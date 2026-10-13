@@ -34,6 +34,18 @@ git clone https://github.com/ovistoica/omarchy-org-agenda \
 omarchy plugin enable ovistoica.org-agenda
 ```
 
+## Uninstall
+
+```sh
+omarchy plugin remove ovistoica.org-agenda
+```
+
+This disables the plugin and deletes its folder. Your running Emacs keeps
+the helper loaded until it restarts; `M-x unload-feature RET
+omarchy-org-agenda` removes its functions and hooks right away. The plugin
+never writes to your Emacs config, and its agenda file in
+`$XDG_RUNTIME_DIR/omarchy-org-agenda/` is cleared when you log out.
+
 ## How it works
 
 - The plugin loads a small elisp helper
