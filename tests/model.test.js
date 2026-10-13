@@ -13,7 +13,8 @@ const M = new Function(src + "; return { PROTOCOL, MAX_ITEMS, MAX_TITLE, ID_RE, 
   " socketKey, agendaFilesList, filesForm, loadPreamble, pullForm, gotoForm, agendaForm," +
   " fallbackOpenArgs, isNoServer, backoffMs, dateKey, isNewDay, isOld, keywordColor, view," +
   " basename, isDeadline, rowLead, rowTrail, rowLocation, sectionHint, nextMeta, footerLine," +
-  " panelMode, errorMessage, panelModel, refocus }")()
+  " panelMode, errorMessage, panelModel, refocus, stateChoices, canChangeState, stateForm," +
+  " takeNoteForm, parseStateResult, stateMessage, ITEM_TYPES }")()
 
 let failed = 0
 let count = 0
@@ -90,8 +91,17 @@ eq(parsedItems([item({ priority: "A", tags: ["a", "b"] })]).map(i => [i.priority
 {
   const v = parsed(payloadOf([], { keywords: { todo: ["A", 1, "B"], done: "x",
     colors: { A: "#00ff00", B: "red", C: "#12345", D: "#abcdefg", E: "#AbCdEf" } } })).value
-  eq(v.keywords, { todo: ["A", "B"], done: [], colors: { A: "#00ff00", E: "#AbCdEf" } }, "parse: keywords, bad colors dropped")
+  eq(v.keywords, { todo: ["A", "B"], done: [], colors: { A: "#00ff00", E: "#AbCdEf" }, keys: {} },
+     "parse: keywords, bad colors dropped, no keys (pre-0.2 payload)")
 }
+eq(parsed(payloadOf([], { keywords: { todo: ["A"], done: [], keys: { A: "a", B: "Z", C: "9", D: "ab", E: "", F: 3,
+    G: "-", H: "\n", I: "é", "bad\tkey": "x" } } })).value.keywords.keys,
+   { A: "a", B: "Z", C: "9" }, "parse: keys, invalid entries dropped")
+eq(M.parse(JSON.stringify(payloadOf([])).replace("\"colors\"", "\"keys\":{\"__proto__\":\"p\"},\"colors\""))
+     .value.keywords.keys.__proto__ === Object.prototype, true, "parse: __proto__ key ignored")
+eq([parsed(payloadOf([], { keywords: { keys: "n" } })).value.keywords.keys,
+    parsed(payloadOf([], { keywords: { keys: ["n"] } })).value.keywords.keys,
+    parsed(payloadOf([], { keywords: { keys: null } })).value.keywords.keys], [{}, {}, {}], "parse: non-object keys -> {}")
 eq(parsed(payloadOf([], { keywords: { colors: JSON.parse("{\"__proto__\":\"#000000\"}") } })).value.keywords.colors.__proto__ === Object.prototype,
    true, "parse: __proto__ colour key ignored")
 {
@@ -261,6 +271,123 @@ eq(["ab12", "", "abcde", "a\"", null].map(k => /agenda "([^"]*)"/.exec(M.agendaF
 eq(M.fallbackOpenArgs({ socketName: "work" }, sync, gp),
    ["emacsclient", "-s", "work", "-w", "5", "-r", "-n", "+63", "/home/u/org/cal.org"], "fallbackOpenArgs")
 eq(throws(() => M.fallbackOpenArgs({}, item({ path: "/etc/passwd", line: 1 }), gp)), true, "fallbackOpenArgs: unknown item throws")
+
+// ---------------------------------------------------------------- state change
+
+const KW = { todo: ["NEXT", "TODO", "REPEAT"], done: ["DONE", "CANCELED"],
+             colors: { NEXT: "#fb4934", DONE: "#98971a" }, keys: { NEXT: "n", TODO: "t", DONE: "d", CANCELED: "c" } }
+const sp = payloadOf([task, late, sync, item({ line: 70, type: "sexp", title: "Ana is 36" }),
+                      item({ line: 80, id: "e-1", todo: "TODO", title: "With id" })], { keywords: KW })
+eq(M.stateChoices(sp), [
+  { keyword: "NEXT", key: "n", color: "#fb4934", done: false }, { keyword: "TODO", key: "t", color: "", done: false },
+  { keyword: "REPEAT", key: "", color: "", done: false }, { keyword: "DONE", key: "d", color: "#98971a", done: true },
+  { keyword: "CANCELED", key: "c", color: "", done: true }], "stateChoices: todo then done, keys and colours")
+eq(M.stateChoices(payloadOf([], { keywords: { todo: ["NEXT"], done: ["DONE"], colors: {} } })).map(c => c.key),
+   ["", ""], "stateChoices: payload without keys")
+eq([M.stateChoices(null), M.stateChoices({}), M.stateChoices(payloadOf([], { keywords: null }))], [[], [], []],
+   "stateChoices: no keywords")
+eq(M.stateChoices(payloadOf([], { keywords: { todo: ["A B", "C\"", "(x)", "D", "D", "x".repeat(33), 5, "Ș"],
+                                               done: ["D", "E\\", "F"], keys: { D: "dd", F: "f" } } }))
+     .map(c => [c.keyword, c.key, c.done]),
+   [["D", "", false], ["Ș", "", false], ["F", "f", true]], "stateChoices: unsafe keywords and duplicates dropped")
+eq(M.ITEM_TYPES.indexOf("sexp") >= 0, true, "ITEM_TYPES has sexp")
+eq([task, sync, item({ type: "sexp" }), item({ type: "block" }), item({ type: "other" }),
+    item({ path: "rel.org" }), item({ line: 0 }), item({ line: 1.5 }), null, {}].map(M.canChangeState),
+   [true, true, false, true, true, false, false, false, false, false], "canChangeState")
+
+eq(M.stateForm(task, sp, "DONE", ELISP),
+   "(progn " + PRE + " (omarchy-org-agenda-set-state \"/home/u/org/cal.org\" 20 nil \"TODO\" \"DONE\"))", "stateForm: exact")
+eq(M.stateForm(sync, sp, "NEXT", ELISP).split(PRE)[1],
+   " (omarchy-org-agenda-set-state \"/home/u/org/cal.org\" 63 nil nil \"NEXT\"))", "stateForm: no keyword -> FROM nil")
+eq(M.stateForm(sp.items[4], sp, "REPEAT", ELISP).split(PRE)[1],
+   " (omarchy-org-agenda-set-state \"/home/u/org/cal.org\" 80 \"e-1\" \"TODO\" \"REPEAT\"))", "stateForm: id kept")
+eq(M.stateForm(Object.assign({}, task, { id: "x\") (shell-command \"rm\")" }), sp, "DONE", ELISP).indexOf("shell-command"),
+   -1, "stateForm: id injection -> nil")
+{
+  const qp = payloadOf([item({ path: "/home/u/org/it's \"q\".org", line: 7, todo: "NEXT" })], { keywords: KW })
+  eq(M.stateForm(qp.items[0], qp, "DONE", ELISP).split(PRE)[1],
+     " (omarchy-org-agenda-set-state \"/home/u/org/it's \\\"q\\\".org\" 7 nil \"NEXT\" \"DONE\"))", "stateForm: path escaped")
+}
+eq([throws(() => M.stateForm(task, sp, "WAIT", ELISP)),
+    throws(() => M.stateForm(task, sp, "DONE\" (shell-command \"x\") \"", ELISP)),
+    throws(() => M.stateForm(task, sp, null, ELISP)),
+    throws(() => M.stateForm(Object.assign({}, task, { todo: "BOGUS" }), sp, "DONE", ELISP)),
+    throws(() => M.stateForm(Object.assign({}, task, { todo: "TO DO" }), sp, "DONE", ELISP)),
+    throws(() => M.stateForm(sp.items[3], sp, "DONE", ELISP)),
+    throws(() => M.stateForm(item({ line: 21 }), sp, "DONE", ELISP)),
+    throws(() => M.stateForm(item({ path: "/etc/passwd", line: 20 }), sp, "DONE", ELISP)),
+    throws(() => M.stateForm(task, null, "DONE", ELISP)),
+    throws(() => M.stateForm(task, sp, "DONE", "rel.el"))],
+   [true, true, true, true, true, true, true, true, true, true], "stateForm: throws on anything invalid")
+eq(M.takeNoteForm(ELISP), "(progn " + PRE + " (omarchy-org-agenda-take-note))", "takeNoteForm")
+eq(throws(() => M.takeNoteForm("x.el")), true, "takeNoteForm: relative throws")
+
+// Real `emacsclient --eval' stdout of omarchy-org-agenda-set-state (Emacs 31.1;
+// 29.4 and 30.1 print the same bytes): prin1 of an ASCII-only JSON string.
+const OUT_DONE = "\"{\\\"result\\\":\\\"done\\\",\\\"state\\\":\\\"DONE\\\",\\\"saved\\\":true,\\\"detail\\\":null}\"\n"
+const OUT_BLOCKED = "\"{\\\"result\\\":\\\"blocked\\\",\\\"state\\\":null,\\\"saved\\\":false,\\\"detail\\\":" +
+  "\\\"TODO \\\\u0218edin\\\\u021b\\\\u0103 \\\\\\\"copil\\\\\\\" (x)\\\"}\"\n"
+const OUT_NOTE = "\"{\\\"result\\\":\\\"note-frame\\\",\\\"state\\\":\\\"WAIT\\\",\\\"saved\\\":false,\\\"detail\\\":null}\"\n"
+const OUT_CHANGED = "\"{\\\"result\\\":\\\"changed\\\",\\\"state\\\":null,\\\"saved\\\":false,\\\"detail\\\":null}\"\n"
+eq(M.parseStateResult(OUT_DONE), { ok: true, value: { result: "done", state: "DONE", saved: true, detail: null } },
+   "parseStateResult: real done")
+eq(M.parseStateResult(OUT_BLOCKED).value, { result: "blocked", state: null, saved: false, detail: "TODO Ședință \"copil\" (x)" },
+   "parseStateResult: real blocked, unicode and quotes")
+eq(M.parseStateResult(OUT_NOTE).value, { result: "note-frame", state: "WAIT", saved: false, detail: null },
+   "parseStateResult: real note-frame")
+eq(M.parseStateResult(OUT_CHANGED).value.result, "changed", "parseStateResult: real changed")
+eq(M.parseStateResult("\"{\\\"result\\\":\\\"blocked\\\",\\\"detail\\\":\\\"Ședință\\\"}\"").value.detail, "Ședință",
+   "parseStateResult: raw non-ASCII passes through")
+eq(M.parseStateResult("{\"result\":\"busy\"}").value, { result: "busy", state: null, saved: false, detail: null },
+   "parseStateResult: bare JSON accepted")
+{
+  const big = M.parseStateResult(JSON.stringify(JSON.stringify({ result: "error", detail: "a\tb\n" + "x".repeat(500) }))).value
+  eq([big.detail.slice(0, 5), Array.from(big.detail).length], ["a b x", 200], "parseStateResult: detail cleaned and bounded")
+}
+eq([M.parseStateResult(JSON.stringify(JSON.stringify({ result: "done", state: "BAD STATE", saved: "yes", detail: 3 }))).value],
+   [{ result: "done", state: null, saved: false, detail: null }], "parseStateResult: bad fields -> defaults")
+eq(["", null, undefined, "t\n", "nil\n", "\"{\\\"result\\\":\\\"maybe\\\"}\"", "\"not json\"", "\"[1]\"", "\"\\\"x\\\"\"",
+    "\"{\\\"result\\\":\\\"done\\\"}", "\"a\"b\"", "\"\\q\"", "*ERROR*: boom"].map(s => M.parseStateResult(s).ok),
+   [false, false, false, false, false, false, false, false, false, false, false, false, false],
+   "parseStateResult: malformed or unknown -> not ok")
+eq(M.parseStateResult("\"{\\\"result\\\":\\\"done\\\"}\"").ok, true, "parseStateResult: minimal")
+
+{
+  const msg = (v, kw) => M.stateMessage(Object.assign({ state: null, saved: false, detail: null }, v), kw)
+  eq([msg({ result: "done", state: "DONE", saved: true }, "DONE"),
+      msg({ result: "done", state: "DONE" }, "DONE"),
+      msg({ result: "done", state: "DONE", detail: "Permission denied" }, "DONE"),
+      msg({ result: "done", state: "NEXT", saved: true }, "DONE"),
+      msg({ result: "note", state: "DONE" }, "DONE"),
+      msg({ result: "note-frame", state: "DONE" }, "DONE"),
+      msg({ result: "blocked", detail: "TODO Child" }, "DONE"),
+      msg({ result: "blocked" }, "DONE"),
+      msg({ result: "changed" }, "DONE"),
+      msg({ result: "conflict" }, "DONE"),
+      msg({ result: "busy" }, "DONE"),
+      msg({ result: "invalid", detail: "NOPE isn't a keyword of this file" }, "NOPE"),
+      msg({ result: "error", detail: "boom" }, "DONE"),
+      msg({ result: "weird" }, "DONE")],
+     [{ text: "Marked DONE · saved", tone: "ok" },
+      { text: "Marked DONE · not saved: the file had unsaved edits in Emacs", tone: "warn" },
+      { text: "Marked DONE · not saved: Permission denied", tone: "warn" },
+      { text: "Marked DONE · repeats as NEXT · saved", tone: "ok" },
+      { text: "Marked DONE · add your note in Emacs", tone: "ok" },
+      { text: "Marked DONE · opening Emacs for your note", tone: "ok" },
+      { text: "Org blocked this: “TODO Child” isn't done yet", tone: "warn" },
+      { text: "Org blocked this: its checkboxes or dependencies aren't done yet", tone: "warn" },
+      { text: "This entry changed in Emacs. The agenda is refreshing; try again.", tone: "warn" },
+      { text: "The file changed on disk and has unsaved edits in Emacs. Resolve it there first.", tone: "error" },
+      { text: "Emacs is waiting for another note. Finish it first.", tone: "warn" },
+      { text: "Emacs refused NOPE: NOPE isn't a keyword of this file", tone: "error" },
+      { text: "Couldn't change the state: boom", tone: "error" },
+      { text: "Couldn't change the state: unexpected answer from Emacs", tone: "error" }], "stateMessage: every result")
+  eq(msg({ result: "blocked", detail: "<b>x</b>\n" + "y".repeat(300) }, "DONE").text.indexOf("<"), -1,
+     "stateMessage: markup neutralised")
+  eq(Array.from(msg({ result: "error", detail: "y".repeat(400) }, "DONE").text).length <= 300, true, "stateMessage: bounded")
+  eq([M.stateMessage(null, null).tone, msg({ result: "done", saved: true }, "A B\"").text],
+     ["error", "Marked the new state · saved"], "stateMessage: bad input")
+}
 
 // ---------------------------------------------------------------- clientArgs / socket / files
 

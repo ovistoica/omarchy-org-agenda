@@ -19,6 +19,13 @@ const CONTROL_RE = /[\u0000-\u001f\u007f]/
 const CONTROL_RE_G = /[\u0000-\u001f\u007f]/g
 const REASON_RE = /^[a-z-]{1,20}$/
 const KEY_RE = /^[A-Za-z0-9]{1,4}$/
+const FAST_KEY_RE = /^[A-Za-z0-9]$/
+// A TODO keyword safe to put in an elisp form and a label: no whitespace,
+// quotes, parens, backslashes or control chars.
+const KEYWORD_RE = /^[^\s"'`()\[\]\\\u0000-\u001f\u007f]{1,32}$/
+const STATE_RESULTS = ["done", "note", "note-frame", "blocked", "changed", "conflict",
+                       "busy", "invalid", "error"]
+const MAX_DETAIL = 200
 const ITEM_TYPES = ["scheduled", "past-scheduled", "deadline", "upcoming-deadline",
                     "timestamp", "sexp", "block"]
 const LABELS = ["Next item", "Count", "Icon"]
@@ -99,10 +106,22 @@ function normalizeColors(raw) {
   return out
 }
 
+// keyword → its one-char fast-selection key; payloads before v0.2 have none.
+function normalizeKeys(raw) {
+  const out = {}
+  if (!isObj(raw)) return out
+  Object.keys(raw).slice(0, 100)
+    .filter(k => k !== "__proto__" && cleanStr(k, 32) !== null
+                 && isStr(raw[k]) && FAST_KEY_RE.test(raw[k]))
+    .slice(0, 50)
+    .forEach(k => { out[k] = raw[k] })
+  return out
+}
+
 function normalizeKeywords(raw) {
   const kw = isObj(raw) ? raw : {}
   return { todo: strList(kw.todo, 50, 32), done: strList(kw.done, 50, 32),
-           colors: normalizeColors(kw.colors) }
+           colors: normalizeColors(kw.colors), keys: normalizeKeys(kw.keys) }
 }
 
 function normalizePayload(raw) {
@@ -382,6 +401,114 @@ function agendaForm(key, elispFile) {
 function fallbackOpenArgs(settings, item, payload) {
   const it = knownItem(item, payload)
   return clientArgs(settings).concat(["-r", "-n", "+" + it.line, it.path])
+}
+
+// ---------------------------------------------------------------- state change
+
+function isKeyword(k) { return isStr(k) && KEYWORD_RE.test(k) }
+
+// The keywords the picker offers: todo then done, in declaration order.
+function stateChoices(payload) {
+  const kw = isObj(payload) && isObj(payload.keywords) ? payload.keywords : {}
+  const keys = isObj(kw.keys) ? kw.keys : {}
+  const keyOf = k => hasOwn(keys, k) && isStr(keys[k]) && FAST_KEY_RE.test(keys[k]) ? keys[k] : ""
+  const list = (arr, done) => (Array.isArray(arr) ? arr : [])
+    .filter(isKeyword)
+    .map(k => ({ keyword: k, key: keyOf(k), color: keywordColor(payload, k), done: done }))
+  const all = list(kw.todo, false).concat(list(kw.done, true))
+  return all.filter((c, i) => all.findIndex(d => d.keyword === c.keyword) === i)
+}
+
+// A diary sexp has no TODO heading of its own to change.
+function canChangeState(item) {
+  return isObj(item) && item.type !== "sexp" && isAbsPath(item.path)
+    && Number.isSafeInteger(item.line) && item.line > 0
+}
+
+function keywordForm(k, choices) {
+  if (!isKeyword(k) || choices.indexOf(k) < 0) throw new Error("not one of the agenda's keywords")
+  return elispString(k)
+}
+
+function stateForm(item, payload, toKeyword, elispFile) {
+  const it = knownItem(item, payload)
+  if (!canChangeState(it)) throw new Error("this entry has no TODO state to change")
+  const choices = stateChoices(payload).map(c => c.keyword)
+  const to = keywordForm(toKeyword, choices)
+  const from = it.todo === null || it.todo === undefined ? "nil" : keywordForm(it.todo, choices)
+  const id = isStr(it.id) && ID_RE.test(it.id) ? elispString(it.id) : "nil"
+  return "(progn " + loadPreamble(elispFile) +
+    " (omarchy-org-agenda-set-state " + elispString(it.path) + " " + it.line + " " +
+    id + " " + from + " " + to + "))"
+}
+
+function takeNoteForm(elispFile) {
+  return "(progn " + loadPreamble(elispFile) + " (omarchy-org-agenda-take-note))"
+}
+
+// The contents of a string as `emacsclient --eval' prints it (prin1:
+// quoted, with \" and \\ escaped), or null.  The helper's JSON is ASCII,
+// but raw non-ASCII passes through too.
+function elispStringValue(s) {
+  const t = String(s == null ? "" : s).trim()
+  if (t.length < 2 || t.charAt(0) !== "\"" || t.charAt(t.length - 1) !== "\"") return null
+  let out = ""
+  for (let i = 1; i < t.length - 1; i++) {
+    const c = t.charAt(i)
+    if (c === "\"") return null
+    if (c !== "\\") { out += c; continue }
+    if (++i >= t.length - 1) return null
+    const n = t.charAt(i)
+    if (n === "\\" || n === "\"") out += n
+    else if (n === "n") out += "\n"
+    else if (n === "t") out += "\t"
+    else if (n !== "\n") return null
+  }
+  return out
+}
+
+function parseStateResult(stdout) {
+  const s = String(stdout == null ? "" : stdout).trim()
+  const json = s.charAt(0) === "{" ? s : elispStringValue(s)
+  if (json === null) return { ok: false, reason: "not an elisp string" }
+  let raw
+  try { raw = JSON.parse(json) } catch (e) { return { ok: false, reason: "invalid JSON" } }
+  if (!isObj(raw) || STATE_RESULTS.indexOf(raw.result) < 0)
+    return { ok: false, reason: "unknown result" }
+  const detail = isStr(raw.detail) ? text(raw.detail, MAX_DETAIL) : ""
+  return { ok: true, value: {
+    result: raw.result,
+    state: isKeyword(raw.state) ? raw.state : null,
+    saved: raw.saved === true,
+    detail: detail === "" ? null : detail
+  } }
+}
+
+// One line for the popout after a state change: {text, tone}.
+function stateMessage(value, toKeyword) {
+  const v = isObj(value) ? value : {}
+  const kw = isKeyword(toKeyword) ? toKeyword : "the new state"
+  const detail = isStr(v.detail) ? text(v.detail, 120) : ""
+  const marked = "Marked " + kw
+    + (v.result === "done" && isKeyword(v.state) && v.state !== kw ? " · repeats as " + v.state : "")
+  const msg = (t, tone) => ({ text: plain(bounded(t, 300)), tone: tone })
+  switch (v.result) {
+  case "done":
+    return v.saved ? msg(marked + " · saved", "ok")
+      : msg(marked + " · not saved: " + (detail || "the file had unsaved edits in Emacs"), "warn")
+  case "note": return msg(marked + " · add your note in Emacs", "ok")
+  case "note-frame": return msg(marked + " · opening Emacs for your note", "ok")
+  case "blocked":
+    return msg(detail ? "Org blocked this: “" + detail + "” isn't done yet"
+                      : "Org blocked this: its checkboxes or dependencies aren't done yet", "warn")
+  case "changed": return msg("This entry changed in Emacs. The agenda is refreshing; try again.", "warn")
+  case "conflict":
+    return msg("The file changed on disk and has unsaved edits in Emacs. Resolve it there first.", "error")
+  case "busy": return msg("Emacs is waiting for another note. Finish it first.", "warn")
+  case "invalid": return msg("Emacs refused " + kw + (detail ? ": " + detail : ""), "error")
+  case "error": return msg("Couldn't change the state" + (detail ? ": " + detail : ""), "error")
+  default: return msg("Couldn't change the state: unexpected answer from Emacs", "error")
+  }
 }
 
 // ---------------------------------------------------------------- status
