@@ -35,8 +35,8 @@ const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "
 const SECTION_ORDER = [
   { key: "schedule", cls: "schedule", title: "Schedule" },
   { key: "today", cls: "today", title: "Today" },
-  { key: "upcoming", cls: "upcoming", title: "Coming up" },
   { key: "habits", cls: "habit", title: "Habits" },
+  { key: "upcoming", cls: "upcoming", title: "Coming up" },
   { key: "overdue", cls: "overdue", title: "Overdue" }
 ]
 

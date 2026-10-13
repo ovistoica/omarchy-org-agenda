@@ -79,16 +79,16 @@ the Emacs window.
 
 **Coming up**
 
-After today's entries, Coming up looks ahead. It lists Org's warnings for
-upcoming deadlines, and the scheduled tasks and timestamped entries (like
-calendar events, including multi-day ones) of the next `upcomingDays`
-days (a week by default), soonest first. Each row starts with the day:
-`Thu` within the week, `27 Oct` further out. Each heading shows once, at
-its next date: a repeating entry at its next occurrence, a multi-day
-event on its first day, and an entry that is already on today's agenda
-(such as an event under way) isn't listed again. Diary entries on later
-days aren't included. Set `upcomingDays` to `0` to list deadline
-warnings only.
+After today's entries and habits, Coming up looks ahead. It lists Org's
+warnings for upcoming deadlines, and the scheduled tasks and timestamped
+entries (like calendar events, including multi-day ones) of the next
+`upcomingDays` days (a week by default), soonest first. Each row starts
+with the day: `Thu` within the week, `27 Oct` further out. Each heading
+shows once, at its next date: a repeating entry at its next occurrence,
+a multi-day event on its first day, and an entry that is already on
+today's agenda (such as an event under way) isn't listed again. Diary
+entries on later days aren't included. Set `upcomingDays` to `0` to list
+deadline warnings only.
 
 **Changing a state**
 

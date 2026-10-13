@@ -132,8 +132,8 @@ eq([habit, late, soon, sync, task].map(M.classify), ["habit", "overdue", "upcomi
 eq(M.classify(item({ habit: true, time: "08:00" })), "habit", "classify: habit beats time")
 eq(M.classify(item({ type: "upcoming-deadline", time: "08:00" })), "upcoming", "classify: upcoming beats time")
 eq(M.sections(all, {}).map(s => [s.key, s.title, s.items.map(i => i.line)]),
-   [["schedule", "Schedule", [63, 10]], ["today", "Today", [20, 60]], ["upcoming", "Coming up", [50]],
-    ["habits", "Habits", [30]], ["overdue", "Overdue", [40]]], "sections: order, Org order kept")
+   [["schedule", "Schedule", [63, 10]], ["today", "Today", [20, 60]], ["habits", "Habits", [30]],
+    ["upcoming", "Coming up", [50]], ["overdue", "Overdue", [40]]], "sections: order, Org order kept")
 eq(M.sections([task, soon], {}).map(s => s.key), ["today", "upcoming"], "sections: empty omitted")
 eq(M.sections(all, { showDone: false })[1].items.map(i => i.line), [20], "sections: showDone false")
 eq(M.sections([doneTask], { showDone: false }), [], "sections: all done hidden")
@@ -147,7 +147,7 @@ eq([tomorrow, repeat, item({ inDays: 2, habit: true }), item({ type: "upcoming-d
     item({ type: "upcoming-deadline", inDays: 3, overdueDays: 2 })].map(M.classify),
    ["upcoming", "upcoming", "habit", "upcoming", "upcoming"], "classify: habit, then inDays/upcoming-deadline, then overdue")
 eq(M.sections(all.concat([tomorrow, repeat]), {}).map(s => [s.key, s.items.map(i => i.line)]),
-   [["schedule", [63, 10]], ["today", [20, 60]], ["upcoming", [50, 90, 91]], ["habits", [30]], ["overdue", [40]]],
+   [["schedule", [63, 10]], ["today", [20, 60]], ["habits", [30]], ["upcoming", [50, 90, 91]], ["overdue", [40]]],
    "sections: later-day tasks only under Coming up")
 eq([M.nextUp([tomorrow], at(8, 0)), M.openToday([tomorrow, repeat]), M.overdueCount([repeat], { habitsInBadge: true })],
    [null, 0, 0], "later-day task: not next up, not open today, not overdue")
@@ -159,7 +159,7 @@ const event = item({ line: 92, type: "timestamp", title: "Design review", time: 
 const trip = item({ line: 93, type: "block", title: "Conference", inDays: 14, overdueDays: 1 })
 eq([event, trip].map(M.classify), ["upcoming", "upcoming"], "classify: later-day timestamp and block -> upcoming")
 eq(M.sections(all.concat([event, trip]), {}).map(s => [s.key, s.items.map(i => i.line)]),
-   [["schedule", [63, 10]], ["today", [20, 60]], ["upcoming", [50, 92, 93]], ["habits", [30]], ["overdue", [40]]],
+   [["schedule", [63, 10]], ["today", [20, 60]], ["habits", [30]], ["upcoming", [50, 92, 93]], ["overdue", [40]]],
    "sections: later-day events only under Coming up")
 eq([M.nextUp([event], at(8, 0)), M.openToday([event, trip]), M.overdueCount([event, trip], { habitsInBadge: true })],
    [null, 0, 0], "later-day event: not next up, not open today, not overdue")
@@ -563,21 +563,22 @@ eq([M.errorMessage(M.view(payloadOf([], { error: "bad" }), "ok", "x", at(11, 13)
 {
   const v = M.view(P(all), "ok", "", at(11, 13), {})
   const before = M.panelModel(v)
-  // A refresh after the habit was done: its row is gone, the overdue row moves up.
+  // A refresh after the habit was done: its row is gone, the rows below it move up.
   const after = M.panelModel(M.view(P(all.filter(i => i !== habit)), "ok", "", at(11, 13), {}))
   eq(before.sections.map(s => [s.key, s.count, s.rows.length, s.hint]),
-     [["schedule", 2, 2, ""], ["today", 2, 2, ""], ["upcoming", 1, 1, ""],
-      ["habits", 1, 1, "missed days"], ["overdue", 1, 1, ""]], "panelModel: sections")
+     [["schedule", 2, 2, ""], ["today", 2, 2, ""], ["habits", 1, 1, "missed days"],
+      ["upcoming", 1, 1, ""], ["overdue", 1, 1, ""]], "panelModel: sections")
   eq(before.rows.map(r => [r.sel, r.item.line]),
-     [[0, 63], [1, 63], [2, 10], [3, 20], [4, 60], [5, 50], [6, 30], [7, 40]],
+     [[0, 63], [1, 63], [2, 10], [3, 20], [4, 60], [5, 30], [6, 50], [7, 40]],
      "panelModel: next card first, then every section's rows, overdue included")
   eq([before.next.key, before.rows[7].key], ["next", "overdue:/home/u/org/cal.org:40:scheduled"], "panelModel: keys")
   eq(M.panelModel(M.view(P([task]), "ok", "", at(11, 13), {})).rows.map(r => r.sel), [0], "panelModel: no next")
   const keys = m => m.rows.map(r => r.key)
-  eq([M.refocus(keys(before), keys(after), 6), M.refocus(keys(before), keys(after), 7),
+  eq([M.refocus(keys(before), keys(after), 5), M.refocus(keys(before), keys(after), 6),
+      M.refocus(keys(before), keys(after), 7),
       M.refocus(keys(after), keys(before), 6), M.refocus(keys(after), keys(before), 3),
       M.refocus([], keys(before), 0), M.refocus(keys(before), [], 3), M.refocus(["gone"], ["a", "b"], 5)],
-     [5, 6, 7, 3, 0, 0, 1], "refocus: keeps the entry or the one above")
+     [4, 5, 6, 7, 3, 0, 0, 1], "refocus: keeps the entry or the one above")
 }
 
 eq([M.PROTOCOL, M.MAX_ITEMS, M.MAX_TITLE, M.NOW_GRACE_MIN, M.STALE_AFTER_MS, M.ID_RE.test("a:b")],
