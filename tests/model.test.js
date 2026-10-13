@@ -1,0 +1,327 @@
+// Model.js under node: parsing, sections, next up, bar text, elisp forms.
+//   node tests/model.test.js
+// TZ is pinned (before any Date use) so local-time helpers (dateKey, nextUp,
+// isOld with a +0300 stamp) are deterministic: Bucharest is UTC+3 in October.
+process.env.TZ = "Europe/Bucharest"
+
+const fs = require("fs")
+const path = require("path")
+const src = fs.readFileSync(path.join(__dirname, "..", "Model.js"), "utf8")
+const M = new Function(src + "; return { PROTOCOL, MAX_ITEMS, MAX_TITLE, ID_RE, NOW_GRACE_MIN," +
+  " STALE_AFTER_MS, parse, bounded, classify, sections, openToday, overdueCount, minutesOf," +
+  " nextUp, normalizeSettings, barLabel, relTime, tooltip, plain, elispString, clientArgs," +
+  " socketKey, agendaFilesList, filesForm, loadPreamble, pullForm, gotoForm, agendaForm," +
+  " fallbackOpenArgs, isNoServer, backoffMs, dateKey, isNewDay, isOld, keywordColor, view }")()
+
+let failed = 0
+let count = 0
+function eq(got, want, name) {
+  const ok = JSON.stringify(got) === JSON.stringify(want)
+  count++
+  if (!ok) failed++
+  console.log((ok ? "ok   " : "FAIL ") + name + (ok ? "" : "\n     got  " + JSON.stringify(got) + "\n     want " + JSON.stringify(want)))
+}
+function throws(fn) { try { fn(); return false } catch (e) { return true } }
+
+// ---------------------------------------------------------------- fixtures
+
+const ELISP = "/home/u/plugin/elisp/omarchy-org-agenda.el"
+const OUT = "/home/u/.cache/org-agenda/server.json"
+const at = (h, m) => new Date(2026, 9, 13, h, m)
+
+function item(over) {
+  return Object.assign({ id: null, path: "/home/u/org/cal.org", line: 1, type: "scheduled",
+    todo: null, done: false, title: "x", priority: null, category: "cal", tags: [],
+    time: null, durationMin: null, overdueDays: 0, habit: false }, over)
+}
+function payloadOf(items, over) {
+  return Object.assign({ version: 1, date: "2026-10-13", generatedAt: "2026-10-13T11:13:04+0300",
+    reason: "save", emacs: "31.1", org: "9.8.7",
+    keywords: { todo: ["NEXT", "TODO"], done: ["DONE"], colors: { NEXT: "#fb4934" } },
+    items: items, error: null, missing: [] }, over)
+}
+const parsed = raw => M.parse(JSON.stringify(raw))
+const parsedItems = items => parsed(payloadOf(items)).value.items
+
+const sync = item({ line: 63, type: "timestamp", title: "Engineering Sync Up", time: "13:00", durationMin: 30 })
+const standup = item({ line: 10, title: "Standup", time: "09:00" })
+const task = item({ line: 20, todo: "TODO", title: "Write report" })
+const habit = item({ line: 30, title: "Log weight ⚖️", habit: true, overdueDays: 2 })
+const late = item({ line: 40, todo: "NEXT", title: "Pay bill", overdueDays: 3 })
+const soon = item({ line: 50, type: "upcoming-deadline", title: "Taxes" })
+const doneTask = item({ line: 60, todo: "DONE", title: "Done thing", done: true })
+const all = [sync, standup, task, habit, late, soon, doneTask]
+
+// ---------------------------------------------------------------- parse
+
+eq(M.parse("not json {").ok, false, "parse: garbage")
+eq([M.parse(undefined).ok, M.parse(null).ok, M.parse(42).ok], [false, false, false], "parse: non-string input")
+eq([M.parse("[]").ok, M.parse("3").ok, M.parse("null").ok, M.parse("\"x\"").ok], [false, false, false, false], "parse: non-object")
+eq(parsed(payloadOf([], { version: 2 })).ok, false, "parse: wrong version")
+eq(parsed(payloadOf([], { version: "1" })).ok, false, "parse: string version")
+eq([parsed(payloadOf([], { date: "2026-10-1" })).ok, parsed(payloadOf([], { date: 5 })).ok], [false, false], "parse: bad date")
+eq(parsed(payloadOf([sync])).ok, true, "parse: valid")
+eq(parsedItems([sync])[0], sync, "parse: item round-trips")
+eq(parsedItems([item({ path: undefined }), item({ line: undefined }), item({ line: 0 }), item({ line: 1.5 }), item({ line: "3" })]).length,
+   0, "parse: missing/bad path or line dropped")
+eq(parsedItems([item({ path: "org/cal.org" }), item({ path: "/a\nb" }), item({ path: "/" + "a".repeat(5000) })]).length,
+   0, "parse: relative / control / huge path dropped")
+eq(parsedItems([null, 3, "x", [], sync]).length, 1, "parse: non-object items dropped")
+eq(parsedItems(Array.from({ length: 250 }, (_, i) => item({ line: i + 1 }))).length, 200, "parse: 250 items -> 200")
+{
+  const t = parsedItems([item({ title: "a".repeat(500) })])[0].title
+  eq([Array.from(t).length, t.slice(-1)], [200, "…"], "parse: long title bounded with …")
+}
+eq(parsedItems([habit])[0].title, "Log weight ⚖️", "parse: emoji title intact")
+eq(parsedItems([item({ title: "a\tb\nc\u0000d\u007f" })])[0].title, "a b c d ", "parse: control chars in title -> spaces")
+eq(parsedItems([item({ title: 5 })])[0].title, "", "parse: non-string title -> empty")
+eq(parsedItems([item({ id: "bad id!" }), item({ id: "x\") (shell-command \"rm\")" }), item({ id: "abc-123:4.5_6" })]).map(i => i.id),
+   [null, null, "abc-123:4.5_6"], "parse: id validated")
+{
+  const i = parsedItems([item({ todo: "X".repeat(33), done: "yes", habit: 1, time: "9:00", durationMin: -5,
+    overdueDays: 1.5, priority: "AB", category: "c".repeat(61), tags: ["ok", 3, "t".repeat(41)].concat(Array(30).fill("z")),
+    type: "weird" })])[0]
+  eq([i.todo, i.done, i.habit, i.time, i.durationMin, i.overdueDays, i.priority, i.category, i.tags.length, i.tags[0], i.type],
+     [null, false, false, null, null, 0, null, null, 20, "ok", "other"], "parse: field normalisation")
+}
+eq(parsedItems([item({ priority: "A", tags: ["a", "b"] })]).map(i => [i.priority, i.tags]), [["A", ["a", "b"]]], "parse: priority and tags kept")
+{
+  const v = parsed(payloadOf([], { keywords: { todo: ["A", 1, "B"], done: "x",
+    colors: { A: "#00ff00", B: "red", C: "#12345", D: "#abcdefg", E: "#AbCdEf" } } })).value
+  eq(v.keywords, { todo: ["A", "B"], done: [], colors: { A: "#00ff00", E: "#AbCdEf" } }, "parse: keywords, bad colors dropped")
+}
+eq(parsed(payloadOf([], { keywords: { colors: JSON.parse("{\"__proto__\":\"#000000\"}") } })).value.keywords.colors.__proto__ === Object.prototype,
+   true, "parse: __proto__ colour key ignored")
+{
+  const raw = payloadOf([sync]); delete raw.missing
+  eq(parsed(raw).value.missing, [], "parse: missing defaults to []")
+}
+eq(parsed(payloadOf([], { missing: ["/a.org", 3, "/b.org"] })).value.missing, ["/a.org", "/b.org"], "parse: missing strings")
+eq([parsed(payloadOf([], { error: "e".repeat(400) })).value.error.length, parsed(payloadOf([], { error: 3 })).value.error],
+   [300, null], "parse: error bounded / non-string -> null")
+eq(parsed(payloadOf([], { generatedAt: 5, reason: null, emacs: undefined, org: {} })).value,
+   Object.assign(parsed(payloadOf([])).value, { generatedAt: "", reason: "", emacs: "", org: "" }), "parse: meta strings default to empty")
+eq(parsed(payloadOf("nope")).value.items, [], "parse: non-array items -> []")
+
+// ---------------------------------------------------------------- bounded
+
+eq([M.bounded("abc", 5), M.bounded("abcdef", 4), M.bounded("Log weight ⚖️", 28), M.bounded("😀😀😀", 2)],
+   ["abc", "abc…", "Log weight ⚖️", "😀…"], "bounded")
+
+// ---------------------------------------------------------------- classify / sections
+
+eq([habit, late, soon, sync, task].map(M.classify), ["habit", "overdue", "upcoming", "schedule", "today"], "classify: every branch")
+eq(M.classify(item({ habit: true, time: "08:00" })), "habit", "classify: habit beats time")
+eq(M.classify(item({ type: "upcoming-deadline", time: "08:00" })), "upcoming", "classify: upcoming beats time")
+eq(M.sections(all, {}).map(s => [s.key, s.title, s.items.map(i => i.line)]),
+   [["schedule", "Schedule", [63, 10]], ["today", "Today", [20, 60]], ["habits", "Habits", [30]],
+    ["overdue", "Overdue", [40]], ["upcoming", "Coming up", [50]]], "sections: order, Org order kept")
+eq(M.sections([task, soon], {}).map(s => s.key), ["today", "upcoming"], "sections: empty omitted")
+eq(M.sections(all, { showDone: false })[1].items.map(i => i.line), [20], "sections: showDone false")
+eq(M.sections([doneTask], { showDone: false }), [], "sections: all done hidden")
+eq(M.sections([], {}), [], "sections: empty")
+
+// ---------------------------------------------------------------- counts
+
+eq(M.openToday(all), 3, "openToday")
+eq(M.openToday([doneTask, habit, late]), 0, "openToday: none")
+eq(M.overdueCount(all, {}), 1, "overdueCount: habits excluded")
+eq(M.overdueCount(all, { habitsInBadge: true }), 2, "overdueCount: habitsInBadge")
+eq(M.overdueCount([item({ overdueDays: 2, done: true }), late], { habitsInBadge: true }), 1, "overdueCount: done excluded")
+
+// ---------------------------------------------------------------- nextUp
+
+eq(["13:00", "00:00", "23:59", "24:00", "9:00", "x", null].map(M.minutesOf), [780, 0, 1439, -1, -1, -1, -1], "minutesOf")
+{
+  const n = M.nextUp([sync], at(11, 13))
+  eq([n.state, n.item.line, n.startMin, n.endMin], ["next", 63, 780, 810], "nextUp: before -> next")
+}
+eq(M.nextUp([sync], at(13, 0)).state, "now", "nextUp: at start -> now")
+eq(M.nextUp([sync], at(13, 29)).state, "now", "nextUp: during -> now")
+eq(M.nextUp([sync], at(13, 30)), null, "nextUp: at end -> null")
+eq(M.nextUp([standup], at(9, 29)).state, "now", "nextUp: no duration stays now for 30 min")
+eq(M.nextUp([standup], at(9, 30)), null, "nextUp: no duration ends after 30 min")
+eq(M.nextUp(all, at(23, 0)), null, "nextUp: after all -> null")
+eq(M.nextUp(all, at(8, 0)).item.line, 10, "nextUp: earliest start wins")
+eq(M.nextUp([item({ time: "10:00", done: true }), item({ line: 2, time: "11:00" })], at(8, 0)).item.line, 2, "nextUp: done skipped")
+eq(M.nextUp([item({ line: 1, time: "10:00" }), item({ line: 2, time: "10:00" })], at(8, 0)).item.line, 1, "nextUp: tie keeps Org order")
+eq(M.nextUp([habit, late, task], at(8, 0)), null, "nextUp: only schedule class")
+eq(M.nextUp([sync], new Date(NaN)), null, "nextUp: invalid now -> null")
+
+// ---------------------------------------------------------------- settings
+
+eq(M.normalizeSettings(null), { label: "Next item", maxTitleChars: 28, overdueBadge: true, habitsInBadge: false,
+  showDone: true, pushUpdates: true, socketName: "", serverFile: "", emacsclient: "", agendaFiles: "",
+  agendaKey: "a", emacsApp: "emacs", timeoutSeconds: 5 }, "normalizeSettings: defaults")
+{
+  const s = M.normalizeSettings({ label: "Bogus", maxTitleChars: 500, timeoutSeconds: 0, overdueBadge: "no",
+    habitsInBadge: "yes", showDone: false, pushUpdates: false, socketName: "  work ", agendaKey: "  ", emacsApp: " " })
+  eq([s.label, s.maxTitleChars, s.timeoutSeconds, s.overdueBadge, s.habitsInBadge, s.showDone, s.pushUpdates,
+      s.socketName, s.agendaKey, s.emacsApp],
+     ["Next item", 80, 1, true, false, false, false, "work", "a", "emacs"], "normalizeSettings: clamp, trim, bools")
+}
+eq([M.normalizeSettings({ maxTitleChars: 3 }).maxTitleChars, M.normalizeSettings({ maxTitleChars: "40" }).maxTitleChars,
+    M.normalizeSettings({ timeoutSeconds: 99 }).timeoutSeconds, M.normalizeSettings({ timeoutSeconds: "x" }).timeoutSeconds,
+    M.normalizeSettings({ label: "Count" }).label, M.normalizeSettings({ label: "Icon" }).label],
+   [10, 40, 30, 5, "Count", "Icon"], "normalizeSettings: numbers and labels")
+
+// ---------------------------------------------------------------- barLabel
+
+const P = items => payloadOf(items)
+const label = (items, status, settings, now) => M.view(P(items), status, "", now || at(11, 13), settings).label
+const L = (mode, text, badge, alert) => ({ mode, text, badge, alert })
+
+eq(M.view(P(all), "offline", "x", at(11, 13), {}).label, L("offline", "", 0, false), "barLabel: offline")
+eq(M.view(P(all), "error", "x", at(11, 13), {}).label, L("error", "", 0, false), "barLabel: error status")
+eq(M.view(payloadOf([], { error: "boom" }), "ok", "", at(11, 13), {}).label, L("error", "", 0, false), "barLabel: payload error")
+eq(M.view(null, "loading", "", at(11, 13), {}).label, L("loading", "", 0, false), "barLabel: loading")
+eq(label(all, "ok", { label: "Icon" }), L("icon", "", 0, true), "barLabel: icon with alert")
+eq(label([sync], "ok", { label: "Icon" }), L("icon", "", 0, false), "barLabel: icon without alert")
+eq(label(all, "ok", { label: "Count" }), L("count", "3", 1, true), "barLabel: count")
+eq(label(all, "ok", { label: "Count", overdueBadge: false }), L("count", "3", 0, true), "barLabel: count, overdueBadge false")
+eq(label(all, "ok", {}, at(13, 5)), L("now", "now Engineering Sync Up", 1, true), "barLabel: now")
+eq(label(all, "ok", {}), L("next", "13:00 Engineering Sync Up", 1, true), "barLabel: next")
+eq(label([sync], "ok", { maxTitleChars: 10 }), L("next", "13:00 Engineeri…", 0, false), "barLabel: title bounded")
+// Past schedule entries still count as open today; only nextUp drops them.
+eq(label(all, "ok", {}, at(20, 0)), L("today", "3 today", 1, true), "barLabel: today")
+eq(label([task, late], "ok", {}), L("today", "1 today", 1, true), "barLabel: today, no schedule")
+eq(label([late, doneTask], "ok", {}), L("icon", "", 1, true), "barLabel: overdue only -> icon")
+eq(label([doneTask, soon], "ok", {}), L("clear", "", 0, false), "barLabel: clear")
+eq(label(all, "ok", { overdueBadge: false }), L("next", "13:00 Engineering Sync Up", 0, true), "barLabel: overdueBadge false")
+eq(label(all, "stale", {}), L("next", "13:00 Engineering Sync Up", 1, true), "barLabel: stale keeps label")
+
+// ---------------------------------------------------------------- relTime / plain
+
+eq([-3, 0, 5, 59, 60, 107, 120].map(M.relTime), ["now", "now", "in 5 min", "in 59 min", "in 1 h", "in 1 h 47 min", "in 2 h"], "relTime")
+eq(M.plain("a<b>c\td\ne\u0000"), "a‹b›c d\ne ", "plain")
+eq([M.plain(null), M.plain(3)], ["", "3"], "plain: non-strings")
+
+// ---------------------------------------------------------------- tooltip
+
+eq(M.view(P(all), "ok", "", at(11, 13), {}).tooltip,
+   "Next 13:00 Engineering Sync Up · in 1 h 47 min\nToday 3 · Habits 1 · Overdue 1\nUpdated 11:13 from Emacs", "tooltip: next")
+eq(M.view(P(all), "ok", "", at(13, 5), {}).tooltip.split("\n")[0], "Now Engineering Sync Up · until 13:30", "tooltip: now")
+eq(M.view(P(all), "ok", "", at(11, 13), { label: "Icon" }).tooltip.split("\n")[0], "Next 13:00 · in 1 h 47 min", "tooltip: icon omits titles")
+eq(M.view(P(all), "ok", "", at(13, 5), { label: "Icon" }).tooltip.split("\n")[0], "Now · until 13:30", "tooltip: icon now")
+eq(M.view(P(all), "ok", "", at(20, 0), { habitsInBadge: true }).tooltip,
+   "Today 3 · Habits 1 · Overdue 2\nUpdated 11:13 from Emacs", "tooltip: no next line, habitsInBadge")
+eq(M.view(P(all), "stale", "", at(20, 0), {}).tooltip.split("\n").pop(), "Updated 11:13 from Emacs · stale", "tooltip: stale")
+eq(M.view(payloadOf([], { missing: ["/a.org", "/b.org"] }), "ok", "", at(20, 0), {}).tooltip.split("\n").pop(),
+   "Missing: 2 agenda file(s)", "tooltip: missing")
+eq(M.view(null, "offline", "can't find <socket>", at(20, 0), {}).tooltip, "Emacs not reachable\ncan't find ‹socket›", "tooltip: offline")
+eq(M.view(payloadOf([], { error: "void-function foo" }), "ok", "", at(20, 0), {}).tooltip,
+   "Agenda export failed: void-function foo", "tooltip: export error")
+{
+  const t = M.view(P([item({ title: "<img src=x onerror=alert(1)>", time: "13:00" })]), "ok", "", at(11, 13), {}).tooltip
+  eq([t.split("\n")[0], /[<>]/.test(t)], ["Next 13:00 ‹img src=x onerror=alert(1)› · in 1 h 47 min", false], "tooltip: markup neutralised")
+}
+
+// ---------------------------------------------------------------- elispString
+
+eq(M.elispString("a\"b\\c"), "\"a\\\"b\\\\c\"", "elispString: escapes")
+eq(M.elispString("Ünïcødé ⚖️ 😀"), "\"Ünïcødé ⚖️ 😀\"", "elispString: unicode")
+eq(["a\nb", "a\u0000", "a\u007f", "\t", 3, null].map(s => throws(() => M.elispString(s))),
+   [true, true, true, true, true, true], "elispString: control chars / non-strings throw")
+
+// ---------------------------------------------------------------- forms
+
+const PRE = "(unless (and (boundp 'omarchy-org-agenda--source-mtime) (equal omarchy-org-agenda--source-mtime" +
+  " (file-attribute-modification-time (file-attributes \"" + ELISP + "\")))) (load \"" + ELISP + "\" nil t))"
+eq(M.loadPreamble(ELISP), PRE, "loadPreamble")
+eq(throws(() => M.loadPreamble("omarchy-org-agenda")), true, "loadPreamble: relative throws")
+eq(M.pullForm(ELISP, OUT, { agendaFiles: "/home/u/org/a.org:/home/u/org/b.org" }, "save"),
+   "(progn " + PRE + " (omarchy-org-agenda-ensure \"" + OUT + "\" (list \"/home/u/org/a.org\" \"/home/u/org/b.org\") t)" +
+   " (omarchy-org-agenda-export \"save\"))", "pullForm: exact")
+eq(M.pullForm(ELISP, OUT, { pushUpdates: false }, "pull").split(PRE)[1],
+   " (omarchy-org-agenda-ensure \"" + OUT + "\" nil nil) (omarchy-org-agenda-export \"pull\"))", "pullForm: nil files, push nil")
+eq(["Save", "a\"b", "x".repeat(21), undefined, "new-day"].map(r => /export "([^"]*)"/.exec(M.pullForm(ELISP, OUT, {}, r))[1]),
+   ["pull", "pull", "pull", "pull", "new-day"], "pullForm: reason sanitised")
+eq([throws(() => M.pullForm("x.el", OUT, {}, "pull")), throws(() => M.pullForm(ELISP, "out.json", {}, "pull")),
+    throws(() => M.pullForm(ELISP, null, {}, "pull"))], [true, true, true], "pullForm: relative paths throw")
+
+const gp = payloadOf([sync, item({ id: "abc-1", path: "/home/u/org/it's \"q\".org", line: 7 })])
+eq(M.gotoForm(sync, gp, ELISP), "(progn " + PRE + " (omarchy-org-agenda-goto \"/home/u/org/cal.org\" 63 nil))", "gotoForm: exact")
+eq(M.gotoForm(gp.items[1], gp, ELISP).split(PRE)[1],
+   " (omarchy-org-agenda-goto \"/home/u/org/it's \\\"q\\\".org\" 7 \"abc-1\"))", "gotoForm: quote escaped, id kept")
+eq([throws(() => M.gotoForm(item({ path: "/etc/passwd", line: 63 }), gp, ELISP)),
+    throws(() => M.gotoForm(item({ path: "/home/u/org/cal.org", line: 64 }), gp, ELISP)),
+    throws(() => M.gotoForm(item({ path: "/home/u/org/cal.org", line: "63" }), gp, ELISP)),
+    throws(() => M.gotoForm(sync, null, ELISP)),
+    throws(() => M.gotoForm(null, gp, ELISP))], [true, true, true, true, true], "gotoForm: unknown path/line throws")
+eq(/ 63 (\S+)\)\)$/.exec(M.gotoForm(Object.assign({}, sync, { id: "bad id" }), gp, ELISP))[1], "nil", "gotoForm: bad id -> nil")
+{
+  const f = M.gotoForm(Object.assign({}, sync, { id: "x\") (shell-command \"rm\")" }), gp, ELISP)
+  eq([/ 63 nil\)\)$/.test(f), f.indexOf("shell-command")], [true, -1], "gotoForm: id injection -> nil")
+}
+eq(M.agendaForm("t", ELISP), "(progn " + PRE + " (omarchy-org-agenda-open-agenda \"t\"))", "agendaForm: exact")
+eq(["ab12", "", "abcde", "a\"", null].map(k => /agenda "([^"]*)"/.exec(M.agendaForm(k, ELISP))[1]),
+   ["ab12", "a", "a", "a", "a"], "agendaForm: key sanitised")
+eq(M.fallbackOpenArgs({ socketName: "work" }, sync, gp),
+   ["emacsclient", "-s", "work", "-w", "5", "-r", "-n", "+63", "/home/u/org/cal.org"], "fallbackOpenArgs")
+eq(throws(() => M.fallbackOpenArgs({}, item({ path: "/etc/passwd", line: 1 }), gp)), true, "fallbackOpenArgs: unknown item throws")
+
+// ---------------------------------------------------------------- clientArgs / socket / files
+
+eq(M.clientArgs({}), ["emacsclient", "-w", "5"], "clientArgs: default")
+eq(M.clientArgs({ socketName: "work" }), ["emacsclient", "-s", "work", "-w", "5"], "clientArgs: socketName")
+eq(M.clientArgs({ socketName: "work", serverFile: "/tmp/srv" }), ["emacsclient", "-f", "/tmp/srv", "-w", "5"], "clientArgs: serverFile wins")
+eq(M.clientArgs({ emacsclient: " /opt/bin/emacsclient ", timeoutSeconds: 100 }), ["/opt/bin/emacsclient", "-w", "30"], "clientArgs: binary, timeout clamped")
+eq(M.clientArgs(null), ["emacsclient", "-w", "5"], "clientArgs: null settings")
+eq([M.socketKey({}), M.socketKey({ socketName: "work" }), M.socketKey({ serverFile: "/tmp/a b/srv", socketName: "w" }),
+    M.socketKey({ socketName: "x".repeat(200) }).length],
+   ["server", "s-work", "f-_tmp_a_b_srv", 82], "socketKey")
+eq(M.agendaFilesList({ agendaFiles: " /a.org : :/b.org::/c\u0001.org:" + "/" + "x".repeat(1100) }), ["/a.org", "/b.org"], "agendaFilesList")
+eq(M.agendaFilesList({ agendaFiles: Array.from({ length: 60 }, (_, i) => "/f" + i).join(":") }).length, 50, "agendaFilesList: capped at 50")
+eq(M.agendaFilesList({}), [], "agendaFilesList: empty")
+eq([M.filesForm([]), M.filesForm(["/a.org", "/b \"c\".org"])], ["nil", "(list \"/a.org\" \"/b \\\"c\\\".org\")"], "filesForm")
+
+// ---------------------------------------------------------------- status helpers
+
+eq(["emacsclient: can't find socket; have you started the server?",
+    "emacsclient: error accessing socket \"/run/user/1000/emacs/server\"",
+    "emacsclient: error accessing server file \"/x\"",
+    "emacsclient: connect: Connection refused",
+    "emacsclient: No such file or directory",
+    "*ERROR*: Symbol's function definition is void: foo", "", null].map(M.isNoServer),
+   [true, true, true, true, true, false, false, false], "isNoServer")
+eq([0, 1, 2, 3, 4, 5, 6].map(M.backoffMs), [15000, 30000, 60000, 120000, 240000, 300000, 300000], "backoffMs")
+eq([M.backoffMs(-1), M.backoffMs(1000)], [15000, 300000], "backoffMs: bounds")
+eq([M.dateKey(at(0, 0)), M.dateKey(new Date(2026, 0, 5, 23, 59))], ["2026-10-13", "2026-01-05"], "dateKey")
+eq([M.isNewDay(P([]), at(23, 59)), M.isNewDay(P([]), new Date(2026, 9, 14, 0, 0)), M.isNewDay(null, at(1, 0))],
+   [false, true, false], "isNewDay")
+// 11:13:04+0300 is 11:13:04 local in Bucharest.
+eq([M.isOld(P([]), new Date(2026, 9, 13, 11, 13, 30)), M.isOld(P([]), new Date(2026, 9, 13, 11, 14, 4)),
+    M.isOld(P([]), new Date(2026, 9, 13, 11, 14, 5)), M.isOld(null, at(11, 13)),
+    M.isOld(payloadOf([], { generatedAt: "garbage" }), at(11, 13)),
+    M.isOld(payloadOf([], { generatedAt: "2026-10-13T08:13:04Z" }), new Date(2026, 9, 13, 11, 13, 30)),
+    M.isOld(payloadOf([], { generatedAt: "2026-10-13T11:13:04+03:00" }), new Date(2026, 9, 13, 11, 13, 30))],
+   [false, false, true, true, true, false, false], "isOld")
+eq([M.keywordColor(P([]), "NEXT"), M.keywordColor(P([]), "TODO"), M.keywordColor(null, "NEXT"),
+    M.keywordColor(P([]), "toString"), M.keywordColor(payloadOf([], { keywords: {} }), "NEXT")],
+   ["#fb4934", "", "", "", ""], "keywordColor")
+
+// ---------------------------------------------------------------- view
+
+{
+  const results = ["loading", "ok", "offline", "error", "stale", "bogus", undefined].map(st => {
+    try {
+      const v = M.view(null, st, null, at(11, 13), undefined)
+      return [v.status, v.stale, v.items.length, v.sections.length, v.next, v.openToday, v.overdue, v.updated, v.label.mode]
+    } catch (e) { return "threw: " + e.message }
+  })
+  eq(results, [["loading", false, 0, 0, null, 0, 0, "", "loading"], ["ok", false, 0, 0, null, 0, 0, "", "loading"],
+               ["offline", false, 0, 0, null, 0, 0, "", "offline"], ["error", false, 0, 0, null, 0, 0, "", "error"],
+               ["stale", true, 0, 0, null, 0, 0, "", "loading"], ["loading", false, 0, 0, null, 0, 0, "", "loading"],
+               ["loading", false, 0, 0, null, 0, 0, "", "loading"]], "view: null payload, every status")
+}
+{
+  const v = M.view(P(all), "ok", "", at(11, 13), { label: "Count" })
+  eq([v.status, v.stale, v.items.length, v.sections.length, v.next.item.line, v.openToday, v.overdue, v.updated, v.label.text, v.settings.label],
+     ["ok", false, 7, 5, 63, 3, 1, "11:13", "3", "Count"], "view: populated")
+}
+eq(typeof M.view(null, "ok", null, new Date(NaN), null).tooltip, "string", "view: invalid now does not throw")
+eq([M.PROTOCOL, M.MAX_ITEMS, M.MAX_TITLE, M.NOW_GRACE_MIN, M.STALE_AFTER_MS, M.ID_RE.test("a:b")],
+   [1, 200, 200, 30, 60000, true], "constants")
+
+console.log((failed ? "FAIL " : "ok   ") + (count - failed) + "/" + count + " passed")
+process.exit(failed ? 1 : 0)
