@@ -1,0 +1,39 @@
+#+TITLE: Demo agenda
+#+TODO: NEXT TODO WAIT | DONE CANCELED
+#+STARTUP: overview
+
+# Fake data for the README screenshots.  The dates are rewritten for
+# screenshots: shift them so "today" is the day you take them.  Point
+# the widget at this file with
+#   omarchy bar set ovistoica.org-agenda agendaFiles /abs/path/docs/demo-agenda.org
+
+* Acme
+:PROPERTIES:
+:CATEGORY: acme
+:END:
+** NEXT Design review: onboarding flow                           :meeting:
+SCHEDULED: <2026-10-13 Tue 13:15-14:00>
+** TODO 1:1 with Sam                                             :meeting:
+SCHEDULED: <2026-10-13 Tue 16:30-17:00>
+** NEXT [#A] Ship the v2 release notes
+SCHEDULED: <2026-10-13 Tue>
+** TODO Reply to the security questionnaire
+DEADLINE: <2026-10-08 Thu>
+** NEXT Write the Q4 planning doc
+SCHEDULED: <2026-10-01 Thu>
+** TODO Submit the conference talk proposal
+DEADLINE: <2026-10-16 Fri>
+** DONE Merge the dependency updates
+CLOSED: [2026-10-13 Tue 09:12] SCHEDULED: <2026-10-13 Tue>
+
+* House
+:PROPERTIES:
+:CATEGORY: house
+:END:
+** TODO Water the plants
+SCHEDULED: <2026-10-11 Sun .+1d>
+:PROPERTIES:
+:STYLE: habit
+:END:
+** Birthdays
+%%(org-anniversary 1990 10 13) Alex is %d years old
