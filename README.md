@@ -51,8 +51,9 @@ never writes to your Emacs config, and its agenda file in
 - The plugin loads a small elisp helper
   ([`elisp/omarchy-org-agenda.el`](elisp/omarchy-org-agenda.el)) into your
   running Emacs through `emacsclient`.
-- Emacs writes today's agenda as JSON to
-  `$XDG_RUNTIME_DIR/omarchy-org-agenda/`, and the bar watches that file.
+- Emacs writes today's agenda, plus the tasks scheduled on the next few
+  days, as JSON to `$XDG_RUNTIME_DIR/omarchy-org-agenda/`, and the bar
+  watches that file.
 - The bar never polls. Emacs pushes a fresh export whenever an Org
   buffer is saved or reverted, a TODO state changes, or an agenda
   buffer is rebuilt.
@@ -75,6 +76,17 @@ state, `r` refreshes, `Esc` closes.
 Opening an entry (click or `↵`) shows its file at the heading in the
 current Emacs frame, the way `emacsclient +LINE FILE` would, and focuses
 the Emacs window.
+
+**Coming up**
+
+The popout's last section looks ahead. It lists Org's warnings for
+upcoming deadlines, and the tasks scheduled on the next `upcomingDays`
+days (a week by default), soonest first. Each row starts with the day:
+`Thu` within the week, `27 Oct` further out. A task shows once, on its
+next date, even if it repeats; a repeating task that is already on
+today's agenda isn't listed again. Plain timestamps and diary entries on
+later days aren't included. Set `upcomingDays` to `0` to list deadline
+warnings only.
 
 **Changing a state**
 
@@ -139,6 +151,7 @@ omarchy bar set ovistoica.org-agenda label Count
 | `overdueBadge`   | boolean | `true`        | Show the overdue count badge                                                                              |
 | `habitsInBadge`  | boolean | `false`       | Count missed habits as overdue                                                                            |
 | `showDone`       | boolean | `true`        | Keep done entries in the popout, struck through                                                           |
+| `upcomingDays`   | integer | `7`           | Days after today whose scheduled tasks Coming up lists (0–31); `0` lists deadline warnings only           |
 | `pushUpdates`    | boolean | `true`        | Let Emacs push changes (installs the hooks listed below)                                                  |
 | `socketName`     | string  | `""`          | Emacs server socket name or path; blank is the default socket                                            |
 | `serverFile`     | path    | `""`          | Server file of a TCP Emacs server; blank uses the socket                                                  |

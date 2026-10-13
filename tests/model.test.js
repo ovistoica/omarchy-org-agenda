@@ -14,7 +14,7 @@ const M = new Function(src + "; return { PROTOCOL, MAX_ITEMS, MAX_TITLE, ID_RE, 
   " fallbackOpenArgs, isNoServer, backoffMs, dateKey, isNewDay, isOld, keywordColor, view," +
   " basename, isDeadline, rowLead, rowTrail, rowLocation, sectionHint, nextMeta, footerLine," +
   " panelMode, errorMessage, panelModel, refocus, stateChoices, canChangeState, stateForm," +
-  " takeNoteForm, parseStateResult, stateMessage, entryKey, pickerHint, ITEM_TYPES }")()
+  " takeNoteForm, parseStateResult, stateMessage, entryKey, pickerHint, ITEM_TYPES, payloadDay }")()
 
 let failed = 0
 let count = 0
@@ -35,7 +35,7 @@ const at = (h, m) => new Date(2026, 9, 13, h, m)
 function item(over) {
   return Object.assign({ id: null, path: "/home/u/org/cal.org", line: 1, type: "scheduled",
     todo: null, done: false, title: "x", priority: null, category: "cal", tags: [],
-    time: null, durationMin: null, overdueDays: 0, habit: false }, over)
+    time: null, durationMin: null, overdueDays: 0, inDays: 0, habit: false }, over)
 }
 function payloadOf(items, over) {
   return Object.assign({ version: 1, date: "2026-10-13", generatedAt: "2026-10-13T11:13:04+0300",
@@ -89,6 +89,12 @@ eq(parsedItems([item({ id: "bad id!" }), item({ id: "x\") (shell-command \"rm\")
 }
 eq(parsedItems([item({ priority: "A", tags: ["a", "b"] })]).map(i => [i.priority, i.tags]), [["A", ["a", "b"]]], "parse: priority and tags kept")
 {
+  const old = item({ type: "upcoming-deadline" }); delete old.inDays
+  eq(parsedItems([old])[0].inDays, 0, "parse: payload without inDays (pre-0.3) -> 0")
+  eq(parsedItems([4, -1, 1.5, "3", null, 0].map(d => item({ inDays: d }))).map(i => i.inDays),
+     [4, 0, 0, 0, 0, 0], "parse: inDays validated")
+}
+{
   const v = parsed(payloadOf([], { keywords: { todo: ["A", 1, "B"], done: "x",
     colors: { A: "#00ff00", B: "red", C: "#12345", D: "#abcdefg", E: "#AbCdEf" } } })).value
   eq(v.keywords, { todo: ["A", "B"], done: [], colors: { A: "#00ff00", E: "#AbCdEf" }, keys: {} },
@@ -133,6 +139,33 @@ eq(M.sections(all, { showDone: false })[1].items.map(i => i.line), [20], "sectio
 eq(M.sections([doneTask], { showDone: false }), [], "sections: all done hidden")
 eq(M.sections([], {}), [], "sections: empty")
 
+// A task scheduled on a later day. Org can date a repeat by its past base
+// date, so a bad overdueDays mustn't make it overdue either.
+const tomorrow = item({ line: 90, todo: "TODO", title: "Call the bank", time: "09:30", inDays: 1 })
+const repeat = item({ line: 91, type: "past-scheduled", title: "Weekly review", inDays: 4, overdueDays: 3 })
+eq([tomorrow, repeat, item({ inDays: 2, habit: true }), item({ type: "upcoming-deadline", inDays: 0 }),
+    item({ type: "upcoming-deadline", inDays: 3, overdueDays: 2 })].map(M.classify),
+   ["upcoming", "upcoming", "habit", "upcoming", "upcoming"], "classify: habit, then inDays/upcoming-deadline, then overdue")
+eq(M.sections(all.concat([tomorrow, repeat]), {}).map(s => [s.key, s.items.map(i => i.line)]),
+   [["schedule", [63, 10]], ["today", [20, 60]], ["habits", [30]], ["overdue", [40]], ["upcoming", [50, 90, 91]]],
+   "sections: later-day tasks only under Coming up")
+eq([M.nextUp([tomorrow], at(8, 0)), M.openToday([tomorrow, repeat]), M.overdueCount([repeat], { habitsInBadge: true })],
+   [null, 0, 0], "later-day task: not next up, not open today, not overdue")
+eq(M.view(payloadOf([tomorrow, repeat]), "ok", "", at(8, 0), {}).label,
+   { mode: "clear", text: "", badge: 0, alert: false }, "later-day task: bar stays clear")
+{
+  const ups = [[1, 3], [2, 1], [3, 3], [4, 1], [5, 1], [6, 0], [7, 2]]
+    .map(c => item({ line: c[0], type: c[1] ? "scheduled" : "upcoming-deadline", inDays: c[1] }))
+  eq(M.sections(ups, {})[0].items.map(i => i.line), [6, 2, 4, 5, 7, 1, 3], "sections: Coming up by inDays, ties in Org order")
+  const many = Array.from({ length: 40 }, (_, i) => item({ line: i + 1, inDays: 1 + (i % 3) }))
+  const lines = M.sections(many, {})[0].items.map(i => i.line)
+  eq([lines.slice(0, 4), lines.length, lines.every((l, k) => k === 0 || many[l - 1].inDays > many[lines[k - 1] - 1].inDays
+                                                     || l > lines[k - 1])],
+     [[1, 4, 7, 10], 40, true], "sections: stable on many ties")
+  const timed = [item({ line: 1, time: "09:00" }), item({ line: 2, time: "08:00" })]
+  eq(M.sections(timed, {})[0].items.map(i => i.line), [1, 2], "sections: other sections keep Org order")
+}
+
 // ---------------------------------------------------------------- counts
 
 eq(M.openToday(all), 3, "openToday")
@@ -164,7 +197,9 @@ eq(M.nextUp([sync], new Date(NaN)), null, "nextUp: invalid now -> null")
 
 eq(M.normalizeSettings(null), { label: "Next item", maxTitleChars: 28, overdueBadge: true, habitsInBadge: false,
   showDone: true, pushUpdates: true, socketName: "", serverFile: "", emacsclient: "", agendaFiles: "",
-  agendaKey: "a", emacsApp: "emacs", timeoutSeconds: 5 }, "normalizeSettings: defaults")
+  agendaKey: "a", emacsApp: "emacs", timeoutSeconds: 5, upcomingDays: 7 }, "normalizeSettings: defaults")
+eq([-5, 0, 3, "12", 2.6, 99, "x", null, true].map(v => M.normalizeSettings({ upcomingDays: v }).upcomingDays),
+   [0, 0, 3, 12, 3, 31, 7, 7, 7], "normalizeSettings: upcomingDays clamped to 0..31")
 {
   const s = M.normalizeSettings({ label: "Bogus", maxTitleChars: 500, timeoutSeconds: 0, overdueBadge: "no",
     habitsInBadge: "yes", showDone: false, pushUpdates: false, socketName: "  work ", agendaKey: "  ", emacsApp: " " })
@@ -242,10 +277,13 @@ const PRE = "(unless (and (boundp 'omarchy-org-agenda--source-mtime) (equal omar
 eq(M.loadPreamble(ELISP), PRE, "loadPreamble")
 eq(throws(() => M.loadPreamble("omarchy-org-agenda")), true, "loadPreamble: relative throws")
 eq(M.pullForm(ELISP, OUT, { agendaFiles: "/home/u/org/a.org:/home/u/org/b.org" }, "save"),
-   "(progn " + PRE + " (omarchy-org-agenda-ensure \"" + OUT + "\" (list \"/home/u/org/a.org\" \"/home/u/org/b.org\") t)" +
+   "(progn " + PRE + " (omarchy-org-agenda-ensure \"" + OUT + "\" (list \"/home/u/org/a.org\" \"/home/u/org/b.org\") t 7)" +
    " (omarchy-org-agenda-export \"save\"))", "pullForm: exact")
 eq(M.pullForm(ELISP, OUT, { pushUpdates: false }, "pull").split(PRE)[1],
-   " (omarchy-org-agenda-ensure \"" + OUT + "\" nil nil) (omarchy-org-agenda-export \"pull\"))", "pullForm: nil files, push nil")
+   " (omarchy-org-agenda-ensure \"" + OUT + "\" nil nil 7) (omarchy-org-agenda-export \"pull\"))", "pullForm: nil files, push nil")
+eq([0, 12, "12", 99, -1, "x", "3) (shell-command \"rm\""].map(d =>
+     / t (\S+)\) \(omarchy-org-agenda-export/.exec(M.pullForm(ELISP, OUT, { upcomingDays: d }, "pull"))[1]),
+   ["0", "12", "12", "31", "0", "7", "7"], "pullForm: upcomingDays as a bare clamped integer")
 eq(["Save", "a\"b", "x".repeat(21), undefined, "new-day"].map(r => /export "([^"]*)"/.exec(M.pullForm(ELISP, OUT, {}, r))[1]),
    ["pull", "pull", "pull", "pull", "new-day"], "pullForm: reason sanitised")
 eq([throws(() => M.pullForm("x.el", OUT, {}, "pull")), throws(() => M.pullForm(ELISP, "out.json", {}, "pull")),
@@ -469,8 +507,24 @@ eq([sync, soon, item({ type: "deadline" }), task].map(M.isDeadline), [false, tru
 eq([sync, late, habit, soon, task, item({ habit: true, time: "07:00" })].map(M.rowLead),
    [{ text: "13:00", urgent: false }, { text: "3d", urgent: true }, { text: "", urgent: false },
     { text: "", urgent: false }, { text: "", urgent: false }, { text: "07:00", urgent: false }], "rowLead")
+{
+  // 2026-10-28 is a Wednesday; the week runs into November.
+  const wed = new Date(2026, 9, 28)
+  const lead = (d, today) => M.rowLead(item({ inDays: d }), today).text
+  eq([1, 4, 6, 7, 30].map(d => lead(d, wed)), ["Thu", "Sun", "Tue", "4 Nov", "27 Nov"], "rowLead: weekday, then d MMM, across a month")
+  eq([lead(3, new Date(2026, 11, 30)), lead(7, new Date(2026, 11, 30))], ["Sat", "6 Jan"], "rowLead: across a year")
+  eq(M.rowLead(item({ inDays: 14 }), M.payloadDay(P([]))), { text: "27 Oct", urgent: false }, "rowLead: from the payload's day")
+  eq([lead(3, null), lead(3, new Date(NaN))], ["+3d", "+3d"], "rowLead: no day -> +Nd")
+  eq([M.rowLead(item({ type: "upcoming-deadline", inDays: 2 }), wed).text, M.rowLead(soon, wed).text],
+     ["Fri", ""], "rowLead: upcoming deadline; old payload without inDays -> blank")
+  eq(M.rowLead(repeat, wed), { text: "Sun", urgent: false }, "rowLead: later-day repeat isn't urgent")
+}
+eq([M.payloadDay(P([])).getTime(), M.payloadDay(null), M.payloadDay({ date: "13 Oct" })],
+   [new Date(2026, 9, 13).getTime(), null, null], "payloadDay")
 eq([sync, habit, item({ habit: true }), item({ category: null })].map(M.rowTrail),
    ["cal", "2d", "cal", ""], "rowTrail: category, missed days")
+eq([tomorrow, Object.assign({}, tomorrow, { category: null }), item({ inDays: 2 }), sync].map(M.rowTrail),
+   ["09:30 · cal", "09:30", "cal", "cal"], "rowTrail: a coming-up time goes before the category")
 eq(M.rowLocation(sync), "cal.org:63", "rowLocation")
 eq(["habits", "overdue", "today"].map(M.sectionHint), ["missed days", "", ""], "sectionHint")
 {

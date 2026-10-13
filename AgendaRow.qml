@@ -28,7 +28,9 @@ CursorSurface {
 
   readonly property color textColor: Commons.Color.popups.text
   readonly property color mutedColor: Commons.Color.muted
-  readonly property var lead: item ? Model.rowLead(item) : ({ text: "", urgent: false })
+  // A coming-up entry's lead names its day, counted from the export's day.
+  readonly property var lead: item ? Model.rowLead(item, Model.payloadDay(payload))
+                                   : ({ text: "", urgent: false })
   readonly property string keyword: item && item.todo ? item.todo : ""
   readonly property string keywordHex: keyword ? Model.keywordColor(payload, keyword) : ""
   readonly property color keywordColor: keywordHex !== "" ? keywordHex : mutedColor

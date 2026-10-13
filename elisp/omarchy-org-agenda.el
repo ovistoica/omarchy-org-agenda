@@ -7,8 +7,9 @@
 
 ;;; Commentary:
 
-;; Writes today's agenda as JSON to `omarchy-org-agenda-output'.  The bar's
-;; file list is `omarchy-org-agenda-files-override', else
+;; Writes today's agenda as JSON to `omarchy-org-agenda-output', followed
+;; by the tasks scheduled on the next `omarchy-org-agenda-upcoming-days'
+;; days.  The bar's file list is `omarchy-org-agenda-files-override', else
 ;; `omarchy-org-agenda-files', else `org-agenda-files'.
 ;;
 ;; `omarchy-org-agenda-set-state' changes an exported entry's TODO state
@@ -66,7 +67,14 @@ The plugin's own file setting, when given, takes precedence over this."
 Set by the plugin on every `omarchy-org-agenda-ensure'; it takes
 precedence over `omarchy-org-agenda-files'.")
 
-(defvar omarchy-org-agenda-max-items 200)
+(defvar omarchy-org-agenda-upcoming-days 7
+  "How many days after today the export looks ahead for scheduled tasks.
+Their SCHEDULED entries follow today's agenda in the export, once per
+heading, for the bar's \"Coming up\" section; 0 exports today only.
+Set by the plugin on `omarchy-org-agenda-ensure', within 0..31.")
+
+(defvar omarchy-org-agenda-max-items 200
+  "Bound on the exported items, today's first.")
 (defvar omarchy-org-agenda-max-title 200)
 
 (defvar omarchy-org-agenda--timer nil)
@@ -126,8 +134,10 @@ and `omarchy-org-agenda-set-state''s check use it, so they agree."
       (let ((cookie (match-string-no-properties 3)))
         (and cookie (substring cookie 2 3))))))
 
-(defun omarchy-org-agenda--item (entry today)
-  "The JSON plist for agenda ENTRY; TODAY is an absolute day number."
+(defun omarchy-org-agenda--item (entry today &optional day)
+  "The JSON plist for agenda ENTRY; TODAY is an absolute day number.
+DAY is the later day ENTRY was collected for, nil for today's agenda.
+:inDays counts the days until DAY, or until an upcoming deadline."
   (let ((marker (or (omarchy-org-agenda--prop entry 'org-hd-marker)
                     (omarchy-org-agenda--prop entry 'org-marker)))
         (type (omarchy-org-agenda--prop entry 'type))
@@ -157,7 +167,12 @@ and `omarchy-org-agenda-set-state''s check use it, so they agree."
             ;; Org keeps durations as floats; the bar wants whole minutes.
             :durationMin (let ((duration (omarchy-org-agenda--prop entry 'duration)))
                            (if duration (round duration) :null))
-            :overdueDays (if (and ts (< ts today)) (- today ts) 0)
+            ;; On a later day, `ts-date' can be a repeater's past base
+            ;; date: that occurrence isn't overdue.
+            :overdueDays (if (and ts (< ts today) (not day)) (- today ts) 0)
+            :inDays (cond (day (- day today))
+                          ((and ts (> ts today)) (- ts today))
+                          (t 0))
             :habit (if (omarchy-org-agenda--prop entry 'org-habit-p) t :false)))))
 
 (defun omarchy-org-agenda--files ()
@@ -171,8 +186,20 @@ Precedence: `omarchy-org-agenda-files-override', then
     ;; asks about missing files.
     (org-agenda-files nil 'ifmode)))
 
-(defun omarchy-org-agenda--entries (files)
-  "Today's agenda entries in FILES, sorted like the user's own day agenda.
+(defun omarchy-org-agenda--day-entries (files date types)
+  "Agenda entries of TYPES on DATE in FILES, sorted like a day agenda.
+DATE is (MONTH DAY YEAR); TYPES are `org-agenda-get-day-entries' keywords.
+Call it within `omarchy-org-agenda--entries', which prepares FILES."
+  (sort (mapcan (lambda (file)
+                  (apply #'org-agenda-get-day-entries file date types))
+                files)
+        #'org-entries-lessp))
+
+(defun omarchy-org-agenda--entries (files &optional days)
+  "Agenda entries in FILES for today and the DAYS days after it.
+Returns a list of (OFFSET . ENTRIES), one per day in order: OFFSET 0
+holds today's whole agenda, each later day only its SCHEDULED entries.
+Each day is sorted like the user's own day agenda.
 Every file in FILES must exist, or Org prompts to remove it from the list."
   (let* ((org-agenda-files files)
          (org-agenda-sorting-strategy-selected nil)
@@ -181,14 +208,46 @@ Every file in FILES must exist, or Org prompts to remove it from the list."
          ;; cache there, at about 5x the cost (still ~40 ms for 10 files).
          (org-element-use-cache (and (version<= "9.7" (org-release))
                                      org-element-use-cache))
-         (date (calendar-current-date)))
+         (today (calendar-absolute-from-gregorian (calendar-current-date))))
     (org-agenda-prepare-buffers files)
     (org-set-sorting-strategy 'agenda)
-    (sort (mapcan (lambda (file)
-                    (org-agenda-get-day-entries file date
-                                                :deadline :scheduled :timestamp :sexp))
-                  files)
-          #'org-entries-lessp)))
+    (cons (cons 0 (omarchy-org-agenda--day-entries
+                   files (calendar-current-date)
+                   '(:deadline :scheduled :timestamp :sexp)))
+          (mapcar (lambda (offset)
+                    (cons offset (omarchy-org-agenda--day-entries
+                                  files
+                                  (calendar-gregorian-from-absolute (+ today offset))
+                                  '(:scheduled))))
+                  (number-sequence 1 (or days 0))))))
+
+(defun omarchy-org-agenda--key (item)
+  "The (PATH . LINE) of the heading behind the JSON ITEM."
+  (cons (plist-get item :path) (plist-get item :line)))
+
+(defun omarchy-org-agenda--items (days today)
+  "JSON plists for DAYS, the (OFFSET . ENTRIES) list of `--entries'.
+TODAY is an absolute day number.  Today's entries come first, as Org
+lists them; a later day's entry is dropped when its heading is already
+listed, so a repeating task shows once, at its next occurrence.  At most
+`omarchy-org-agenda-max-items' in all, today's kept first."
+  (let* ((max omarchy-org-agenda-max-items)
+         (now (mapcar (lambda (entry) (omarchy-org-agenda--item entry today))
+                      (seq-take (cdar days) max)))
+         (seen (make-hash-table :test #'equal))
+         (later nil))
+    ;; A diary sexp's row isn't its heading's, which may be scheduled.
+    (dolist (item now)
+      (unless (equal (plist-get item :type) "sexp")
+        (puthash (omarchy-org-agenda--key item) t seen)))
+    (when (< (length now) max)
+      (pcase-dolist (`(,offset . ,entries) (cdr days))
+        (dolist (entry entries)
+          (let ((item (omarchy-org-agenda--item entry today (+ today offset))))
+            (unless (gethash (omarchy-org-agenda--key item) seen)
+              (puthash (omarchy-org-agenda--key item) t seen)
+              (push item later))))))
+    (seq-take (append now (nreverse later)) max)))
 
 (defun omarchy-org-agenda--color (kwd)
   "Foreground of the TODO face for KWD as #rrggbb, or nil."
@@ -254,9 +313,11 @@ See `omarchy-org-agenda--index'."
 
 (defun omarchy-org-agenda-export (&optional reason)
   "Write today's agenda to `omarchy-org-agenda-output'.
-REASON (default \"pull\") is echoed in the payload.  Agenda files that
-don't exist are skipped and listed under :missing.  Errors are written
-into the file too, so the bar can show them."
+The tasks scheduled on the next `omarchy-org-agenda-upcoming-days' days
+follow it, with their :inDays.  REASON (default \"pull\") is echoed in
+the payload.  Agenda files that don't exist are skipped and listed
+under :missing.  Errors are written into the file too, so the bar can
+show them."
   (let* ((omarchy-org-agenda--exporting t)
          ;; Collected afresh from this export's files, without disturbing
          ;; the user's agenda buffer, which reads them too.
@@ -274,10 +335,10 @@ into the file too, so the bar can show them."
          (let* ((files (omarchy-org-agenda--files))
                 (missing (seq-remove #'file-exists-p files))
                 (present (seq-difference files missing))
-                (entries (seq-take (omarchy-org-agenda--entries present)
-                                   omarchy-org-agenda-max-items))
-                (items (mapcar (lambda (e) (omarchy-org-agenda--item e today))
-                               entries)))
+                (items (omarchy-org-agenda--items
+                        (omarchy-org-agenda--entries
+                         present omarchy-org-agenda-upcoming-days)
+                        today)))
            (setq omarchy-org-agenda--index (omarchy-org-agenda--build-index items))
            (append base
                    (list :keywords (omarchy-org-agenda--keywords present)
@@ -326,11 +387,16 @@ list doesn't follow `org-agenda-files', so its changes don't matter."
                       omarchy-org-agenda-files)))
     (omarchy-org-agenda--schedule "files")))
 
-(defun omarchy-org-agenda-ensure (output &optional files push)
+(defun omarchy-org-agenda-ensure (output &optional files push upcoming)
   "Point the exporter at OUTPUT; idempotent, called by the plugin on every pull.
-FILES overrides `org-agenda-files'.  PUSH installs the change hooks."
+FILES overrides `org-agenda-files'.  PUSH installs the change hooks.
+UPCOMING, an integer clamped to 0..31, sets
+`omarchy-org-agenda-upcoming-days'; nil, as older plugins send, keeps it.
+Exports the hooks trigger use these settings too."
   (setq omarchy-org-agenda-output (expand-file-name output)
         omarchy-org-agenda-files-override files)
+  (when (integerp upcoming)
+    (setq omarchy-org-agenda-upcoming-days (min 31 (max 0 upcoming))))
   (unless (eq (and push t) omarchy-org-agenda--push)
     (omarchy-org-agenda--remove-push-hooks)
     (when push

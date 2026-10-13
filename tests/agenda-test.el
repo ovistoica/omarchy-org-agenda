@@ -126,6 +126,7 @@ cleaned up afterwards."
            (org-agenda-files nil)
            (omarchy-org-agenda-files nil)
            (omarchy-org-agenda-files-override nil)
+           (omarchy-org-agenda-upcoming-days 7)
            (omarchy-org-agenda-output nil))
        (unwind-protect (progn ,@body)
          (omarchy-org-agenda-teardown)
@@ -212,11 +213,13 @@ cleaned up afterwards."
         (should (equal "A" (plist-get timed :priority)))
         (should (equal "NEXT" (plist-get timed :todo)))
         (should (eq :false (plist-get timed :done)))
-        (should (equal "Timed meeting today" (plist-get timed :title))))
+        (should (equal "Timed meeting today" (plist-get timed :title)))
+        (should (equal 0 (plist-get timed :inDays))))
       (let ((overdue (funcall item "Overdue task")))
         (should (equal "Overdue task with a link" (plist-get overdue :title)))
         (should (equal ["work"] (plist-get overdue :tags)))
         (should (equal 12 (plist-get overdue :overdueDays)))
+        (should (equal 0 (plist-get overdue :inDays)))
         (should (equal "fixture-overdue" (plist-get overdue :id))))
       (let ((deadline (funcall item "Deadline today")))
         (should (equal "WAIT" (plist-get deadline :todo)))
@@ -225,7 +228,8 @@ cleaned up afterwards."
         (should (eq :null (plist-get deadline :priority))))
       (let ((upcoming (funcall item "Upcoming deadline")))
         (should (equal "upcoming-deadline" (plist-get upcoming :type)))
-        (should (equal 0 (plist-get upcoming :overdueDays))))
+        (should (equal 0 (plist-get upcoming :overdueDays)))
+        (should (equal 3 (plist-get upcoming :inDays))))
       (should (funcall item
                        "<img src=\"https://example.invalid/x\"> markup-shaped title"))
       (let ((done (funcall item "Finished earlier today")))
@@ -920,6 +924,192 @@ Dependencies are enforced like a typical configuration."
                                        :result)))
       (should (equal "REPEAT" (omarchy-org-agenda-test--todo file "Alpha"))))))
 
+;;;; Coming up: tasks scheduled on later days
+
+(defun omarchy-org-agenda-test--upcoming-text ()
+  "The look-ahead fixture: today's entries and tasks scheduled later."
+  (let ((ts #'omarchy-org-agenda-test--ts))
+    (concat
+     "#+TODO: NEXT TODO WAIT | DONE CANCELED\n\n"
+     "* NEXT Task for today\n"
+     "SCHEDULED: " (funcall ts 0) "\n"
+     "* TODO Weekly since three days ago\n"
+     "SCHEDULED: " (funcall ts -3 nil "+1w") "\n"
+     "* TODO Habit since two days ago\n"
+     "SCHEDULED: " (funcall ts -2 nil ".+1d") "\n"
+     ":PROPERTIES:\n:STYLE: habit\n:END:\n"
+     "* TODO Deadline in five days\n"
+     "DEADLINE: " (funcall ts 5) "\n"
+     "* TODO Timed task tomorrow\n"
+     "SCHEDULED: " (funcall ts 1 "09:30-10:00") "\n"
+     "* NEXT Daily from tomorrow\n"
+     "SCHEDULED: " (funcall ts 1 nil "+1d") "\n"
+     "* TODO Habit from tomorrow\n"
+     "SCHEDULED: " (funcall ts 1 nil ".+1d") "\n"
+     ":PROPERTIES:\n:STYLE: habit\n:END:\n"
+     "* TODO Task in three days\n"
+     "SCHEDULED: " (funcall ts 3) "\n"
+     "* Event in two days\n"
+     (funcall ts 2 "10:00-11:00") "\n"
+     "* TODO Task beyond the horizon\n"
+     "SCHEDULED: " (funcall ts 9) "\n")))
+
+(defmacro omarchy-org-agenda-test--with-upcoming (spec &rest body)
+  "Run BODY with (FILE PAYLOAD) of SPEC bound to the exported look-ahead fixture.
+Habits show on today only, as Org's default has it."
+  (declare (indent 1) (debug ((symbolp symbolp) body)))
+  `(omarchy-org-agenda-test--with-dir (dir)
+     (let* ((org-habit-show-habits-only-for-today t)
+            (org-agenda-show-future-repeats t)
+            (,(car spec) (omarchy-org-agenda-test--write
+                          (expand-file-name "upcoming.org" dir)
+                          (omarchy-org-agenda-test--upcoming-text)))
+            (,(cadr spec) (omarchy-org-agenda-test--export dir (list ,(car spec)))))
+       (ignore ,(car spec) ,(cadr spec))
+       ,@body)))
+
+(defun omarchy-org-agenda-test--later-p (item)
+  "Non-nil when ITEM was collected for a later day."
+  (and (equal "scheduled" (plist-get item :type))
+       (> (plist-get item :inDays) 0)))
+
+(defun omarchy-org-agenda-test--matching (payload title)
+  "The items of PAYLOAD whose title contains TITLE."
+  (seq-filter (lambda (item) (string-search title (plist-get item :title)))
+              (omarchy-org-agenda-test--items payload)))
+
+(ert-deftest omarchy-org-agenda-test-upcoming-scheduled ()
+  (omarchy-org-agenda-test--with-upcoming (file payload)
+    (let ((timed (omarchy-org-agenda-test--item payload "Timed task tomorrow"))
+          (later (omarchy-org-agenda-test--item payload "Task in three days")))
+      (should (equal "scheduled" (plist-get timed :type)))
+      (should (equal 1 (plist-get timed :inDays)))
+      (should (equal 0 (plist-get timed :overdueDays)))
+      (should (equal "09:30" (plist-get timed :time)))
+      (should (eql 30 (plist-get timed :durationMin)))
+      (should (equal 3 (plist-get later :inDays)))
+      (should (eq :null (plist-get later :time))))
+    (let ((deadline (omarchy-org-agenda-test--item payload "Deadline in five days")))
+      (should (equal "upcoming-deadline" (plist-get deadline :type)))
+      (should (equal 5 (plist-get deadline :inDays))))
+    ;; Only SCHEDULED entries are looked ahead for: no plain timestamps.
+    (should-not (omarchy-org-agenda-test--matching payload "Event in two days"))
+    (should-not (omarchy-org-agenda-test--matching payload "beyond the horizon"))
+    (dolist (item (omarchy-org-agenda-test--items payload))
+      (should (natnump (plist-get item :inDays))))))
+
+(ert-deftest omarchy-org-agenda-test-upcoming-one-row-per-heading ()
+  (omarchy-org-agenda-test--with-upcoming (file payload)
+    ;; A daily repeater shows on every later day; only the first is kept.
+    (let ((daily (omarchy-org-agenda-test--item payload "Daily from tomorrow")))
+      (should (equal 1 (plist-get daily :inDays)))
+      (should (equal 0 (plist-get daily :overdueDays))))
+    ;; Already on today's agenda: its next occurrence adds no row.
+    (let ((weekly (omarchy-org-agenda-test--item payload "Weekly since three days ago")))
+      (should (equal 0 (plist-get weekly :inDays)))
+      (should (equal 3 (plist-get weekly :overdueDays))))
+    (let ((keys (mapcar #'omarchy-org-agenda--key
+                        (seq-filter #'omarchy-org-agenda-test--later-p
+                                    (omarchy-org-agenda-test--items payload)))))
+      (should (equal keys (seq-uniq keys))))))
+
+(ert-deftest omarchy-org-agenda-test-upcoming-habits ()
+  (omarchy-org-agenda-test--with-upcoming (file payload)
+    (let ((habit (omarchy-org-agenda-test--item payload "Habit since two days ago")))
+      (should (eq t (plist-get habit :habit)))
+      (should (equal 0 (plist-get habit :inDays))))
+    ;; `org-habit-show-habits-only-for-today': never on a later day.
+    (should-not (omarchy-org-agenda-test--matching payload "Habit from tomorrow"))))
+
+(ert-deftest omarchy-org-agenda-test-upcoming-repeat-not-overdue ()
+  (omarchy-org-agenda-test--with-upcoming (file payload)
+    ;; The weekly task's next occurrence, before deduplication: Org may
+    ;; date it by its past base date, which must not count as overdue.
+    (let* ((today (calendar-absolute-from-gregorian (calendar-current-date)))
+           (days (omarchy-org-agenda--entries (list file) 7))
+           (entry (seq-find (lambda (e) (string-search "Weekly" e))
+                            (alist-get 4 days)))
+           (item (omarchy-org-agenda--item entry today (+ today 4))))
+      (should entry)
+      (should (equal 4 (plist-get item :inDays)))
+      (should (equal 0 (plist-get item :overdueDays))))))
+
+(ert-deftest omarchy-org-agenda-test-upcoming-order ()
+  (omarchy-org-agenda-test--with-upcoming (file payload)
+    (let* ((items (omarchy-org-agenda-test--items payload))
+           (later (seq-drop-while (lambda (i) (not (omarchy-org-agenda-test--later-p i)))
+                                  items))
+           (days (mapcar (lambda (i) (plist-get i :inDays)) later)))
+      ;; Today's agenda first, then the later days, in order.
+      (should (= 3 (length later)))
+      (should (seq-every-p #'omarchy-org-agenda-test--later-p later))
+      (should (equal days (sort (copy-sequence days) #'<)))
+      (should (equal '(1 1 3) days))
+      ;; Within a day, Org's sorting: the timed task first.
+      (should (string-search "Timed task tomorrow" (plist-get (car later) :title)))
+      (should (= 4 (- (length items) (length later)))))))
+
+(ert-deftest omarchy-org-agenda-test-upcoming-days-zero ()
+  (omarchy-org-agenda-test--with-dir (dir)
+    (let* ((org-habit-show-habits-only-for-today t)
+           (file (omarchy-org-agenda-test--write
+                  (expand-file-name "upcoming.org" dir)
+                  (omarchy-org-agenda-test--upcoming-text)))
+           (out (expand-file-name "agenda.json" dir)))
+      (omarchy-org-agenda-ensure out (list file) nil 0)
+      (omarchy-org-agenda-export)
+      (let ((payload (omarchy-org-agenda-test--read out)))
+        (should-not (seq-filter #'omarchy-org-agenda-test--later-p
+                                (omarchy-org-agenda-test--items payload)))
+        ;; Org's own deadline warning still counts its days.
+        (should (equal 5 (plist-get (omarchy-org-agenda-test--item
+                                     payload "Deadline in five days")
+                                    :inDays)))))))
+
+(ert-deftest omarchy-org-agenda-test-upcoming-cap ()
+  (omarchy-org-agenda-test--with-upcoming (file payload)
+    (let* ((today-count (seq-count (lambda (i) (not (omarchy-org-agenda-test--later-p i)))
+                                   (omarchy-org-agenda-test--items payload)))
+           (export (lambda (max)
+                     (let ((omarchy-org-agenda-max-items max))
+                       (omarchy-org-agenda-test--items
+                        (omarchy-org-agenda-test--export
+                         (file-name-directory file) (list file)))))))
+      (should (= 4 today-count))
+      (let ((items (funcall export (1+ today-count))))
+        (should (= (1+ today-count) (length items)))
+        (should (equal '(nil nil nil nil t)
+                       (mapcar (lambda (i) (and (omarchy-org-agenda-test--later-p i) t))
+                               items))))
+      (let ((items (funcall export 2)))
+        (should (= 2 (length items)))
+        (should-not (seq-some #'omarchy-org-agenda-test--later-p items))))))
+
+(ert-deftest omarchy-org-agenda-test-upcoming-ensure ()
+  (omarchy-org-agenda-test--with-dir (dir)
+    (let ((out (expand-file-name "agenda.json" dir)))
+      (omarchy-org-agenda-ensure out nil nil 5)
+      (should (= 5 omarchy-org-agenda-upcoming-days))
+      (omarchy-org-agenda-ensure out nil nil)
+      (should (= 5 omarchy-org-agenda-upcoming-days))
+      (omarchy-org-agenda-ensure out nil nil "9")
+      (should (= 5 omarchy-org-agenda-upcoming-days))
+      (omarchy-org-agenda-ensure out nil nil 40)
+      (should (= 31 omarchy-org-agenda-upcoming-days))
+      (omarchy-org-agenda-ensure out nil nil -3)
+      (should (= 0 omarchy-org-agenda-upcoming-days)))))
+
+(ert-deftest omarchy-org-agenda-test-upcoming-set-state ()
+  (omarchy-org-agenda-test--with-upcoming (file payload)
+    (let* ((item (omarchy-org-agenda-test--item payload "Task in three days"))
+           (line (plist-get item :line)))
+      (should (gethash (omarchy-org-agenda--key item) omarchy-org-agenda--index))
+      (let ((r (omarchy-org-agenda-test--set-state file line nil "TODO" "DONE")))
+        (should (equal "done" (plist-get r :result)))
+        (should (equal "DONE" (plist-get r :state))))
+      (should (string-search "* DONE Task in three days"
+                             (omarchy-org-agenda-test--disk file))))))
+
 (defun omarchy-org-agenda-test--queue-note (dir)
   "Leave a state-change note queued for a fixture in DIR; return its timer."
   (let* ((file (omarchy-org-agenda-test--write
@@ -965,7 +1155,8 @@ Dependencies are enforced like a typical configuration."
           (should-not (get-variable-watchers 'org-agenda-files))
           (omarchy-org-agenda-test--note-gone timer)
           (should-not (boundp 'omarchy-org-agenda--index))
-          (should-not (boundp 'omarchy-org-agenda--note)))
+          (should-not (boundp 'omarchy-org-agenda--note))
+          (should-not (boundp 'omarchy-org-agenda-upcoming-days)))
       (load omarchy-org-agenda-test--source nil t)
       (omarchy-org-agenda-test--clear-notes)
       (omarchy-org-agenda-test--kill-buffers dir)

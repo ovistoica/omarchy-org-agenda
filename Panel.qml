@@ -221,11 +221,13 @@ PanelKeyCatcher {
     else if (t === "t") root.openPicker(root.selected)
   }
 
+  // The widest lead: a coming-up date ("27 Oct") is a cell wider than a
+  // time ("13:00") in Omarchy's monospace font.
   TextMetrics {
     id: leadMetrics
     font.family: root.fontFamily
     font.pixelSize: Style.font.bodySmall
-    text: "00:00"
+    text: "30 May"
   }
 
   PointerMoveGate {

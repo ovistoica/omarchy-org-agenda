@@ -23,6 +23,10 @@ DEADLINE: <2026-10-08 Thu>
 SCHEDULED: <2026-10-01 Thu>
 ** TODO Submit the conference talk proposal
 DEADLINE: <2026-10-16 Fri>
+** NEXT Prepare the sprint demo
+SCHEDULED: <2026-10-14 Wed>
+** TODO Customer call: renewal terms                             :meeting:
+SCHEDULED: <2026-10-16 Fri 10:00-10:45>
 ** DONE Merge the dependency updates
 CLOSED: [2026-10-13 Tue 09:12] SCHEDULED: <2026-10-13 Tue>
 

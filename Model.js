@@ -30,6 +30,8 @@ const ITEM_TYPES = ["scheduled", "past-scheduled", "deadline", "upcoming-deadlin
                     "timestamp", "sexp", "block"]
 const LABELS = ["Next item", "Count", "Icon"]
 const STATUSES = ["loading", "ok", "offline", "error", "stale"]
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 const SECTION_ORDER = [
   { key: "schedule", cls: "schedule", title: "Schedule" },
   { key: "today", cls: "today", title: "Today" },
@@ -91,6 +93,9 @@ function normalizeItem(raw) {
     time: isStr(raw.time) && TIME_RE.test(raw.time) ? raw.time : null,
     durationMin: nonNegInt(raw.durationMin) ? raw.durationMin : null,
     overdueDays: nonNegInt(raw.overdueDays) ? raw.overdueDays : 0,
+    // Days until a later day's scheduled task or an upcoming deadline;
+    // older payloads have none.
+    inDays: nonNegInt(raw.inDays) ? raw.inDays : 0,
     habit: raw.habit === true
   }
 }
@@ -161,20 +166,32 @@ function parse(textIn) {
 
 // ---------------------------------------------------------------- classification
 
+// A later day's task comes before overdue: Org may date a repeat by its
+// past base date.
 function classify(item) {
   if (item.habit) return "habit"
+  if (item.inDays > 0 || item.type === "upcoming-deadline") return "upcoming"
   if (item.overdueDays > 0) return "overdue"
-  if (item.type === "upcoming-deadline") return "upcoming"
   if (item.time) return "schedule"
   return "today"
+}
+
+// Soonest first, ties in Org's order: V4's sort may not be stable.
+function byInDays(items) {
+  return items
+    .map((item, i) => ({ item: item, i: i }))
+    .sort((a, b) => (a.item.inDays - b.item.inDays) || (a.i - b.i))
+    .map(e => e.item)
 }
 
 function sections(items, settings) {
   const s = normalizeSettings(settings)
   const shown = (items || []).filter(i => s.showDone || !i.done)
   return SECTION_ORDER
-    .map(sec => ({ key: sec.key, title: sec.title,
-                   items: shown.filter(i => classify(i) === sec.cls) }))
+    .map(sec => {
+      const its = shown.filter(i => classify(i) === sec.cls)
+      return { key: sec.key, title: sec.title, items: sec.key === "upcoming" ? byInDays(its) : its }
+    })
     .filter(sec => sec.items.length > 0)
 }
 
@@ -188,7 +205,8 @@ function habitCount(items) { return countOpen(items, ["habit"]) }
 
 function overdueCount(items, settings) {
   const withHabits = !!settings && settings.habitsInBadge === true
-  return (items || []).filter(i => !i.done && i.overdueDays > 0 && (withHabits || !i.habit)).length
+  return (items || []).filter(i => !i.done && i.overdueDays > 0 && !(i.inDays > 0)
+                                   && (withHabits || !i.habit)).length
 }
 
 function minutesOf(hm) {
@@ -246,7 +264,8 @@ function normalizeSettings(raw) {
     agendaFiles: settingStr(r.agendaFiles, ""),
     agendaKey: settingStr(r.agendaKey, "a"),
     emacsApp: settingStr(r.emacsApp, "emacs"),
-    timeoutSeconds: settingInt(r.timeoutSeconds, 5, 1, 30)
+    timeoutSeconds: settingInt(r.timeoutSeconds, 5, 1, 30),
+    upcomingDays: settingInt(r.upcomingDays, 7, 0, 31)
   }
 }
 
@@ -372,7 +391,7 @@ function pullForm(elispFile, outputFile, settings, reason) {
   const why = isStr(reason) && REASON_RE.test(reason) ? reason : "pull"
   return "(progn " + loadPreamble(elispFile) +
     " (omarchy-org-agenda-ensure " + out + " " + filesForm(agendaFilesList(s)) + " " +
-    (s.pushUpdates ? "t" : "nil") + ")" +
+    (s.pushUpdates ? "t" : "nil") + " " + s.upcomingDays + ")" +
     " (omarchy-org-agenda-export " + elispString(why) + "))"
 }
 
@@ -586,17 +605,36 @@ function basename(p) {
 
 function isDeadline(item) { return item.type === "deadline" || item.type === "upcoming-deadline" }
 
-// Left column of a popout row: the clock time, or days overdue (urgent).
-function rowLead(item) {
+// The payload's day as a local Date at midnight, or null.
+function payloadDay(payload) {
+  const m = isObj(payload) && isStr(payload.date) && /^(\d{4})-(\d{2})-(\d{2})$/.exec(payload.date)
+  return m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])) : null
+}
+
+// The day `inDays` after `today`: "Wed" within the week, "27 Oct" further
+// out. Fixed English names, so node and QML agree whatever the locale.
+function dayLabel(inDays, today) {
+  if (!(today instanceof Date) || isNaN(today.getTime())) return "+" + inDays + "d"
+  const d = new Date(today.getFullYear(), today.getMonth(), today.getDate() + inDays)
+  return inDays < 7 ? WEEKDAYS[d.getDay()] : d.getDate() + " " + MONTHS[d.getMonth()]
+}
+
+// Left column of a popout row: the clock time, days overdue (urgent), or
+// the day a coming-up entry falls on. `today` is the agenda's day.
+function rowLead(item, today) {
   const cls = classify(item)
   if (cls === "overdue") return { text: item.overdueDays + "d", urgent: true }
-  if (cls === "upcoming") return { text: "", urgent: false }
+  if (cls === "upcoming") return { text: item.inDays > 0 ? dayLabel(item.inDays, today) : "", urgent: false }
   return { text: item.time || "", urgent: false }
 }
 
-// Right column at rest: the category, or a habit's missed days.
+// Right column at rest: the category, or a habit's missed days. A coming-up
+// entry's lead is its day, so its time goes here.
 function rowTrail(item) {
-  return item.habit && item.overdueDays > 0 ? item.overdueDays + "d" : (item.category || "")
+  if (item.habit && item.overdueDays > 0) return item.overdueDays + "d"
+  if (item.time && classify(item) === "upcoming")
+    return item.time + (item.category ? " · " + item.category : "")
+  return item.category || ""
 }
 
 function rowLocation(item) { return basename(item.path) + ":" + item.line }
