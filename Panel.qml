@@ -14,6 +14,10 @@ import "Model.js" as Model
 // The keyboard reaches the next-up card first, then each row of every
 // section, in order. Hover moves the same cursor as the arrows, so only one
 // row is ever highlighted.
+//
+// `t` (or a click on a row's keyword chip) opens the state picker under the
+// selected entry. While it is open every key goes to it first (forwarded
+// below), except ↑↓, which close it and move on.
 PanelKeyCatcher {
   id: root
 
@@ -25,6 +29,20 @@ PanelKeyCatcher {
   // Keyboard moves scroll the cursor into view; hover never scrolls.
   property bool followSelection: false
   property var shownKeys: []
+
+  // The open picker: its row's key, the entry it was opened for, and the
+  // live StatePicker (null while it is closed or loading).
+  property string pickerKey: ""
+  property string pickerEntry: ""
+  property var picker: null
+  readonly property bool pickerOpen: pickerKey !== ""
+  readonly property var stateChoices: Model.stateChoices(payload)
+  readonly property var pickerItem: {
+    var rows = entries.rows
+    for (var i = 0; i < rows.length; i++) if (rows[i].key === pickerKey) return rows[i].item
+    return null
+  }
+  readonly property var stateResult: service ? service.stateResult : null
 
   readonly property color textColor: Commons.Color.popups.text
   readonly property color mutedColor: Commons.Color.muted
@@ -41,20 +59,104 @@ PanelKeyCatcher {
   // nf-md-keyboard-return: the bar's Nerd Font has it, unlike a bare ↵,
   // whose fallback glyph overhangs the next word.
   readonly property string enterGlyph: String.fromCodePoint(0xf0311)
+  // The picker's chips line up under the rows' keyword chips.
+  readonly property int pickerIndent: Style.spacing.md + leadWidth + Style.spacing.lg
 
   implicitHeight: header.implicitHeight + bodyGap + body.implicitHeight + bodyGap + footer.implicitHeight
 
-  // Back to the top, cursor on the first entry: called on each open.
+  // Back to the top, cursor on the first entry, no picker and no leftover
+  // result line: called on each open.
   function reset() {
     selected = 0
     followSelection = false
     pointerGate.reset()
     scroll.contentY = 0
+    closePicker()
+    clearResult()
   }
 
   onRowKeysChanged: {
     selected = Model.refocus(shownKeys, rowKeys, selected)
     shownKeys = rowKeys
+  }
+
+  // A refresh may drop the picker's row, or put another entry in the
+  // next-up card; the picker only ever applies to the entry it opened for.
+  onEntriesChanged: {
+    if (!pickerOpen) return
+    var row = entries.rows.filter(function(r) { return r.key === pickerKey })[0]
+    if (!row || Model.entryKey(row.item) !== pickerEntry) closePicker()
+  }
+
+  function clearResult() {
+    if (service) service.clearStateResult()
+  }
+
+  function canPick(item) {
+    return !!service && !!payload && stateChoices.length > 0 && Model.canChangeState(item)
+  }
+
+  function openPicker(sel) {
+    var row = entries.rows[sel]
+    if (!row || !canPick(row.item)) return
+    if (service.stateBusy) {
+      console.warn("org-agenda: a state change is already in progress")
+      return
+    }
+    clearResult()
+    followSelection = true
+    selected = sel
+    pickerEntry = Model.entryKey(row.item)
+    pickerKey = row.key
+  }
+
+  // The keyword chip toggles the picker for its row.
+  function togglePicker(sel) {
+    var row = entries.rows[sel]
+    if (row && row.key === pickerKey) closePicker()
+    else openPicker(sel)
+  }
+
+  function closePicker() {
+    pickerKey = ""
+    pickerEntry = ""
+  }
+
+  function pick(keyword) {
+    var item = pickerItem
+    closePicker()
+    if (item && service) service.setState(item, keyword)
+  }
+
+  function isPending(item) {
+    return !!service && service.stateBusy && service.stateItemKey === Model.entryKey(item)
+  }
+
+  // Keys while the picker is open. ↑↓ always leave it; j/k too, unless a
+  // keyword uses them as its fast key. Everything else is the picker's or
+  // swallowed, so `r`, ↵ and Esc never reach the panel behind it.
+  function pickerKeyPressed(event) {
+    if (!pickerOpen) return
+    var leave = event.key === Qt.Key_Down ? 1 : event.key === Qt.Key_Up ? -1 : 0
+    if (leave === 0 && !(picker && picker.handleKey(event)))
+      leave = event.text === "j" ? 1 : event.text === "k" ? -1 : 0
+    if (leave !== 0) {
+      closePicker()
+      moveSelection(leave)
+    }
+    event.accepted = true
+  }
+
+  Keys.forwardTo: [pickerKeys]
+
+  Item {
+    id: pickerKeys
+    Keys.onPressed: function(event) { root.pickerKeyPressed(event) }
+  }
+
+  Connections {
+    target: root.service
+    function onStateNeedsEmacs() { root.closeRequested() }
   }
 
   function moveSelection(dy) {
@@ -72,6 +174,7 @@ PanelKeyCatcher {
 
   function openItem(item) {
     if (!item || !service) return
+    clearResult()
     service.open(item)
     root.closeRequested()
   }
@@ -83,12 +186,15 @@ PanelKeyCatcher {
 
   function openAgenda() {
     if (!service) return
+    clearResult()
     service.openAgenda()
     root.closeRequested()
   }
 
   function refresh() {
-    if (service) service.pull("manual")
+    if (!service) return
+    clearResult()
+    service.pull("manual")
   }
 
   // Scroll so `bottomItem` is in view and, where it fits, `topItem` too (a
@@ -110,7 +216,10 @@ PanelKeyCatcher {
 
   onMoveRequested: function(dx, dy) { root.moveSelection(dy) }
   onActivateRequested: root.activate()
-  onTextKey: function(t) { if (t === "r" || t === "R") root.refresh() }
+  onTextKey: function(t) {
+    if (t === "r" || t === "R") root.refresh()
+    else if (t === "t") root.openPicker(root.selected)
+  }
 
   TextMetrics {
     id: leadMetrics
@@ -217,6 +326,7 @@ PanelKeyCatcher {
           anchors.leftMargin: Style.spacing.xl
           anchors.rightMargin: Style.spacing.xl
           spacing: Style.spacing.xs
+          opacity: card.next && root.isPending(card.next.item) ? 0.45 : 1
 
           RowLayout {
             width: parent.width
@@ -253,6 +363,16 @@ PanelKeyCatcher {
             color: root.mutedColor
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
+          }
+
+          Loader {
+            id: cardPicker
+            property int indent: 0
+            active: root.pickerKey === "next"
+            visible: active
+            width: parent.width
+            sourceComponent: pickerComponent
+            onLoaded: root.reveal(card, card)
           }
         }
       }
@@ -309,19 +429,38 @@ PanelKeyCatcher {
           Repeater {
             model: sectionBlock.modelData.rows
 
-            AgendaRow {
-              id: row
+            // The row, and its state picker right under it while open.
+            Column {
+              id: rowBlock
               required property var modelData
               required property int index
               width: sectionBlock.width
-              item: modelData.item
-              payload: root.payload
-              fontFamily: root.fontFamily
-              leadWidth: root.leadWidth
-              hasCursor: root.selected === modelData.sel
-              onHasCursorChanged: if (hasCursor) root.reveal(index === 0 ? sectionBlock : row, row)
-              onPointerMoved: function(area, mouse) { root.pointed(row.modelData.sel, area, mouse) }
-              onActivated: root.openItem(row.modelData.item)
+
+              AgendaRow {
+                id: row
+                width: parent.width
+                item: rowBlock.modelData.item
+                payload: root.payload
+                fontFamily: root.fontFamily
+                leadWidth: root.leadWidth
+                hasCursor: root.selected === rowBlock.modelData.sel
+                stateEnabled: root.canPick(rowBlock.modelData.item)
+                pending: root.isPending(rowBlock.modelData.item)
+                onHasCursorChanged: if (hasCursor) root.reveal(rowBlock.index === 0 ? sectionBlock : row, row)
+                onPointerMoved: function(area, mouse) { root.pointed(rowBlock.modelData.sel, area, mouse) }
+                onActivated: root.openItem(rowBlock.modelData.item)
+                onKeywordClicked: root.togglePicker(rowBlock.modelData.sel)
+              }
+
+              Loader {
+                id: rowPicker
+                property int indent: root.pickerIndent
+                active: root.pickerKey === rowBlock.modelData.key
+                visible: active
+                width: parent.width
+                sourceComponent: pickerComponent
+                onLoaded: root.reveal(row, rowPicker)
+              }
             }
           }
         }
@@ -426,6 +565,19 @@ PanelKeyCatcher {
     anchors.right: parent.right
     spacing: Style.spacing.sm
 
+    // The last state change, until the next action or the next open.
+    PlainText {
+      visible: root.stateResult !== null
+      width: parent.width
+      text: root.stateResult ? root.stateResult.text : ""
+      color: !root.stateResult ? root.mutedColor
+        : root.stateResult.tone === "ok" ? Commons.Color.accent
+        : root.stateResult.tone === "error" ? Commons.Color.urgent
+        : root.mutedColor
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.bodySmall
+    }
+
     PanelSeparator { foreground: root.textColor }
 
     PlainText {
@@ -448,12 +600,47 @@ PanelKeyCatcher {
 
     PlainText {
       width: parent.width
-      text: root.mode === "agenda"
-        ? "↑↓ move · " + root.enterGlyph + " open · r refresh · esc close"
+      text: root.pickerOpen ? Model.pickerHint(root.stateChoices, root.enterGlyph)
+        : root.mode === "agenda"
+        ? "↑↓ move · " + root.enterGlyph + " open" + (root.stateChoices.length > 0 ? " · t state" : "")
+          + " · r refresh · esc close"
         : "r refresh · esc close"
       color: root.mutedColor
       font.family: root.fontFamily
       font.pixelSize: Style.font.caption
+    }
+  }
+
+  // Loaded under the row (or inside the next-up card) whose key is
+  // `pickerKey`; the Loader's `indent` lines the chips up with its content.
+  Component {
+    id: pickerComponent
+
+    Item {
+      id: pickerHost
+      implicitHeight: statePicker.implicitHeight + Style.spacing.xs * 2
+
+      // Clicks between chips stay here instead of opening the entry.
+      MouseArea { anchors.fill: parent }
+
+      StatePicker {
+        id: statePicker
+        x: pickerHost.parent ? pickerHost.parent.indent : 0
+        y: Style.spacing.xs
+        width: Math.max(0, pickerHost.width - x - Style.spacing.md)
+        choices: root.stateChoices
+        current: root.pickerItem && root.pickerItem.todo ? root.pickerItem.todo : ""
+        fontFamily: root.fontFamily
+        fontSize: Style.font.caption
+        textColor: root.textColor
+        mutedColor: root.mutedColor
+        accentColor: Commons.Color.accent
+        surfaceColor: Util.alpha(root.textColor, 0.04)
+        onPicked: function(keyword) { root.pick(keyword) }
+        onDismissed: root.closePicker()
+        Component.onCompleted: root.picker = statePicker
+        Component.onDestruction: if (root.picker === statePicker) root.picker = null
+      }
     }
   }
 

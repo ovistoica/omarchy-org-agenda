@@ -8,7 +8,9 @@ import "Model.js" as Model
 // place that talks to Emacs. Emacs writes the agenda as JSON into the
 // runtime dir — on our pull, or by itself from its save/TODO hooks — and
 // the file is watched, so there is no polling: timers only run for a retry
-// after a failed pull and as a watchdog while a pull is in flight.
+// after a failed pull and as a watchdog while a pull or a state change is
+// in flight. A state change is the only write, and only the popout's
+// picker starts one; there is no IPC for it.
 Item {
   id: root
 
@@ -38,6 +40,20 @@ Item {
   property bool pullTimedOut: false
   property int retryAttempt: 0
   property string midnightPulledFor: ""
+
+  // State change: one at a time. `stateItemKey` is the entry being changed
+  // (Model.entryKey); `stateResult` is the last outcome for the popout,
+  // {key, keyword, value, text, tone}, until it clears it.
+  property bool stateBusy: false
+  property string stateItemKey: ""
+  property string stateKeyword: ""
+  property var stateResult: null
+  property bool stateStarted: false
+  property bool stateTimedOut: false
+
+  // Emacs needs the user now (a note to write, or a hook asking something):
+  // the popout should get out of the way.
+  signal stateNeedsEmacs()
 
   function errorText(e) { return String(e && e.message ? e.message : e) }
 
@@ -176,6 +192,109 @@ Item {
     }
   }
 
+  // ---- state change. Emacs does the work and the saving; this runs the
+  // call, maps its answer to a message, and hands notes over to Emacs.
+
+  function clearStateResult() { stateResult = null }
+
+  function showStateResult(value, message) {
+    stateResult = { key: stateItemKey, keyword: stateKeyword, value: value,
+                    text: message.text, tone: message.tone }
+  }
+
+  function stateFailed(why) {
+    console.warn("org-agenda: state change failed:", why)
+    showStateResult(null, { text: Model.plain("Couldn't change the state: " + Model.bounded(why, 200)), tone: "error" })
+  }
+
+  function setState(item, keyword) {
+    if (stateBusy || setter.running) {
+      console.warn("org-agenda: a state change is already in progress")
+      return
+    }
+    stateItemKey = Model.entryKey(item)
+    stateKeyword = String(keyword || "")
+    var argv
+    try {
+      argv = Model.clientArgs(settings).concat(["--eval", Model.stateForm(item, payload, keyword, elispFile)])
+    } catch (e) {
+      stateFailed(errorText(e))
+      return
+    }
+    console.log("org-agenda: set state " + stateKeyword)
+    stateResult = null
+    stateStarted = false
+    stateTimedOut = false
+    stateBusy = true
+    setter.command = argv
+    // Armed before starting: a failed start may be reported synchronously.
+    stateWatchdog.restart()
+    setter.running = true
+  }
+
+  function stateExited(code) {
+    stateWatchdog.stop()
+    stateBusy = false
+    if (stateTimedOut) {
+      // Most likely one of the user's hooks is asking something in Emacs.
+      console.warn("org-agenda: state change timed out")
+      showStateResult(null, { text: "Emacs didn't answer. It may be asking you something.", tone: "warn" })
+      focusEmacs()
+      stateNeedsEmacs()
+      return
+    }
+    if (code !== 0) {
+      var err = String(setErr.text || "").trim()
+      if (Model.isNoServer(err)) {
+        console.warn("org-agenda: state change: no server")
+        showStateResult(null, { text: "Can't reach your Emacs server", tone: "error" })
+      } else {
+        stateFailed(err || ("emacsclient exited with code " + code))
+      }
+      return
+    }
+    var parsed = Model.parseStateResult(setOut.text)
+    if (!parsed.ok) console.warn("org-agenda: state change: unexpected answer:", parsed.reason)
+    var value = parsed.ok ? parsed.value : null
+    showStateResult(value, Model.stateMessage(value, stateKeyword))
+    var result = value ? value.result : ""
+    // With pushUpdates off, nothing else tells the bar the file changed.
+    if (!settings.pushUpdates && ["done", "note", "note-frame", "blocked", "changed"].indexOf(result) >= 0)
+      pull("state")
+    if (result === "note") {
+      focusEmacs()
+      stateNeedsEmacs()
+    } else if (result === "note-frame") {
+      takeNote()
+      stateNeedsEmacs()
+    }
+  }
+
+  function stateFailedToStart() {
+    stateWatchdog.stop()
+    stateBusy = false
+    var bin = setter.command[0] || "emacsclient"
+    console.warn("org-agenda: state change: couldn't run", bin)
+    showStateResult(null, { text: Model.plain("Couldn't run " + Model.bounded(bin, 100) + " — check the emacsclient setting"),
+                            tone: "error" })
+  }
+
+  // No graphic frame was selected: open the queued note in a frame of its
+  // own. Emacs drops the note if this doesn't come within 15 s.
+  function takeNote() {
+    if (noteTaker.running) {
+      console.warn("org-agenda: a note is already being opened")
+      return
+    }
+    try {
+      noteTaker.command = Model.clientArgs(settings).concat(["-r", "-n", "--eval", Model.takeNoteForm(elispFile)])
+    } catch (e) {
+      console.warn("org-agenda: cannot open the note:", errorText(e))
+      return
+    }
+    noteTaker.running = true
+  }
+
   Process {
     id: puller
     stderr: StdioCollector { id: pullErr }
@@ -242,6 +361,38 @@ Item {
       } else {
         console.warn("org-agenda: open failed:", Model.bounded(String(openErr.text || "").trim(), 200))
       }
+    }
+  }
+
+  Process {
+    id: setter
+    stdout: StdioCollector { id: setOut }
+    stderr: StdioCollector { id: setErr }
+    onStarted: root.stateStarted = true
+    onExited: function(exitCode, exitStatus) { root.stateExited(exitCode) }
+    onRunningChanged: if (!running && !root.stateStarted && root.stateBusy) root.stateFailedToStart()
+  }
+
+  // Same bound as a pull. Emacs keeps going when emacsclient is stopped;
+  // a hook that prompts is then waiting for the user there.
+  Timer {
+    id: stateWatchdog
+    interval: (root.settings.timeoutSeconds + 2) * 1000
+    repeat: false
+    onTriggered: {
+      if (!setter.running) return
+      root.stateTimedOut = true
+      setter.signal(15)
+    }
+  }
+
+  Process {
+    id: noteTaker
+    stderr: StdioCollector { id: noteErr }
+    onExited: function(exitCode, exitStatus) {
+      if (exitCode !== 0)
+        console.warn("org-agenda: opening the note failed:", Model.bounded(String(noteErr.text || "").trim(), 200))
+      root.focusEmacs()
     }
   }
 

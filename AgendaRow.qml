@@ -9,7 +9,9 @@ import "Model.js" as Model
 //   time | KEYWORD [A] title ……………… category
 // The highlight comes from `hasCursor` (keyboard and hover alike, set by the
 // panel), and only then does the right column turn into the entry's
-// file:line, the place ↵ jumps to.
+// file:line, the place ↵ jumps to. Clicking the keyword chip asks for the
+// state picker instead; while a change is in flight the row dims and its
+// time reads "…".
 CursorSurface {
   id: root
 
@@ -17,9 +19,12 @@ CursorSurface {
   property var payload: null
   property string fontFamily: Style.font.family
   property int leadWidth: Style.space(40)
+  property bool stateEnabled: false
+  property bool pending: false
 
   signal pointerMoved(var area, var mouse)
   signal activated()
+  signal keywordClicked()
 
   readonly property color textColor: Commons.Color.popups.text
   readonly property color mutedColor: Commons.Color.muted
@@ -47,14 +52,14 @@ CursorSurface {
     anchors.leftMargin: Style.spacing.md
     anchors.rightMargin: Style.spacing.md
     spacing: Style.spacing.lg
-    opacity: root.done ? 0.5 : 1
+    opacity: root.pending ? 0.45 : root.done ? 0.5 : 1
 
     PlainText {
       Layout.preferredWidth: root.leadWidth
       Layout.alignment: Qt.AlignVCenter
       horizontalAlignment: Text.AlignRight
-      text: root.lead.text
-      color: root.lead.urgent ? Commons.Color.urgent : root.mutedColor
+      text: root.pending ? "…" : root.lead.text
+      color: root.lead.urgent && !root.pending ? Commons.Color.urgent : root.mutedColor
       font.family: root.fontFamily
       font.pixelSize: Style.font.bodySmall
       font.features: { "tnum": 1 }
@@ -79,6 +84,14 @@ CursorSurface {
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
         font.bold: true
+      }
+
+      // Above the row's own area: a click here changes the state, not opens.
+      MouseArea {
+        visible: root.stateEnabled
+        anchors.fill: parent
+        cursorShape: Qt.PointingHandCursor
+        onClicked: root.keywordClicked()
       }
     }
 

@@ -69,12 +69,44 @@ never writes to your Emacs config, and its agenda file in
 | Middle | Open your `org-agenda` in Emacs (dispatcher key `agendaKey`) |
 | Right  | Ask Emacs for a fresh export                                 |
 
-**Popout keys:** `↑`/`↓` or `j`/`k` move, `↵` opens, `r` refreshes,
-`Esc` closes.
+**Popout keys:** `↑`/`↓` or `j`/`k` move, `↵` opens, `t` changes the
+state, `r` refreshes, `Esc` closes.
 
 Opening an entry (click or `↵`) shows its file at the heading in the
 current Emacs frame, the way `emacsclient +LINE FILE` would, and focuses
 the Emacs window.
+
+**Changing a state**
+
+Press `t` on an entry, or click its keyword, and your TODO keywords
+appear under it in their Emacs colours, each with its Org fast key
+(`d DONE`):
+
+- press a fast key, or click a keyword, to set it;
+- `←`/`→` move between keywords and `↵` sets the highlighted one;
+- `Esc` closes the picker, and so does `t` unless one of your keywords
+  uses `t` as its fast key (then `t` sets that keyword);
+- `↑`/`↓` close it and move to the next entry.
+
+Fast keys are case-sensitive, as in Org, and take precedence over the
+picker's own letters (`h`, `j`, `k`, `l`, `t`). The footer lists the keys
+while the picker is open.
+
+What happens next:
+
+- If the new state logs a note, Emacs shows the heading with Org's
+  `*Org Note*` buffer and is focused, and the popout closes. `C-c C-c`
+  stores the note as usual.
+- Any other change finishes in the bar: the entry updates in place and
+  a one-line result appears above the footer.
+- Org's blockers are respected (`org-enforce-todo-dependencies`, open
+  checkboxes): nothing changes, and the popout says what is blocking.
+- The file is saved when it had no other unsaved edits in Emacs;
+  otherwise the change is left for you to save, and the popout says so.
+- If you cancel the note with `C-c C-k`, the change stays in the
+  buffer unsaved, as it does from Org's own agenda.
+- If Emacs doesn't answer (say one of your hooks asks a question), the
+  bar focuses Emacs so you can answer it there.
 
 **IPC**
 
@@ -149,9 +181,14 @@ too.
   `org-agenda-finalize-hook`, and a variable watcher on
   `org-agenda-files`. Set `pushUpdates` to `false` and they are removed;
   the bar then refreshes when you open the popout (if the agenda is over
-  a minute old), on right click and at midnight.
+  a minute old), on right click, at midnight and after a state change.
+- A state change from the popout calls `org-todo` on the heading, after
+  checking it is still the entry the bar showed.
+- While a note started from the bar is pending, a temporary advice on
+  `org-store-log-note` saves the file once the note is stored; it
+  removes itself when the note is stored or cancelled.
 - `M-x unload-feature RET omarchy-org-agenda` removes everything,
-  hooks included.
+  hooks and advice included.
 - It never prompts. Agenda files that don't exist are skipped and
   counted in the popout's footer.
 
@@ -191,7 +228,9 @@ Security notes:
 - All Org text is rendered as plain text (`PlainText.qml`). Rich and
   styled text are never used, so markup in a heading stays literal.
 - The `--eval` forms sent to Emacs are built only in `Model.js`, from
-  validated paths, line numbers and IDs.
+  validated paths, line numbers and IDs, and keywords from the export.
+- Only the popout's picker changes a state; there is no IPC command for
+  it.
 - `emacsclient` is always run with an argument vector, never through a
   shell.
 

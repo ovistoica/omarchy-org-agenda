@@ -14,7 +14,7 @@ const M = new Function(src + "; return { PROTOCOL, MAX_ITEMS, MAX_TITLE, ID_RE, 
   " fallbackOpenArgs, isNoServer, backoffMs, dateKey, isNewDay, isOld, keywordColor, view," +
   " basename, isDeadline, rowLead, rowTrail, rowLocation, sectionHint, nextMeta, footerLine," +
   " panelMode, errorMessage, panelModel, refocus, stateChoices, canChangeState, stateForm," +
-  " takeNoteForm, parseStateResult, stateMessage, ITEM_TYPES }")()
+  " takeNoteForm, parseStateResult, stateMessage, entryKey, pickerHint, ITEM_TYPES }")()
 
 let failed = 0
 let count = 0
@@ -388,6 +388,18 @@ eq(M.parseStateResult("\"{\\\"result\\\":\\\"done\\\"}\"").ok, true, "parseState
   eq([M.stateMessage(null, null).tone, msg({ result: "done", saved: true }, "A B\"").text],
      ["error", "Marked the new state · saved"], "stateMessage: bad input")
 }
+
+eq([M.entryKey(task), M.entryKey(item({ line: 80, type: "deadline" })), M.entryKey(null),
+    M.entryKey({ path: "/a.org" }), M.entryKey({ path: 3, line: 1 })],
+   ["/home/u/org/cal.org:20", "/home/u/org/cal.org:80", "", "", ""], "entryKey: path:line or empty")
+
+eq(M.pickerHint(M.stateChoices(sp), "R"), "n t d c set · ←→ R set · ↑↓ leave · esc cancel",
+   "pickerHint: t is a fast key, so only esc cancels")
+eq(M.pickerHint([{ key: "n" }, { key: "" }, { key: "d" }], "R"), "n d set · ←→ R set · ↑↓ leave · esc/t cancel",
+   "pickerHint: t cancels when no keyword uses it")
+eq([M.pickerHint([], "R"), M.pickerHint(null), M.pickerHint([{ key: "xy" }, null, { key: "<" }], "R")],
+   ["←→ R set · ↑↓ leave · esc/t cancel", "←→ ↵ set · ↑↓ leave · esc/t cancel",
+    "←→ R set · ↑↓ leave · esc/t cancel"], "pickerHint: no fast keys, bad input")
 
 // ---------------------------------------------------------------- clientArgs / socket / files
 

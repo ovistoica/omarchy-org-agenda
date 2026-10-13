@@ -511,6 +511,26 @@ function stateMessage(value, toKeyword) {
   }
 }
 
+// Which entry a state change is for: one heading, whatever section shows it.
+function entryKey(item) {
+  return isObj(item) && isStr(item.path) && Number.isSafeInteger(item.line)
+    ? item.path + ":" + item.line : ""
+}
+
+// The footer while the picker is open. A fast key wins over the picker's
+// own letters, so `t` closes it only when no keyword uses `t`.
+function pickerHint(choices, enter) {
+  const keys = (Array.isArray(choices) ? choices : [])
+    .map(c => isObj(c) && isStr(c.key) && FAST_KEY_RE.test(c.key) ? c.key : "")
+    .filter(k => k !== "")
+  return [keys.length ? keys.join(" ") + " set" : "",
+          "←→ " + (isStr(enter) ? enter : "↵") + " set",
+          "↑↓ leave",
+          (keys.indexOf("t") >= 0 ? "esc" : "esc/t") + " cancel"]
+    .filter(s => s !== "")
+    .join(" · ")
+}
+
 // ---------------------------------------------------------------- status
 
 const NO_SERVER_HINTS = ["can't find socket", "have you started the server",
