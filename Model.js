@@ -430,6 +430,102 @@ function updatedOf(payload) {
   return m ? m[1] + ":" + m[2] : ""
 }
 
+// ---------------------------------------------------------------- popout
+
+function basename(p) {
+  const s = String(p == null ? "" : p)
+  return s.slice(s.lastIndexOf("/") + 1)
+}
+
+function isDeadline(item) { return item.type === "deadline" || item.type === "upcoming-deadline" }
+
+// Left column of a popout row: the clock time, or days overdue (urgent).
+function rowLead(item) {
+  const cls = classify(item)
+  if (cls === "overdue") return { text: item.overdueDays + "d", urgent: true }
+  if (cls === "upcoming") return { text: "", urgent: false }
+  return { text: item.time || "", urgent: false }
+}
+
+// Right column at rest: the category, or a habit's missed days.
+function rowTrail(item) {
+  return item.habit && item.overdueDays > 0 ? item.overdueDays + "d" : (item.category || "")
+}
+
+function rowLocation(item) { return basename(item.path) + ":" + item.line }
+
+// What the muted tail of a section header explains.
+function sectionHint(key, folded) {
+  if (key === "habits") return "missed days"
+  if (key === "overdue") return "tab to " + (folded ? "unfold" : "fold")
+  return ""
+}
+
+function nextMeta(next, nowMin) {
+  const it = next.item
+  const end = hhmm(next.endMin % 1440)
+  return (next.state === "now"
+    ? [it.time + "–" + end, "until " + end]
+    : [it.time, relTime(next.startMin - nowMin)])
+    .concat(it.category ? [it.category] : [])
+    .join(" · ")
+}
+
+function footerLine(view) {
+  const p = view.payload
+  if (!p) return ""
+  return [view.updated ? "Updated " + view.updated : "", p.reason,
+          p.emacs ? "Emacs " + p.emacs : "", p.org ? "Org " + p.org : "",
+          view.stale ? "stale" : ""]
+    .filter(s => s !== "")
+    .join(" · ")
+}
+
+// Which body the popout shows.
+function panelMode(view) {
+  if (view.status === "offline") return "offline"
+  if (hasError(view)) return "error"
+  if (!view.payload) return "loading"
+  return view.next || view.sections.length ? "agenda" : "empty"
+}
+
+function errorMessage(view) {
+  return (view.payload && view.payload.error) || view.detail || "unknown error"
+}
+
+// The popout in display order. `sel` numbers what the keyboard can reach:
+// the next-up card, then every row of an unfolded section. `rows` lists
+// those in `sel` order, keyed so a selection survives a refresh or a fold.
+function panelModel(view, overdueOpen) {
+  let sel = 0
+  const next = view.next ? { key: "next", sel: sel++, item: view.next.item } : null
+  const secs = view.sections.map(sec => {
+    const foldable = sec.key === "overdue"
+    const folded = foldable && !overdueOpen
+    return {
+      key: sec.key, title: sec.title, count: sec.items.length,
+      hint: sectionHint(sec.key, folded), foldable: foldable, folded: folded,
+      rows: folded ? [] : sec.items.map(item => ({
+        key: sec.key + ":" + item.path + ":" + item.line + ":" + item.type,
+        sel: sel++, item: item
+      }))
+    }
+  })
+  return { next: next, sections: secs,
+           rows: secs.reduce((acc, s) => acc.concat(s.rows), next ? [next] : []) }
+}
+
+// Index in `after` (keys) for what was selected at `index` in `before`:
+// the same entry if it is still there, else the nearest one above it.
+function refocus(before, after, index) {
+  if (!after.length) return 0
+  for (let i = Math.min(index, before.length - 1); i >= 0; i--) {
+    const j = after.indexOf(before[i])
+    if (j >= 0) return j
+  }
+  return clamp(index, 0, after.length - 1)
+}
+
 // ---------------------------------------------------------------- view
 
 function view(payload, status, detail, now, rawSettings) {

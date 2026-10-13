@@ -3,6 +3,7 @@ import Quickshell
 import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
+import qs.Ui as Ui
 
 // Bar label for today's Org agenda. One of these exists per monitor; all of
 // them read the one Service, which does every pull. What to show comes from
@@ -10,7 +11,10 @@ import qs.Ui
 //
 // Left click opens the popout, middle click opens the agenda in Emacs, and
 // right click asks Emacs for a fresh export.
-Panel {
+//
+// The root is qualified because this plugin's own Panel.qml (the popout
+// content) would otherwise shadow the shell's Panel.
+Ui.Panel {
   id: root
   moduleName: "ovistoica.org-agenda"
   // The service owns the one IpcHandler; one per monitor would collide.
@@ -43,6 +47,16 @@ Panel {
   onServiceChanged: configureService()
   onSettingsChanged: configureService()
   Component.onCompleted: configureService()
+
+  // The popout's content is built on first open and kept from then on.
+  property bool panelBuilt: false
+
+  onOpenedChanged: {
+    if (!opened) return
+    panelBuilt = true
+    if (panelContent.item) panelContent.item.reset()
+    if (service) service.ensureFresh()
+  }
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -160,6 +174,36 @@ Panel {
         }
       }
     }
+  }
+
+  KeyboardPanel {
+    id: panel
+    anchorItem: button
+    owner: root
+    bar: root.bar
+    open: root.opened
+    focusTarget: panelContent.item
+    contentWidth: panel.fittedContentWidth(Style.space(500))
+    contentHeight: panel.fittedContentHeight(
+      panelContent.item ? panelContent.item.implicitHeight : Style.space(120),
+      Math.round(panel.screenH * 0.7))
+
+    Loader {
+      id: panelContent
+      anchors.fill: parent
+      active: root.panelBuilt
+      source: Qt.resolvedUrl("Panel.qml")
+      onLoaded: {
+        item.service = Qt.binding(function() { return root.service })
+        item.view = Qt.binding(function() { return root.view })
+        item.fontFamily = Qt.binding(function() { return button.fontFamily })
+      }
+    }
+  }
+
+  Connections {
+    target: panelContent.item
+    function onCloseRequested() { root.close() }
   }
 
   // Overdue count: urgent pill with the number in the bar background colour.

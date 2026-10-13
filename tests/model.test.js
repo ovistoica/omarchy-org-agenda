@@ -11,7 +11,9 @@ const M = new Function(src + "; return { PROTOCOL, MAX_ITEMS, MAX_TITLE, ID_RE, 
   " STALE_AFTER_MS, parse, bounded, classify, sections, openToday, overdueCount, minutesOf," +
   " nextUp, normalizeSettings, barLabel, relTime, tooltip, plain, elispString, clientArgs," +
   " socketKey, agendaFilesList, filesForm, loadPreamble, pullForm, gotoForm, agendaForm," +
-  " fallbackOpenArgs, isNoServer, backoffMs, dateKey, isNewDay, isOld, keywordColor, view }")()
+  " fallbackOpenArgs, isNoServer, backoffMs, dateKey, isNewDay, isOld, keywordColor, view," +
+  " basename, isDeadline, rowLead, rowTrail, rowLocation, sectionHint, nextMeta, footerLine," +
+  " panelMode, errorMessage, panelModel, refocus }")()
 
 let failed = 0
 let count = 0
@@ -320,6 +322,57 @@ eq([M.keywordColor(P([]), "NEXT"), M.keywordColor(P([]), "TODO"), M.keywordColor
      ["ok", false, 7, 5, 63, 3, 1, "11:13", "3", "Count"], "view: populated")
 }
 eq(typeof M.view(null, "ok", null, new Date(NaN), null).tooltip, "string", "view: invalid now does not throw")
+// ---------------------------------------------------------------- popout
+
+eq([M.basename("/home/u/org/work.org"), M.basename("work.org"), M.basename(null)],
+   ["work.org", "work.org", ""], "basename")
+eq([sync, soon, item({ type: "deadline" }), task].map(M.isDeadline), [false, true, true, false], "isDeadline")
+eq([sync, late, habit, soon, task, item({ habit: true, time: "07:00" })].map(M.rowLead),
+   [{ text: "13:00", urgent: false }, { text: "3d", urgent: true }, { text: "", urgent: false },
+    { text: "", urgent: false }, { text: "", urgent: false }, { text: "07:00", urgent: false }], "rowLead")
+eq([sync, habit, item({ habit: true }), item({ category: null })].map(M.rowTrail),
+   ["cal", "2d", "cal", ""], "rowTrail: category, missed days")
+eq(M.rowLocation(sync), "cal.org:63", "rowLocation")
+eq([M.sectionHint("habits", false), M.sectionHint("overdue", true), M.sectionHint("overdue", false), M.sectionHint("today", false)],
+   ["missed days", "tab to unfold", "tab to fold", ""], "sectionHint")
+{
+  const v = M.view(P(all), "ok", "", at(11, 13), {})
+  eq(M.nextMeta(v.next, v.nowMin), "13:00 · in 1 h 47 min · cal", "nextMeta: next")
+  const n = M.view(P(all), "ok", "", at(13, 10), {})
+  eq(M.nextMeta(n.next, n.nowMin), "13:00–13:30 · until 13:30 · cal", "nextMeta: now")
+  eq(M.footerLine(v), "Updated 11:13 · save · Emacs 31.1 · Org 9.8.7", "footerLine")
+  eq(M.footerLine(M.view(P(all), "stale", "", at(11, 13), {})), "Updated 11:13 · save · Emacs 31.1 · Org 9.8.7 · stale",
+     "footerLine: stale")
+  eq(M.footerLine(M.view(null, "ok", "", at(11, 13), {})), "", "footerLine: no payload")
+}
+eq([M.view(null, "offline", "", at(11, 13), {}), M.view(P(all), "offline", "", at(11, 13), {}),
+    M.view(null, "error", "boom", at(11, 13), {}), M.view(payloadOf([], { error: "bad" }), "ok", "", at(11, 13), {}),
+    M.view(null, "loading", "", at(11, 13), {}), M.view(P([]), "ok", "", at(11, 13), {}),
+    M.view(P(all), "stale", "", at(11, 13), {})].map(M.panelMode),
+   ["offline", "offline", "error", "error", "loading", "empty", "agenda"], "panelMode")
+eq([M.errorMessage(M.view(payloadOf([], { error: "bad" }), "ok", "x", at(11, 13), {})),
+    M.errorMessage(M.view(null, "error", "boom", at(11, 13), {})),
+    M.errorMessage(M.view(null, "error", "", at(11, 13), {}))], ["bad", "boom", "unknown error"], "errorMessage")
+{
+  const v = M.view(P(all), "ok", "", at(11, 13), {})
+  const folded = M.panelModel(v, false)
+  const open = M.panelModel(v, true)
+  eq(folded.sections.map(s => [s.key, s.count, s.folded, s.rows.length, s.hint]),
+     [["schedule", 2, false, 2, ""], ["today", 2, false, 2, ""], ["habits", 1, false, 1, "missed days"],
+      ["overdue", 1, true, 0, "tab to unfold"], ["upcoming", 1, false, 1, ""]], "panelModel: overdue folded")
+  eq(folded.rows.map(r => [r.sel, r.item.line]), [[0, 63], [1, 63], [2, 10], [3, 20], [4, 60], [5, 30], [6, 50]],
+     "panelModel: next card first, folded rows skipped")
+  eq(open.rows.map(r => r.item.line), [63, 63, 10, 20, 60, 30, 40, 50], "panelModel: unfolded")
+  eq([folded.next.key, open.sections[3].hint, open.rows[6].key],
+     ["next", "tab to fold", "overdue:/home/u/org/cal.org:40:scheduled"], "panelModel: keys")
+  eq(M.panelModel(M.view(P([task]), "ok", "", at(11, 13), {}), false).rows.map(r => r.sel), [0], "panelModel: no next")
+  const keys = m => m.rows.map(r => r.key)
+  eq([M.refocus(keys(open), keys(folded), 6), M.refocus(keys(open), keys(folded), 7),
+      M.refocus(keys(folded), keys(open), 6), M.refocus(keys(folded), keys(open), 3),
+      M.refocus([], keys(open), 0), M.refocus(keys(open), [], 3), M.refocus(["gone"], ["a", "b"], 5)],
+     [5, 6, 7, 3, 0, 0, 1], "refocus: keeps the entry or the one above")
+}
+
 eq([M.PROTOCOL, M.MAX_ITEMS, M.MAX_TITLE, M.NOW_GRACE_MIN, M.STALE_AFTER_MS, M.ID_RE.test("a:b")],
    [1, 200, 200, 30, 60000, true], "constants")
 
