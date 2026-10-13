@@ -511,4 +511,28 @@ cleaned up afterwards."
       (setq omarchy-org-agenda-output nil
             omarchy-org-agenda-files-override nil))))
 
+;; The plugin reloads the helper whenever it changes on disk.  Emacs keeps
+;; replaced definitions in `function-history', and `unload-feature' revives
+;; them, so a reloaded helper must not leave any behind.
+(ert-deftest omarchy-org-agenda-test-zz-reload-unload ()
+  (let ((out (expand-file-name "reload/agenda.json" omarchy-org-agenda-test--root)))
+    (unwind-protect
+        (progn
+          (load omarchy-org-agenda-test--source nil t)
+          (load omarchy-org-agenda-test--source nil t)
+          (should-not (get 'omarchy-org-agenda-export 'function-history))
+          ;; The reload tore the hooks down; the plugin's ensure brings them back.
+          (should (equal '(:save 0 :revert 0 :todo 0 :agenda 0 :watcher 0)
+                         (omarchy-org-agenda-test--hooks-installed)))
+          (omarchy-org-agenda-ensure out nil t)
+          (should (equal '(:save 1 :revert 1 :todo 1 :agenda 1 :watcher 1)
+                         (omarchy-org-agenda-test--hooks-installed)))
+          (unload-feature 'omarchy-org-agenda t)
+          (should-not (fboundp 'omarchy-org-agenda-export))
+          (should-not (fboundp 'omarchy-org-agenda--on-save))
+          (should-not (get-variable-watchers 'org-agenda-files)))
+      (load omarchy-org-agenda-test--source nil t)
+      (setq omarchy-org-agenda-output nil
+            omarchy-org-agenda-files-override nil))))
+
 ;;; agenda-test.el ends here

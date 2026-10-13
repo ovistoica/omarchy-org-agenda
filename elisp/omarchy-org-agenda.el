@@ -17,6 +17,22 @@
 (require 'org-agenda)
 (require 'seq)
 
+;; A reload replaces the previous version instead of stacking on it.  The
+;; plugin reloads this file whenever it changes on disk, and Emacs keeps
+;; the replaced definitions in `function-history', which `unload-feature'
+;; would bring back.  Hooks come off first, so a load that fails halfway
+;; leaves nothing pointing at a missing function; the plugin's next
+;; `omarchy-org-agenda-ensure' puts them back.
+(declare-function feature-file "loadhist" (feature))
+(when (featurep 'omarchy-org-agenda)
+  (require 'loadhist)
+  (when (fboundp 'omarchy-org-agenda-teardown)
+    (omarchy-org-agenda-teardown))
+  (dolist (elt (cdr (assoc (feature-file 'omarchy-org-agenda) load-history)))
+    (when (eq (car-safe elt) 'defun)
+      (put (cdr elt) 'function-history nil)
+      (fmakunbound (cdr elt)))))
+
 (defconst omarchy-org-agenda-version "0.1.0")
 (defconst omarchy-org-agenda-protocol 1)
 
