@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "id": "ovistoica.org-agenda",
+  "name": "Org Agenda",
+  "version": "0.1.0",
+  "author": "Ovi Stoica",
+  "license": "MIT",
+  "description": "Today's Org agenda from your running Emacs, in the bar. Click an entry to open it in Emacs at its line. Needs Emacs running as a server.",
+  "kinds": ["service", "bar-widget"],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Org Agenda",
+    "description": "Next agenda entry, overdue count, and today's agenda in a popout. Needs Emacs running as a server.",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {
+      "label": "Next item",
+      "maxTitleChars": 28,
+      "overdueBadge": true,
+      "habitsInBadge": false,
+      "showDone": true,
+      "pushUpdates": true,
+      "socketName": "",
+      "serverFile": "",
+      "emacsclient": "",
+      "agendaFiles": "",
+      "agendaKey": "a",
+      "emacsApp": "emacs",
+      "timeoutSeconds": 5
+    },
+    "schema": [
+      { "key": "label", "type": "enum", "label": "Bar label", "options": ["Next item", "Count", "Icon"], "defaultValue": "Next item", "description": "Next item shows the next entry's time and title. Count and Icon keep task titles off the bar, e.g. while screen sharing." },
+      { "key": "maxTitleChars", "type": "integer", "label": "Max title length in the bar", "min": 10, "max": 80, "step": 2, "defaultValue": 28 },
+      { "key": "overdueBadge", "type": "boolean", "label": "Show overdue count", "defaultValue": true },
+      { "key": "habitsInBadge", "type": "boolean", "label": "Count missed habits as overdue", "defaultValue": false },
+      { "key": "showDone", "type": "boolean", "label": "Keep done entries (struck through)", "defaultValue": true },
+      { "key": "pushUpdates", "type": "boolean", "label": "Let Emacs push changes (installs save/TODO hooks)", "defaultValue": true },
+      { "key": "socketName", "type": "string", "label": "Emacs server socket (blank = default)", "defaultValue": "" },
+      { "key": "serverFile", "type": "path", "label": "Emacs TCP server file (blank = use the socket)", "defaultValue": "" },
+      { "key": "emacsclient", "type": "path", "label": "emacsclient binary (blank = PATH)", "defaultValue": "" },
+      { "key": "agendaFiles", "type": "string", "label": "Agenda files/dirs, colon-separated", "defaultValue": "", "description": "Blank uses omarchy-org-agenda-files if set in Emacs, else org-agenda-files." },
+      { "key": "agendaKey", "type": "string", "label": "org-agenda key for middle click", "defaultValue": "a" },
+      { "key": "emacsApp", "type": "string", "label": "Emacs window class to focus", "defaultValue": "emacs" },
+      { "key": "timeoutSeconds", "type": "integer", "label": "emacsclient timeout (seconds)", "min": 1, "max": 30, "defaultValue": 5 }
+    ]
+  }
+}
