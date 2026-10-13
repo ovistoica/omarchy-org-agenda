@@ -27,6 +27,8 @@ DEADLINE: <2026-10-16 Fri>
 SCHEDULED: <2026-10-14 Wed>
 ** TODO Customer call: renewal terms                             :meeting:
 SCHEDULED: <2026-10-16 Fri 10:00-10:45>
+** Design review: billing page                                  :meeting:
+<2026-10-15 Thu 15:00-16:00>
 ** DONE Merge the dependency updates
 CLOSED: [2026-10-13 Tue 09:12] SCHEDULED: <2026-10-13 Tue>
 

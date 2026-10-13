@@ -8,8 +8,9 @@
 ;;; Commentary:
 
 ;; Writes today's agenda as JSON to `omarchy-org-agenda-output', followed
-;; by the tasks scheduled on the next `omarchy-org-agenda-upcoming-days'
-;; days.  The bar's file list is `omarchy-org-agenda-files-override', else
+;; by the scheduled tasks and timestamped entries (such as calendar
+;; events) of the next `omarchy-org-agenda-upcoming-days' days.  The
+;; bar's file list is `omarchy-org-agenda-files-override', else
 ;; `omarchy-org-agenda-files', else `org-agenda-files'.
 ;;
 ;; `omarchy-org-agenda-set-state' changes an exported entry's TODO state
@@ -68,9 +69,11 @@ Set by the plugin on every `omarchy-org-agenda-ensure'; it takes
 precedence over `omarchy-org-agenda-files'.")
 
 (defvar omarchy-org-agenda-upcoming-days 7
-  "How many days after today the export looks ahead for scheduled tasks.
-Their SCHEDULED entries follow today's agenda in the export, once per
-heading, for the bar's \"Coming up\" section; 0 exports today only.
+  "How many days after today the export looks ahead.
+The scheduled tasks and timestamped entries (such as calendar events,
+date ranges included) of those days follow today's agenda in the
+export, once per heading at its first date, for the bar's \"Coming up\"
+section; 0 exports today only.
 Set by the plugin on `omarchy-org-agenda-ensure', within 0..31.")
 
 (defvar omarchy-org-agenda-max-items 200
@@ -198,7 +201,9 @@ Call it within `omarchy-org-agenda--entries', which prepares FILES."
 (defun omarchy-org-agenda--entries (files &optional days)
   "Agenda entries in FILES for today and the DAYS days after it.
 Returns a list of (OFFSET . ENTRIES), one per day in order: OFFSET 0
-holds today's whole agenda, each later day only its SCHEDULED entries.
+holds today's whole agenda, each later day only its scheduled tasks
+and timestamped entries (such as calendar events): no deadlines, whose
+warnings today's agenda already has, and no diary sexps.
 Each day is sorted like the user's own day agenda.
 Every file in FILES must exist, or Org prompts to remove it from the list."
   (let* ((org-agenda-files files)
@@ -218,7 +223,8 @@ Every file in FILES must exist, or Org prompts to remove it from the list."
                     (cons offset (omarchy-org-agenda--day-entries
                                   files
                                   (calendar-gregorian-from-absolute (+ today offset))
-                                  '(:scheduled))))
+                                  ;; :timestamp covers date ranges too.
+                                  '(:scheduled :timestamp))))
                   (number-sequence 1 (or days 0))))))
 
 (defun omarchy-org-agenda--key (item)
@@ -229,7 +235,8 @@ Every file in FILES must exist, or Org prompts to remove it from the list."
   "JSON plists for DAYS, the (OFFSET . ENTRIES) list of `--entries'.
 TODAY is an absolute day number.  Today's entries come first, as Org
 lists them; a later day's entry is dropped when its heading is already
-listed, so a repeating task shows once, at its next occurrence.  At most
+listed, so a repeating task or event shows once, at its next occurrence,
+and a date range once, on its first day.  At most
 `omarchy-org-agenda-max-items' in all, today's kept first."
   (let* ((max omarchy-org-agenda-max-items)
          (now (mapcar (lambda (entry) (omarchy-org-agenda--item entry today))
@@ -313,8 +320,9 @@ See `omarchy-org-agenda--index'."
 
 (defun omarchy-org-agenda-export (&optional reason)
   "Write today's agenda to `omarchy-org-agenda-output'.
-The tasks scheduled on the next `omarchy-org-agenda-upcoming-days' days
-follow it, with their :inDays.  REASON (default \"pull\") is echoed in
+The scheduled tasks and timestamped entries (such as calendar events)
+of the next `omarchy-org-agenda-upcoming-days' days follow it, with
+their :inDays.  REASON (default \"pull\") is echoed in
 the payload.  Agenda files that don't exist are skipped and listed
 under :missing.  Errors are written into the file too, so the bar can
 show them."
@@ -391,7 +399,9 @@ list doesn't follow `org-agenda-files', so its changes don't matter."
   "Point the exporter at OUTPUT; idempotent, called by the plugin on every pull.
 FILES overrides `org-agenda-files'.  PUSH installs the change hooks.
 UPCOMING, an integer clamped to 0..31, sets
-`omarchy-org-agenda-upcoming-days'; nil, as older plugins send, keeps it.
+`omarchy-org-agenda-upcoming-days', the days of scheduled tasks and
+timestamped entries (such as calendar events) exported after today;
+nil, as older plugins send, keeps it.
 Exports the hooks trigger use these settings too."
   (setq omarchy-org-agenda-output (expand-file-name output)
         omarchy-org-agenda-files-override files)

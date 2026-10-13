@@ -153,6 +153,21 @@ eq([M.nextUp([tomorrow], at(8, 0)), M.openToday([tomorrow, repeat]), M.overdueCo
    [null, 0, 0], "later-day task: not next up, not open today, not overdue")
 eq(M.view(payloadOf([tomorrow, repeat]), "ok", "", at(8, 0), {}).label,
    { mode: "clear", text: "", badge: 0, alert: false }, "later-day task: bar stays clear")
+
+// Calendar-style entries on a later day: a timed timestamp, a date range.
+const event = item({ line: 92, type: "timestamp", title: "Design review", time: "10:00", durationMin: 30, inDays: 1 })
+const trip = item({ line: 93, type: "block", title: "Conference", inDays: 14, overdueDays: 1 })
+eq([event, trip].map(M.classify), ["upcoming", "upcoming"], "classify: later-day timestamp and block -> upcoming")
+eq(M.sections(all.concat([event, trip]), {}).map(s => [s.key, s.items.map(i => i.line)]),
+   [["schedule", [63, 10]], ["today", [20, 60]], ["upcoming", [50, 92, 93]], ["habits", [30]], ["overdue", [40]]],
+   "sections: later-day events only under Coming up")
+eq([M.nextUp([event], at(8, 0)), M.openToday([event, trip]), M.overdueCount([event, trip], { habitsInBadge: true })],
+   [null, 0, 0], "later-day event: not next up, not open today, not overdue")
+eq(M.view(payloadOf([event, trip]), "ok", "", at(8, 0), {}).label,
+   { mode: "clear", text: "", badge: 0, alert: false }, "later-day event: bar stays clear")
+eq([event, trip].map(i => M.rowLead(i, M.payloadDay(payloadOf([])))),
+   [{ text: "Wed", urgent: false }, { text: "27 Oct", urgent: false }], "rowLead: later-day events")
+eq([event, trip].map(M.rowTrail), ["10:00 · cal", "cal"], "rowTrail: later-day events")
 {
   const ups = [[1, 3], [2, 1], [3, 3], [4, 1], [5, 1], [6, 0], [7, 2]]
     .map(c => item({ line: c[0], type: c[1] ? "scheduled" : "upcoming-deadline", inDays: c[1] }))
