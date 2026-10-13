@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  node:
+    name: Model.js and manifest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Model.js tests
+        run: node tests/model.test.js
+      - name: Manifest and plugin-folder checks
+        run: bash tests/check-manifest.sh
+
+  ert:
+    name: ERT (Emacs ${{ matrix.emacs }})
+    runs-on: ubuntu-latest
+    # Snapshot tracks Emacs master; a break there is news, not a red build.
+    continue-on-error: ${{ matrix.emacs == 'snapshot' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        emacs: ['29.4', '30.1', '31.1', 'snapshot']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: purcell/setup-emacs@master
+        with:
+          version: ${{ matrix.emacs }}
+      # tests/run.sh also runs the node suite after ERT.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Versions
+        run: emacs --batch -Q --eval '(progn (require (quote org)) (princ (format "Emacs %s, Org %s\n" emacs-version (org-version))))'
+      - name: Byte-compile (warnings are errors)
+        run: >-
+          emacs --batch -Q
+          --eval '(setq byte-compile-error-on-warn t)'
+          -f batch-byte-compile elisp/omarchy-org-agenda.el
+      - name: Tests
+        run: bash tests/run.sh
