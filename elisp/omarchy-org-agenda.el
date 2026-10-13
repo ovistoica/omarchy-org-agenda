@@ -10,9 +10,13 @@
 ;; Writes today's agenda as JSON to `omarchy-org-agenda-output'.  The bar's
 ;; file list is `omarchy-org-agenda-files-override', else
 ;; `omarchy-org-agenda-files', else `org-agenda-files'.
+;;
+;; `omarchy-org-agenda-set-state' changes an exported entry's TODO state
+;; for the bar, after checking the entry still is what the bar showed.
 
 ;;; Code:
 
+(require 'cl-lib)
 (require 'org)
 (require 'org-agenda)
 (require 'seq)
@@ -69,6 +73,24 @@ precedence over `omarchy-org-agenda-files'.")
 (defvar omarchy-org-agenda--push nil)
 (defvar omarchy-org-agenda--exporting nil)
 
+(defvar omarchy-org-agenda--index nil
+  "What the last export wrote, for `omarchy-org-agenda-set-state' to check.
+A hash table keyed by (PATH . LINE), holding (:title :todo :id) as the
+JSON has them, `:null' included.  Diary sexps are left out.")
+
+(defvar omarchy-org-agenda-max-detail 200
+  "Bound on the user-visible detail of a state change result.")
+
+(defvar omarchy-org-agenda-note-timeout 15
+  "Seconds a note queued for `omarchy-org-agenda-take-note' stays queued.")
+
+(defvar omarchy-org-agenda--note nil
+  "The note a state change left queued or open, or nil.
+A plist: :marker, a copy of `org-log-note-marker' that moves with it;
+:time, its `org-log-note-effective-time'; :save, non-nil to save the
+buffer once the note is stored; :timer, the timer that drops it if no
+frame takes it.")
+
 (defvar omarchy-org-agenda--source-mtime nil
   "Modification time of the file this helper was last loaded from.
 The plugin compares it with the file on disk and reloads when they differ.")
@@ -86,6 +108,14 @@ The plugin compares it with the file on disk and reloads when they differ.")
       (if (and max (> (length s) max))
           (concat (substring s 0 (1- max)) "…")
         s))))
+
+(defun omarchy-org-agenda--title (&optional raw)
+  "The bar's title for RAW text, or for the heading at point.
+Links show their description; the result is bounded.  Both the export
+and `omarchy-org-agenda-set-state''s check use it, so they agree."
+  (omarchy-org-agenda--clean
+   (org-link-display-format (or raw (org-get-heading t t t t)))
+   omarchy-org-agenda-max-title))
 
 (defun omarchy-org-agenda--priority ()
   "The explicit priority cookie of the heading at point, or nil."
@@ -114,12 +144,9 @@ The plugin compares it with the file on disk and reloads when they differ.")
             :done (if (member todo org-done-keywords-for-agenda) t :false)
             ;; A diary sexp's text is its result ("Ana is 36 years old"),
             ;; not the heading it happens to sit under.
-            :title (omarchy-org-agenda--clean
-                    (org-link-display-format
-                     (if (equal type "sexp")
-                         (omarchy-org-agenda--prop entry 'txt)
-                       (org-get-heading t t t t)))
-                    omarchy-org-agenda-max-title)
+            :title (omarchy-org-agenda--title
+                    (and (equal type "sexp")
+                         (omarchy-org-agenda--prop entry 'txt)))
             :priority (or (omarchy-org-agenda--priority) :null)
             :category (or (omarchy-org-agenda--clean
                            (omarchy-org-agenda--prop entry 'org-category))
@@ -170,8 +197,22 @@ Every file in FILES must exist, or Org prompts to remove it from the list."
                    ((listp face) (plist-get face :foreground)))))
     (and (stringp fg) (string-prefix-p "#" fg) fg)))
 
-(defun omarchy-org-agenda--keywords ()
-  "TODO and DONE keywords of the exported files, with their face colors."
+(defun omarchy-org-agenda--fast-keys (files keywords)
+  "Fast selection keys of KEYWORDS in the buffers of FILES, as a hash.
+Maps keyword to a one-char string; the first file declaring a key wins."
+  (let ((keys (make-hash-table :test #'equal)))
+    (dolist (file files)
+      (when-let* ((buf (find-buffer-visiting file)))
+        (dolist (cell (buffer-local-value 'org-todo-key-alist buf))
+          (when (and (stringp (car-safe cell))
+                     (characterp (cdr cell))
+                     (member (car cell) keywords)
+                     (not (gethash (car cell) keys)))
+            (puthash (car cell) (char-to-string (cdr cell)) keys)))))
+    keys))
+
+(defun omarchy-org-agenda--keywords (files)
+  "TODO and DONE keywords of the exported FILES, with face colors and keys."
   ;; `org-agenda-prepare-buffers' pushes keywords, so they come out in
   ;; reverse; restore the order they are declared in.
   (let ((all (reverse org-todo-keywords-for-agenda))
@@ -182,7 +223,22 @@ Every file in FILES must exist, or Org prompts to remove it from the list."
         (puthash kwd color colors)))
     (list :todo (vconcat (seq-difference all done))
           :done (vconcat done)
-          :colors colors)))
+          :colors colors
+          :keys (omarchy-org-agenda--fast-keys files all))))
+
+(defun omarchy-org-agenda--build-index (items)
+  "Index of the exported ITEMS (JSON plists) by (PATH . LINE).
+See `omarchy-org-agenda--index'."
+  (let ((index (make-hash-table :test #'equal)))
+    (dolist (item items)
+      (let ((key (cons (plist-get item :path) (plist-get item :line))))
+        (unless (or (equal (plist-get item :type) "sexp")
+                    (gethash key index))
+          (puthash key (list :title (plist-get item :title)
+                             :todo (plist-get item :todo)
+                             :id (plist-get item :id))
+                   index))))
+    index))
 
 ;;;; Output
 
@@ -217,16 +273,19 @@ into the file too, so the bar can show them."
      (condition-case err
          (let* ((files (omarchy-org-agenda--files))
                 (missing (seq-remove #'file-exists-p files))
-                (entries (seq-take (omarchy-org-agenda--entries
-                                    (seq-difference files missing))
-                                   omarchy-org-agenda-max-items)))
+                (present (seq-difference files missing))
+                (entries (seq-take (omarchy-org-agenda--entries present)
+                                   omarchy-org-agenda-max-items))
+                (items (mapcar (lambda (e) (omarchy-org-agenda--item e today))
+                               entries)))
+           (setq omarchy-org-agenda--index (omarchy-org-agenda--build-index items))
            (append base
-                   (list :keywords (omarchy-org-agenda--keywords)
-                         :items (vconcat (mapcar (lambda (e) (omarchy-org-agenda--item e today))
-                                                 entries))
+                   (list :keywords (omarchy-org-agenda--keywords present)
+                         :items (vconcat items)
                          :missing (vconcat missing)
                          :error :null)))
-       (error (append base (list :items []
+       (error (setq omarchy-org-agenda--index (omarchy-org-agenda--build-index nil))
+              (append base (list :items []
                                  :missing []
                                  :error (error-message-string err))))))
     t))
@@ -273,7 +332,7 @@ FILES overrides `org-agenda-files'.  PUSH installs the change hooks."
   (setq omarchy-org-agenda-output (expand-file-name output)
         omarchy-org-agenda-files-override files)
   (unless (eq (and push t) omarchy-org-agenda--push)
-    (omarchy-org-agenda-teardown)
+    (omarchy-org-agenda--remove-push-hooks)
     (when push
       (add-hook 'after-save-hook #'omarchy-org-agenda--on-save)
       (add-hook 'after-revert-hook #'omarchy-org-agenda--on-revert)
@@ -283,8 +342,8 @@ FILES overrides `org-agenda-files'.  PUSH installs the change hooks."
       (setq omarchy-org-agenda--push t)))
   t)
 
-(defun omarchy-org-agenda-teardown ()
-  "Remove every hook, watcher and timer this package installed."
+(defun omarchy-org-agenda--remove-push-hooks ()
+  "Remove the hooks, watcher and export timer `omarchy-org-agenda-ensure' adds."
   (remove-hook 'after-save-hook #'omarchy-org-agenda--on-save)
   (remove-hook 'after-revert-hook #'omarchy-org-agenda--on-revert)
   (remove-hook 'org-after-todo-state-change-hook #'omarchy-org-agenda--on-todo)
@@ -293,7 +352,15 @@ FILES overrides `org-agenda-files'.  PUSH installs the change hooks."
   (when (timerp omarchy-org-agenda--timer)
     (cancel-timer omarchy-org-agenda--timer))
   (setq omarchy-org-agenda--timer nil
-        omarchy-org-agenda--push nil)
+        omarchy-org-agenda--push nil))
+
+(defun omarchy-org-agenda-teardown ()
+  "Remove every hook, watcher, advice and timer this package installed.
+A note a state change left queued is dropped too, and the export index
+is cleared."
+  (omarchy-org-agenda--remove-push-hooks)
+  (omarchy-org-agenda--drop-note)
+  (setq omarchy-org-agenda--index nil)
   t)
 
 (defun omarchy-org-agenda-unload-function ()
@@ -303,17 +370,21 @@ FILES overrides `org-agenda-files'.  PUSH installs the change hooks."
 
 ;;;; Click: open the source file at the entry's line
 
-(defun omarchy-org-agenda--locate (path line &optional id)
+(defun omarchy-org-agenda--locate (path line &optional id local)
   "Marker for the entry at LINE of PATH.
 When ID is given and the heading at LINE no longer carries it (the file
-was edited since the export), follow the ID instead."
+was edited since the export), follow the ID instead: within PATH only
+when LOCAL is non-nil, else wherever Org's ID index says."
   (with-current-buffer (find-file-noselect path)
     (org-with-wide-buffer
      (goto-char (point-min))
      (forward-line (1- line))
      (or (and id
               (not (equal id (ignore-errors (org-entry-get nil "ID"))))
-              (org-id-find id 'marker))
+              (if local
+                  (when-let* ((pos (org-find-entry-with-id id)))
+                    (copy-marker pos))
+                (org-id-find id 'marker)))
          (point-marker)))))
 
 (defun omarchy-org-agenda-goto (path line &optional id)
@@ -334,6 +405,294 @@ the entry if LINE is stale; see `omarchy-org-agenda--locate'."
   "Open the user's agenda dispatcher entry KEY (default \"a\")."
   (org-agenda nil (or key "a"))
   t)
+
+;;;; State change: `omarchy-org-agenda-set-state'
+;;
+;; Org queues a log note by putting `org-add-log-note' on the global
+;; `post-command-hook'; `org-store-log-note' stores it, or drops it when
+;; `org-note-abort' is set (C-c C-k).  The note's identity is the pair
+;; `org-log-note-marker' / `org-log-note-effective-time': a copy of the
+;; marker moves with it through edits, and every new note resets both.
+;;
+;; The save after a note can't use `org-after-note-stored-hook': Org 9.6
+;; doesn't have it, and it never runs on cancel, which must clean up too.
+;; A transient advice around `org-store-log-note' sees every outcome on
+;; every version; it removes itself on the first store, ours or not.
+
+(defun omarchy-org-agenda--detail (s)
+  "S as a bounded, single-line detail string, or nil."
+  (when (stringp s)
+    (omarchy-org-agenda--clean (replace-regexp-in-string "[\0-\37\177]" " " s)
+                               omarchy-org-agenda-max-detail)))
+
+(defun omarchy-org-agenda--ascii (json)
+  "JSON with every non-ASCII char as a \\u escape.
+The output of `emacsclient --eval' then is plain ASCII, whatever the
+client's locale; JSON allows non-ASCII only inside strings."
+  (replace-regexp-in-string
+   "[^[:ascii:]]"
+   (lambda (s)
+     (let ((c (string-to-char s)))
+       (cond ((> c #x10ffff) "\\ufffd")
+             ((> c #xffff)
+              (let ((v (- c #x10000)))
+                (format "\\u%04x\\u%04x"
+                        (+ #xd800 (ash v -10)) (+ #xdc00 (logand v #x3ff)))))
+             (t (format "\\u%04x" c)))))
+   (if (multibyte-string-p json) json (decode-coding-string json 'utf-8 t))
+   t t))
+
+(defun omarchy-org-agenda--json-result (result)
+  "RESULT, a plist (:result :state :saved :detail), as a JSON string."
+  (omarchy-org-agenda--ascii
+   (json-serialize
+    (list :result (plist-get result :result)
+          :state (or (plist-get result :state) :null)
+          :saved (if (plist-get result :saved) t :false)
+          :detail (or (omarchy-org-agenda--detail (plist-get result :detail))
+                      :null)))))
+
+(defun omarchy-org-agenda--nullish (v)
+  "V, with JSON's `:null' as nil."
+  (unless (eq v :null) v))
+
+(defun omarchy-org-agenda--note-queued-p ()
+  "Non-nil when Org has a note queued on the global `post-command-hook'."
+  (memq #'org-add-log-note (default-value 'post-command-hook)))
+
+(defun omarchy-org-agenda--busy-p ()
+  "Non-nil while a note is queued or being written.
+Another state change would retarget Org's single pending note."
+  (or (omarchy-org-agenda--note-queued-p)
+      (buffer-live-p (get-buffer "*Org Note*"))))
+
+(defun omarchy-org-agenda--our-note-p ()
+  "Non-nil when Org's pending note is the one recorded in `--note'."
+  (when-let* ((note omarchy-org-agenda--note)
+              (ours (plist-get note :marker))
+              (buf (marker-buffer org-log-note-marker)))
+    (and (eq buf (marker-buffer ours))
+         (= org-log-note-marker ours)
+         (equal org-log-note-effective-time (plist-get note :time)))))
+
+(defun omarchy-org-agenda--forget-note ()
+  "Stop tracking our note: its timer, its marker and the store advice."
+  (when-let* ((note omarchy-org-agenda--note))
+    (when (timerp (plist-get note :timer))
+      (cancel-timer (plist-get note :timer)))
+    (set-marker (plist-get note :marker) nil))
+  (advice-remove 'org-store-log-note #'omarchy-org-agenda--around-store-note)
+  (setq omarchy-org-agenda--note nil))
+
+(defun omarchy-org-agenda--drop-note ()
+  "Unqueue our note if Org still has it queued, then forget it."
+  (when (and (omarchy-org-agenda--note-queued-p)
+             (omarchy-org-agenda--our-note-p))
+    (remove-hook 'post-command-hook #'org-add-log-note)
+    (setq org-log-setup nil))
+  (omarchy-org-agenda--forget-note))
+
+(defun omarchy-org-agenda--expire-note ()
+  "Drop our note if it is still queued: no frame came to take it."
+  (when (and (omarchy-org-agenda--note-queued-p)
+             (omarchy-org-agenda--our-note-p))
+    (omarchy-org-agenda--drop-note)))
+
+(defun omarchy-org-agenda--track-note (save &optional timeout)
+  "Record Org's pending note as ours; SAVE its buffer once it is stored.
+With TIMEOUT, drop the note after that many seconds unless taken."
+  (omarchy-org-agenda--forget-note)
+  (setq omarchy-org-agenda--note
+        (list :marker (copy-marker org-log-note-marker)
+              :time org-log-note-effective-time
+              :save save
+              :timer (and timeout
+                          (run-at-time timeout nil
+                                       #'omarchy-org-agenda--expire-note))))
+  (advice-add 'org-store-log-note :around
+              #'omarchy-org-agenda--around-store-note))
+
+(defun omarchy-org-agenda--save (buf)
+  "Save BUF without prompting; return (SAVED . DETAIL)."
+  (condition-case err
+      (with-current-buffer buf
+        (if (not (verify-visited-file-modtime buf))
+            (cons nil "the file changed on disk")
+          (let ((save-silently t)
+                (inhibit-message t)
+                (require-final-newline (and (not (eq require-final-newline 'ask))
+                                            require-final-newline)))
+            (save-buffer)
+            (cons t nil))))
+    (error (cons nil (error-message-string err)))))
+
+(defun omarchy-org-agenda--around-store-note (store &rest args)
+  "Call STORE (`org-store-log-note') with ARGS; save after our note.
+Removes itself first: any store ends the note it was waiting for."
+  (let* ((note omarchy-org-agenda--note)
+         (buf (marker-buffer org-log-note-marker))
+         (save (and (omarchy-org-agenda--our-note-p)
+                    (not org-note-abort)
+                    (plist-get note :save))))
+    (omarchy-org-agenda--forget-note)
+    (prog1 (apply store args)
+      (when (and save (buffer-live-p buf))
+        (omarchy-org-agenda--save buf)))))
+
+(defun omarchy-org-agenda--graphic-frame-p ()
+  "Non-nil when the selected frame is a visible graphic frame."
+  (and (display-graphic-p) (eq t (frame-visible-p (selected-frame)))))
+
+(defun omarchy-org-agenda--refuse-prompt (&rest _)
+  "Stand-in for Emacs's lock and supersession questions: refuse."
+  (error "The file is locked or changed on disk"))
+
+(defun omarchy-org-agenda--changed ()
+  "The `changed' result, with an export to refresh the bar."
+  (when omarchy-org-agenda-output
+    (omarchy-org-agenda--schedule "changed"))
+  (list :result "changed"))
+
+(defun omarchy-org-agenda--valid-args-p (path line id from to)
+  "Non-nil when PATH, LINE, ID, FROM and TO have the expected types."
+  (and (stringp path) (file-name-absolute-p path)
+       (natnump line) (> line 0)
+       (or (null id) (stringp id))
+       (or (null from) (stringp from))
+       (stringp to)))
+
+(defun omarchy-org-agenda--entry-matches-p (marker buf entry id from)
+  "Non-nil when MARKER is still the heading the bar showed.
+It must be in BUF, at a heading whose title and keyword match the
+index ENTRY, and FROM; and the index's ID, if any, must be ID."
+  (and (eq (marker-buffer marker) buf)
+       (or (null id) (equal id (omarchy-org-agenda--nullish (plist-get entry :id))))
+       (with-current-buffer buf
+         (org-with-wide-buffer
+          (goto-char marker)
+          (and (org-at-heading-p)
+               (equal (omarchy-org-agenda--title) (plist-get entry :title))
+               (let ((todo (org-get-todo-state)))
+                 (and (equal todo from)
+                      (equal todo (omarchy-org-agenda--nullish
+                                   (plist-get entry :todo))))))))))
+
+(defun omarchy-org-agenda--apply (buf marker to)
+  "Run `org-todo' TO on the entry at MARKER in BUF, in a widened view.
+Return (:changed BOOL :state KEYWORD :blocking STRING)."
+  (with-current-buffer buf
+    (org-with-wide-buffer
+     (goto-char marker)
+     (let ((tick (buffer-chars-modified-tick))
+           (org-block-entry-blocking nil))
+       (save-window-excursion (org-todo to))
+       (list :changed (/= tick (buffer-chars-modified-tick))
+             :state (save-excursion (goto-char marker) (org-get-todo-state))
+             :blocking org-block-entry-blocking)))))
+
+(defun omarchy-org-agenda--finish-log (was-modified)
+  "Handle the log Org queued for a state change; return a result plist.
+Time and state logs are stored now, out of sight.  A note opens in a
+visible graphic frame (`note'), else stays queued for
+`omarchy-org-agenda-take-note' (`note-frame').  WAS-MODIFIED says the
+buffer had unsaved edits before the change, so it isn't saved."
+  (if (memq org-log-note-how '(time state))
+      (progn
+        (save-window-excursion (org-add-log-note))
+        (list :result "done"))
+    (if (omarchy-org-agenda--graphic-frame-p)
+        (progn
+          (omarchy-org-agenda--track-note (not was-modified))
+          (org-add-log-note)
+          (list :result "note"))
+      ;; No frame to show it in: only `omarchy-org-agenda-take-note' may
+      ;; open it, never whatever command the user runs next.
+      (setq org-log-note-this-command 'omarchy-org-agenda-take-note)
+      (omarchy-org-agenda--track-note (not was-modified)
+                                      omarchy-org-agenda-note-timeout)
+      (list :result "note-frame"))))
+
+(defun omarchy-org-agenda--change (path line id from to entry)
+  "Change the indexed ENTRY at LINE (or ID) of PATH from FROM to TO."
+  (let* ((buf (or (find-buffer-visiting path)
+                  (let ((large-file-warning-threshold nil))
+                    (find-file-noselect path t))))
+         (marker (omarchy-org-agenda--locate path line id t)))
+    (cond
+     ((not (omarchy-org-agenda--entry-matches-p marker buf entry id from))
+      (omarchy-org-agenda--changed))
+     ((not (member to (buffer-local-value 'org-todo-keywords-1 buf)))
+      (list :result "invalid" :detail (concat to " isn't a keyword of this file")))
+     ((equal from to)
+      (list :result "done" :state to
+            :saved (not (buffer-modified-p buf))))
+     (t
+      (let* ((was-modified (buffer-modified-p buf))
+             (change (omarchy-org-agenda--apply buf marker to))
+             (state (plist-get change :state))
+             (result
+              (cond ((not (plist-get change :changed))
+                     (list :result "blocked"
+                           :detail (org-string-nw-p (plist-get change :blocking))))
+                    ((omarchy-org-agenda--note-queued-p)
+                     (omarchy-org-agenda--finish-log was-modified))
+                    (t (list :result "done")))))
+        (if (and (equal (plist-get result :result) "done") (not was-modified))
+            (pcase-let ((`(,saved . ,detail) (omarchy-org-agenda--save buf)))
+              (append (list :state state :saved saved :detail detail) result))
+          (append (list :state (and (plist-get change :changed) state)) result)))))))
+
+(defun omarchy-org-agenda--set-state (path line id from to)
+  "The steps of `omarchy-org-agenda-set-state'; return a result plist."
+  (let ((entry (and omarchy-org-agenda--index
+                    (gethash (cons path line) omarchy-org-agenda--index)))
+        (buf (and (stringp path) (find-buffer-visiting path))))
+    (cond
+     ((not (omarchy-org-agenda--valid-args-p path line id from to))
+      (list :result "invalid" :detail "bad arguments"))
+     ((omarchy-org-agenda--busy-p) (list :result "busy"))
+     ((not (and entry (file-exists-p path))) (omarchy-org-agenda--changed))
+     ((and buf (not (verify-visited-file-modtime buf)) (buffer-modified-p buf))
+      (list :result "conflict"))
+     (t
+      (when (and buf (not (verify-visited-file-modtime buf)))
+        (with-current-buffer buf (revert-buffer t t t)))
+      (omarchy-org-agenda--change path line id from to entry)))))
+
+(defun omarchy-org-agenda-set-state (path line id from to)
+  "Change the TODO state of the exported entry at LINE of PATH to TO.
+ID, when non-nil, finds the entry if lines moved.  FROM is the keyword
+the bar showed (nil for none).  Called by the plugin through
+`emacsclient --eval'; never prompts.
+
+Returns a JSON string {result, state, saved, detail}.  result is one of
+done, note, note-frame, blocked, changed, conflict, busy, invalid or
+error; state is the keyword after the change; saved says the file was
+saved, which happens when it had no unsaved edits before the change."
+  (omarchy-org-agenda--json-result
+   (condition-case err
+       (let ((inhibit-message t))
+         (cl-letf (((symbol-function 'ask-user-about-lock)
+                    #'omarchy-org-agenda--refuse-prompt)
+                   ((symbol-function 'ask-user-about-supersession-threat)
+                    #'omarchy-org-agenda--refuse-prompt))
+           (omarchy-org-agenda--set-state path line id from to)))
+     (error (list :result "error" :detail (error-message-string err))))))
+
+(defun omarchy-org-agenda-take-note ()
+  "Open the note a state change left queued, in the selected frame.
+Returns t, or nil when there is no such note any more."
+  (when (and (omarchy-org-agenda--note-queued-p)
+             (omarchy-org-agenda--our-note-p))
+    (let ((note omarchy-org-agenda--note))
+      (when (timerp (plist-get note :timer))
+        (cancel-timer (plist-get note :timer)))
+      (setq omarchy-org-agenda--note (plist-put note :timer nil)))
+    ;; Org 9.6+ only opens a note from the command that queued it.
+    (let ((this-command org-log-note-this-command))
+      (setq org-log-note-recursion-depth (recursion-depth))
+      (org-add-log-note))
+    t))
 
 ;; Updated on every load, not just the first, so the plugin's mtime check
 ;; sees the version that is actually loaded.

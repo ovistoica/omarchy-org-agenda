@@ -488,26 +488,487 @@ cleaned up afterwards."
         ;; Back to the repo's definitions for the remaining tests.
         (load omarchy-org-agenda-test--source nil t)))))
 
+;;;; State changes
+
+(defun omarchy-org-agenda-test--state-text ()
+  "The state-change fixture: fast keys, logging, blockers, an ID."
+  (let ((today (concat "SCHEDULED: " (omarchy-org-agenda-test--ts 0) "\n")))
+    (concat
+     "#+TODO: NEXT(n@/!) TODO(t@/!) REPEAT(r) PROJ(p) | DONE(d@) CANCELED(c@)\n\n"
+     "* REPEAT Alpha task\n" today
+     "* PROJ Beta task\n" today
+     ":PROPERTIES:\n:ID: state-beta\n:END:\n"
+     "* PROJ Parent task\n" today
+     "** NEXT Ședință copil\n"
+     "* PROJ Checklist task\n" today
+     "- [ ] First box\n"
+     "* NEXT Gamma \"quoted\" task\n" today
+     "* Plain heading\n" today)))
+
+(defun omarchy-org-agenda-test--clear-notes ()
+  "Forget any note Org has queued or open."
+  (remove-hook 'post-command-hook #'org-add-log-note)
+  (setq org-log-setup nil)
+  (when (get-buffer "*Org Note*")
+    (kill-buffer "*Org Note*")))
+
+(defmacro omarchy-org-agenda-test--with-state (spec &rest body)
+  "Run BODY with (FILE PAYLOAD) of SPEC bound to the exported state fixture.
+Dependencies are enforced like a typical configuration."
+  (declare (indent 1) (debug ((symbolp symbolp) body)))
+  `(omarchy-org-agenda-test--with-dir (dir)
+     (let* ((org-blocker-hook '(org-block-todo-from-checkboxes
+                                org-block-todo-from-children-or-siblings-or-parent))
+            (org-enforce-todo-dependencies t)
+            (org-enforce-todo-checkbox-dependencies t)
+            (org-log-into-drawer nil)
+            (,(car spec) (omarchy-org-agenda-test--write
+                          (expand-file-name "state.org" dir)
+                          (omarchy-org-agenda-test--state-text)))
+            (,(cadr spec) (omarchy-org-agenda-test--export dir (list ,(car spec)))))
+       (ignore ,(cadr spec))
+       (unwind-protect (progn ,@body)
+         (omarchy-org-agenda-test--clear-notes)))))
+
+(defun omarchy-org-agenda-test--line (payload title)
+  "The line of the PAYLOAD item whose title contains TITLE."
+  (plist-get (omarchy-org-agenda-test--item payload title) :line))
+
+(defun omarchy-org-agenda-test--set-state (&rest args)
+  "`omarchy-org-agenda-set-state' on ARGS, its JSON parsed to a plist."
+  (let ((json (apply #'omarchy-org-agenda-set-state args)))
+    (should (stringp json))
+    (json-parse-string json :object-type 'plist
+                       :null-object nil :false-object nil)))
+
+(defun omarchy-org-agenda-test--disk (file)
+  "FILE's contents on disk."
+  (with-temp-buffer (insert-file-contents file) (buffer-string)))
+
+(defun omarchy-org-agenda-test--todo (file title)
+  "The TODO keyword of the heading in FILE's buffer containing TITLE."
+  (with-current-buffer (find-buffer-visiting file)
+    (org-with-wide-buffer
+     (goto-char (point-min))
+     (re-search-forward (concat "^\\*+ .*" (regexp-quote title)))
+     (org-get-todo-state))))
+
+(defun omarchy-org-agenda-test--edit (file fn)
+  "Call FN in FILE's widened buffer, at the start."
+  (with-current-buffer (find-buffer-visiting file)
+    (org-with-wide-buffer (goto-char (point-min)) (funcall fn))))
+
+(defun omarchy-org-agenda-test--rewrite (file from to)
+  "Replace FROM with TO in FILE on disk, behind Emacs's back."
+  (let ((text (omarchy-org-agenda-test--disk file)))
+    (omarchy-org-agenda-test--write file (string-replace from to text))
+    (set-file-times file (time-add nil 10))))
+
+(defun omarchy-org-agenda-test--advised-p ()
+  "Non-nil while the one-shot note-save advice is installed."
+  (advice-member-p 'omarchy-org-agenda--around-store-note 'org-store-log-note))
+
+(defun omarchy-org-agenda-test--store-note (text &optional abort)
+  "Type TEXT into *Org Note* and finish it, or cancel when ABORT."
+  (with-current-buffer "*Org Note*"
+    (goto-char (point-max))
+    (insert text)
+    (let ((org-note-abort abort))
+      (org-store-log-note))))
+
+(ert-deftest omarchy-org-agenda-test-fast-keys ()
+  (omarchy-org-agenda-test--with-state (file payload)
+    (let ((keys (plist-get (plist-get payload :keywords) :keys)))
+      (should (equal '("n" "t" "r" "p" "d" "c")
+                     (mapcar (lambda (k) (plist-get keys k))
+                             '(:NEXT :TODO :REPEAT :PROJ :DONE :CANCELED))))
+      (should (= 12 (length keys))))))
+
+(ert-deftest omarchy-org-agenda-test-index ()
+  (omarchy-org-agenda-test--with-dir (dir)
+    (let* ((payload (cdr (omarchy-org-agenda-test--fixture-payload dir)))
+           (items (seq-remove (lambda (i) (equal "sexp" (plist-get i :type)))
+                              (omarchy-org-agenda-test--items payload)))
+           (key (lambda (i) (cons (plist-get i :path) (plist-get i :line)))))
+      (should (= (length (seq-uniq (mapcar key items)))
+                 (hash-table-count omarchy-org-agenda--index)))
+      (should (= (length items) (hash-table-count omarchy-org-agenda--index)))
+      (dolist (i items)
+        (should (equal (list :title (plist-get i :title)
+                             :todo (plist-get i :todo)
+                             :id (plist-get i :id))
+                       (gethash (funcall key i) omarchy-org-agenda--index))))
+      (cl-letf (((symbol-function 'omarchy-org-agenda--entries)
+                 (lambda (&rest _) (error "Boom"))))
+        (omarchy-org-agenda-export))
+      (should (= 0 (hash-table-count omarchy-org-agenda--index)))
+      (omarchy-org-agenda-teardown)
+      (should-not omarchy-org-agenda--index))))
+
+(ert-deftest omarchy-org-agenda-test-state-result-shape ()
+  (omarchy-org-agenda-test--with-state (file payload)
+    (let* ((line (omarchy-org-agenda-test--line payload "Parent task"))
+           (json (omarchy-org-agenda-set-state file line nil "PROJ" "DONE"))
+           (result (json-parse-string json :object-type 'alist)))
+      (should (equal '(result state saved detail) (mapcar #'car result)))
+      ;; Plain ASCII on the wire; the child's name survives the round trip.
+      (should-not (string-match-p "[^[:ascii:]]" json))
+      (should (string-search "\\u0218" json))
+      (should (equal "blocked" (alist-get 'result result)))
+      (should (string-search "Ședință copil" (alist-get 'detail result))))
+    (cl-letf (((symbol-function 'omarchy-org-agenda--change)
+               (lambda (&rest _) (error "Boom\nwith a\ttab %s" (make-string 500 ?x)))))
+      (let ((r (omarchy-org-agenda-test--set-state
+                file (omarchy-org-agenda-test--line payload "Alpha") nil "REPEAT" "PROJ")))
+        (should (equal "error" (plist-get r :result)))
+        (should (string-prefix-p "Boom with a tab xx" (plist-get r :detail)))
+        (should (= 200 (length (plist-get r :detail))))))))
+
+(ert-deftest omarchy-org-agenda-test-state-done-saved ()
+  (omarchy-org-agenda-test--with-state (file payload)
+    (let ((r (omarchy-org-agenda-test--set-state
+              file (omarchy-org-agenda-test--line payload "Alpha") nil "REPEAT" "PROJ")))
+      (should (equal '(:result "done" :state "PROJ" :saved t :detail nil)
+                     (list :result (plist-get r :result) :state (plist-get r :state)
+                           :saved (plist-get r :saved) :detail (plist-get r :detail))))
+      (should (string-search "* PROJ Alpha task" (omarchy-org-agenda-test--disk file)))
+      (should-not (buffer-modified-p (find-buffer-visiting file))))
+    ;; No keyword before: FROM is nil.
+    (let ((r (omarchy-org-agenda-test--set-state
+              file (omarchy-org-agenda-test--line payload "Plain heading") nil nil "REPEAT")))
+      (should (equal "done" (plist-get r :result)))
+      (should (equal "REPEAT" (omarchy-org-agenda-test--todo file "Plain heading"))))))
+
+(ert-deftest omarchy-org-agenda-test-state-unsaved-edits ()
+  (omarchy-org-agenda-test--with-state (file payload)
+    (let ((line (omarchy-org-agenda-test--line payload "Alpha")))
+      (omarchy-org-agenda-test--edit file (lambda () (goto-char (point-max))
+                                            (insert "\nUnsaved text\n")))
+      (let ((r (omarchy-org-agenda-test--set-state file line nil "REPEAT" "PROJ")))
+        (should (equal "done" (plist-get r :result)))
+        (should (eq nil (plist-get r :saved)))
+        (should-not (plist-get r :detail)))
+      (should (buffer-modified-p (find-buffer-visiting file)))
+      (should (string-search "* REPEAT Alpha task" (omarchy-org-agenda-test--disk file)))
+      (should (equal "PROJ" (omarchy-org-agenda-test--todo file "Alpha"))))))
+
+(ert-deftest omarchy-org-agenda-test-state-verification ()
+  (omarchy-org-agenda-test--with-state (file payload)
+    (let ((alpha (omarchy-org-agenda-test--line payload "Alpha"))
+          (changed (lambda (&rest args)
+                     (setq omarchy-org-agenda--timer nil)
+                     (let ((r (apply #'omarchy-org-agenda-test--set-state args)))
+                       (should (equal "changed" (plist-get r :result)))
+                       ;; A refresh is on its way.
+                       (should (timerp omarchy-org-agenda--timer))))))
+      ;; Unknown location.
+      (funcall changed file 9999 nil "REPEAT" "PROJ")
+      (funcall changed (concat file "x") alpha nil "REPEAT" "PROJ")
+      ;; FROM isn't what the bar showed.
+      (funcall changed file alpha nil "PROJ" "DONE")
+      ;; Keyword changed in Emacs.
+      (omarchy-org-agenda-test--edit
+       file (lambda () (re-search-forward "^\\* REPEAT Alpha") (replace-match "* PROJ Alpha")))
+      (funcall changed file alpha nil "REPEAT" "PROJ")
+      ;; Title edited.
+      (omarchy-org-agenda-test--edit
+       file (lambda () (re-search-forward "^\\* PROJ Alpha task") (replace-match "* REPEAT Alpha renamed")))
+      (funcall changed file alpha nil "REPEAT" "PROJ")
+      ;; A line shifted: the line now holds another heading, which stays as is.
+      (omarchy-org-agenda-test--edit
+       file (lambda () (re-search-forward "^\\* REPEAT Alpha renamed\n")
+              (replace-match "* REPEAT Inserted above\n* REPEAT Alpha task\n")))
+      (funcall changed file alpha nil "REPEAT" "PROJ")
+      (should (equal "REPEAT" (omarchy-org-agenda-test--todo file "Inserted above")))
+      (should (equal "REPEAT" (omarchy-org-agenda-test--todo file "Alpha task"))))))
+
+(ert-deftest omarchy-org-agenda-test-state-follows-id ()
+  (omarchy-org-agenda-test--with-state (file payload)
+    (let ((beta (omarchy-org-agenda-test--line payload "Beta")))
+      (omarchy-org-agenda-test--edit file (lambda () (forward-line 2)
+                                            (insert "* One\n* Two\n")))
+      (should (equal "done" (plist-get (omarchy-org-agenda-test--set-state
+                                        file beta "state-beta" "PROJ" "REPEAT")
+                                       :result)))
+      (should (equal "REPEAT" (omarchy-org-agenda-test--todo file "Beta")))
+      (should-not (omarchy-org-agenda-test--todo file "One"))
+      ;; An ID the index doesn't have for that location.
+      (should (equal "changed" (plist-get (omarchy-org-agenda-test--set-state
+                                           file beta "other-id" "PROJ" "REPEAT")
+                                          :result))))))
+
+(ert-deftest omarchy-org-agenda-test-state-narrowed-elsewhere ()
+  (omarchy-org-agenda-test--with-state (file payload)
+    (with-current-buffer (find-buffer-visiting file)
+      (goto-char (point-min))
+      (re-search-forward "^\\* NEXT Gamma")
+      (org-narrow-to-subtree)
+      (let ((visible (buffer-string)))
+        (should (equal "done" (plist-get (omarchy-org-agenda-test--set-state
+                                          file (omarchy-org-agenda-test--line payload "Alpha")
+                                          nil "REPEAT" "PROJ")
+                                         :result)))
+        (should (buffer-narrowed-p))
+        (should (equal visible (buffer-string)))
+        (should (equal "PROJ" (omarchy-org-agenda-test--todo file "Alpha")))
+        (should (equal "NEXT" (omarchy-org-agenda-test--todo file "Gamma")))))))
+
+(ert-deftest omarchy-org-agenda-test-state-blocked ()
+  (omarchy-org-agenda-test--with-state (file payload)
+    (let ((r (omarchy-org-agenda-test--set-state
+              file (omarchy-org-agenda-test--line payload "Parent") nil "PROJ" "DONE")))
+      (should (equal "blocked" (plist-get r :result)))
+      (should (equal "NEXT Ședință copil" (plist-get r :detail)))
+      (should-not (plist-get r :state)))
+    (let ((r (omarchy-org-agenda-test--set-state
+              file (omarchy-org-agenda-test--line payload "Checklist") nil "PROJ" "DONE")))
+      (should (equal "blocked" (plist-get r :result)))
+      (should-not (plist-get r :detail)))
+    (should-not (buffer-modified-p (find-buffer-visiting file)))
+    (should-not (omarchy-org-agenda--note-queued-p))
+    (should (equal "PROJ" (omarchy-org-agenda-test--todo file "Parent")))))
+
+(ert-deftest omarchy-org-agenda-test-state-time-log ()
+  (omarchy-org-agenda-test--with-state (file payload)
+    (let ((config (current-window-configuration))
+          (shown (window-buffer))
+          (r (omarchy-org-agenda-test--set-state
+              file (omarchy-org-agenda-test--line payload "Gamma") nil "NEXT" "REPEAT")))
+      (should (equal "done" (plist-get r :result)))
+      (should (equal "REPEAT" (plist-get r :state)))
+      (should (eq t (plist-get r :saved)))
+      (should-not (get-buffer "*Org Note*"))
+      (should-not (omarchy-org-agenda--note-queued-p))
+      (should-not omarchy-org-agenda--note)
+      (should (compare-window-configurations config (current-window-configuration)))
+      (should (eq shown (window-buffer)))
+      (should (string-match-p "State \"REPEAT\" +from \"NEXT\""
+                              (omarchy-org-agenda-test--disk file))))))
+
+(ert-deftest omarchy-org-agenda-test-state-repeater ()
+  (omarchy-org-agenda-test--with-dir (dir)
+    (let* ((org-log-repeat 'time)
+           (org-log-done nil)
+           (file (omarchy-org-agenda-test--write
+                  (expand-file-name "repeat.org" dir)
+                  (concat "#+TODO: TODO NEXT | DONE\n\n* TODO Water the plants\n"
+                          "SCHEDULED: " (omarchy-org-agenda-test--ts 0 nil ".+1d") "\n")))
+           (payload (omarchy-org-agenda-test--export dir (list file)))
+           (r (omarchy-org-agenda-test--set-state
+               file (omarchy-org-agenda-test--line payload "Water") nil "TODO" "DONE")))
+      ;; Back to the state it came from, but the entry did change.
+      (should (equal "done" (plist-get r :result)))
+      (should (equal "TODO" (plist-get r :state)))
+      (should (eq t (plist-get r :saved)))
+      (should (string-search
+               (concat "SCHEDULED: <" (format-time-string
+                                       "%F" (encode-time (omarchy-org-agenda-test--day 1))))
+               (omarchy-org-agenda-test--disk file))))))
+
+(ert-deftest omarchy-org-agenda-test-state-note-frame ()
+  (omarchy-org-agenda-test--with-state (file payload)
+    (let* ((beta (omarchy-org-agenda-test--line payload "Beta"))
+           (r (omarchy-org-agenda-test--set-state file beta nil "PROJ" "DONE"))
+           (timer (plist-get omarchy-org-agenda--note :timer)))
+      (should (equal '("note-frame" "DONE" nil)
+                     (list (plist-get r :result) (plist-get r :state) (plist-get r :saved))))
+      (should (omarchy-org-agenda--note-queued-p))
+      (should (timerp timer))
+      (should (omarchy-org-agenda-test--advised-p))
+      ;; Org's queued note never fires for an unrelated command.
+      (let ((this-command 'next-line)) (run-hooks 'post-command-hook))
+      (should-not (get-buffer "*Org Note*"))
+      (should (equal "busy" (plist-get (omarchy-org-agenda-test--set-state
+                                        file (omarchy-org-agenda-test--line payload "Alpha")
+                                        nil "REPEAT" "PROJ")
+                                       :result)))
+      (should (eq t (omarchy-org-agenda-take-note)))
+      (should (get-buffer "*Org Note*"))
+      (should-not (omarchy-org-agenda--note-queued-p))
+      (should-not (memq timer timer-list))
+      (should-not (omarchy-org-agenda-take-note))
+      ;; Still busy while the note is being written.
+      (should (equal "busy" (plist-get (omarchy-org-agenda-test--set-state
+                                        file (omarchy-org-agenda-test--line payload "Alpha")
+                                        nil "REPEAT" "PROJ")
+                                       :result)))
+      (should (string-search "* PROJ Beta" (omarchy-org-agenda-test--disk file)))
+      (omarchy-org-agenda-test--store-note "Wrapped up")
+      (let ((disk (omarchy-org-agenda-test--disk file)))
+        (should (string-search "* DONE Beta task" disk))
+        (should (string-search "Wrapped up" disk)))
+      (should-not (buffer-modified-p (find-buffer-visiting file)))
+      (should-not (omarchy-org-agenda-test--advised-p))
+      (should-not omarchy-org-agenda--note))))
+
+(ert-deftest omarchy-org-agenda-test-state-note-graphic ()
+  (omarchy-org-agenda-test--with-state (file payload)
+    (let ((opened 0))
+      (cl-letf* ((add-log (symbol-function 'org-add-log-note))
+                 ((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+                 ((symbol-function 'frame-visible-p) (lambda (&rest _) t))
+                 ((symbol-function 'org-add-log-note)
+                  (lambda (&rest args) (cl-incf opened) (apply add-log args))))
+        (let ((r (omarchy-org-agenda-test--set-state
+                  file (omarchy-org-agenda-test--line payload "Beta") nil "PROJ" "DONE")))
+          (should (equal "note" (plist-get r :result)))
+          (should (equal "DONE" (plist-get r :state)))
+          (should (= 1 opened))
+          (should (get-buffer "*Org Note*"))
+          (should-not (omarchy-org-agenda--note-queued-p))
+          (should-not (plist-get omarchy-org-agenda--note :timer)))))
+    (omarchy-org-agenda-test--store-note "From the frame")
+    (should (string-search "From the frame" (omarchy-org-agenda-test--disk file)))
+    (should-not (omarchy-org-agenda-test--advised-p))))
+
+(ert-deftest omarchy-org-agenda-test-state-note-cancel ()
+  (omarchy-org-agenda-test--with-state (file payload)
+    (should (equal "note-frame"
+                   (plist-get (omarchy-org-agenda-test--set-state
+                               file (omarchy-org-agenda-test--line payload "Beta")
+                               nil "PROJ" "DONE")
+                              :result)))
+    (should (omarchy-org-agenda-take-note))
+    (omarchy-org-agenda-test--store-note "Never mind" t)
+    (should-not (omarchy-org-agenda-test--advised-p))
+    (should-not omarchy-org-agenda--note)
+    ;; The change stays, unsaved, as with Org's own agenda.
+    (should (buffer-modified-p (find-buffer-visiting file)))
+    (should (string-search "* PROJ Beta" (omarchy-org-agenda-test--disk file)))))
+
+(ert-deftest omarchy-org-agenda-test-state-note-other ()
+  (omarchy-org-agenda-test--with-state (file payload)
+    (should (equal "note-frame"
+                   (plist-get (omarchy-org-agenda-test--set-state
+                               file (omarchy-org-agenda-test--line payload "Beta")
+                               nil "PROJ" "DONE")
+                              :result)))
+    ;; The user starts another note: Org's single pending note is replaced.
+    (omarchy-org-agenda-test--edit
+     file (lambda ()
+            (re-search-forward "^\\* REPEAT Alpha")
+            (let ((this-command 'org-add-note))
+              (org-add-log-setup 'note nil nil 'note)
+              (org-add-log-note))))
+    (should-not (omarchy-org-agenda-take-note))
+    (omarchy-org-agenda-test--store-note "Another note")
+    (should-not (omarchy-org-agenda-test--advised-p))
+    (should-not omarchy-org-agenda--note)
+    (should (buffer-modified-p (find-buffer-visiting file)))
+    (should-not (string-search "Another note" (omarchy-org-agenda-test--disk file)))))
+
+(ert-deftest omarchy-org-agenda-test-state-note-expires ()
+  (omarchy-org-agenda-test--with-state (file payload)
+    (let ((omarchy-org-agenda-note-timeout 0.05))
+      (should (equal "note-frame"
+                     (plist-get (omarchy-org-agenda-test--set-state
+                                 file (omarchy-org-agenda-test--line payload "Beta")
+                                 nil "PROJ" "DONE")
+                                :result)))
+      (sleep-for 0.3)
+      (should-not (omarchy-org-agenda--note-queued-p))
+      (should-not org-log-setup)
+      (should-not omarchy-org-agenda--note)
+      (should-not (omarchy-org-agenda-test--advised-p))
+      (should-not (omarchy-org-agenda-take-note))
+      (should (equal "DONE" (omarchy-org-agenda-test--todo file "Beta"))))))
+
+(ert-deftest omarchy-org-agenda-test-state-disk-changes ()
+  (omarchy-org-agenda-test--with-state (file payload)
+    (let ((alpha (omarchy-org-agenda-test--line payload "Alpha")))
+      ;; Clean buffer: reverted silently, then changed.
+      (omarchy-org-agenda-test--rewrite file "Gamma \"quoted\" task" "Gamma edited elsewhere")
+      (let ((r (omarchy-org-agenda-test--set-state file alpha nil "REPEAT" "PROJ")))
+        (should (equal '("done" t) (list (plist-get r :result) (plist-get r :saved)))))
+      (let ((disk (omarchy-org-agenda-test--disk file)))
+        (should (string-search "Gamma edited elsewhere" disk))
+        (should (string-search "* PROJ Alpha task" disk)))
+      ;; Clean buffer, but the revert moved the line: refused.
+      (omarchy-org-agenda-test--rewrite file "* PROJ Alpha task" "* PROJ New\n* PROJ Alpha task")
+      (should (equal "changed" (plist-get (omarchy-org-agenda-test--set-state
+                                           file alpha nil "PROJ" "REPEAT")
+                                          :result)))
+      (should (equal "PROJ" (omarchy-org-agenda-test--todo file "New")))
+      ;; Unsaved edits and a newer file: refused, nothing touched.
+      (omarchy-org-agenda-test--edit file (lambda () (goto-char (point-max))
+                                            (insert "Unsaved\n")))
+      (omarchy-org-agenda-test--rewrite file "* PROJ New\n" "")
+      (let ((before (with-current-buffer (find-buffer-visiting file) (buffer-string))))
+        (should (equal "conflict" (plist-get (omarchy-org-agenda-test--set-state
+                                              file alpha nil "PROJ" "REPEAT")
+                                             :result)))
+        (should (equal before (with-current-buffer (find-buffer-visiting file)
+                                (buffer-string))))))))
+
+(ert-deftest omarchy-org-agenda-test-state-refusals ()
+  (omarchy-org-agenda-test--with-state (file payload)
+    (let ((alpha (omarchy-org-agenda-test--line payload "Alpha")))
+      (should (equal "invalid" (plist-get (omarchy-org-agenda-test--set-state
+                                           file alpha nil "REPEAT" "NOPE")
+                                          :result)))
+      (should (equal "invalid" (plist-get (omarchy-org-agenda-test--set-state
+                                           file "3" nil "REPEAT" "PROJ")
+                                          :result)))
+      (let ((r (omarchy-org-agenda-test--set-state file alpha nil "REPEAT" "REPEAT")))
+        (should (equal '("done" "REPEAT") (list (plist-get r :result) (plist-get r :state)))))
+      (should-not (buffer-modified-p (find-buffer-visiting file)))
+      (should (equal "REPEAT" (omarchy-org-agenda-test--todo file "Alpha")))
+      ;; A note Org queued elsewhere is never clobbered.
+      (add-hook 'post-command-hook #'org-add-log-note 'append)
+      (should (equal "busy" (plist-get (omarchy-org-agenda-test--set-state
+                                        file alpha nil "REPEAT" "PROJ")
+                                       :result)))
+      (should (equal "REPEAT" (omarchy-org-agenda-test--todo file "Alpha"))))))
+
+(defun omarchy-org-agenda-test--queue-note (dir)
+  "Leave a state-change note queued for a fixture in DIR; return its timer."
+  (let* ((file (omarchy-org-agenda-test--write
+                (expand-file-name "state.org" dir)
+                (omarchy-org-agenda-test--state-text)))
+         (payload (progn (make-directory dir t)
+                         (omarchy-org-agenda-test--export dir (list file)))))
+    (should (equal "note-frame"
+                   (plist-get (omarchy-org-agenda-test--set-state
+                               file (omarchy-org-agenda-test--line payload "Beta")
+                               nil "PROJ" "DONE")
+                              :result)))
+    (should (omarchy-org-agenda-test--advised-p))
+    (plist-get omarchy-org-agenda--note :timer)))
+
+(defun omarchy-org-agenda-test--note-gone (timer)
+  "Assert the queued note, its TIMER and the store advice are all gone."
+  (should-not (memq #'org-add-log-note (default-value 'post-command-hook)))
+  (should-not (memq timer timer-list))
+  (should-not (advice-member-p 'omarchy-org-agenda--around-store-note
+                               'org-store-log-note)))
+
 ;; Named to run last; it reloads the helper anyway, so order doesn't matter.
 (ert-deftest omarchy-org-agenda-test-zz-unload ()
-  (let ((out (expand-file-name "unload/agenda.json" omarchy-org-agenda-test--root)))
+  (let* ((dir (expand-file-name "unload/" omarchy-org-agenda-test--root))
+         (out (expand-file-name "agenda.json" dir)))
+    (make-directory dir t)
     (unwind-protect
-        (progn
+        (let ((timer (omarchy-org-agenda-test--queue-note dir)))
           (omarchy-org-agenda-ensure out nil t)
           (should (equal '(:save 1 :revert 1 :todo 1 :agenda 1 :watcher 1)
                          (omarchy-org-agenda-test--hooks-installed)))
           (unload-feature 'omarchy-org-agenda t)
           (should-not (featurep 'omarchy-org-agenda))
-          (dolist (hook '(after-save-hook after-revert-hook
+          (dolist (hook '(after-save-hook after-revert-hook post-command-hook
                           org-after-todo-state-change-hook org-agenda-finalize-hook))
             (should-not (seq-filter
                          (lambda (fn)
                            (and (symbolp fn)
                                 (string-prefix-p "omarchy-org-agenda-"
                                                  (symbol-name fn))))
-                         (symbol-value hook))))
-          (should-not (get-variable-watchers 'org-agenda-files)))
+                         (default-value hook))))
+          (should-not (get-variable-watchers 'org-agenda-files))
+          (omarchy-org-agenda-test--note-gone timer)
+          (should-not (boundp 'omarchy-org-agenda--index))
+          (should-not (boundp 'omarchy-org-agenda--note)))
       (load omarchy-org-agenda-test--source nil t)
+      (omarchy-org-agenda-test--clear-notes)
+      (omarchy-org-agenda-test--kill-buffers dir)
       (setq omarchy-org-agenda-output nil
             omarchy-org-agenda-files-override nil))))
 
@@ -515,12 +976,18 @@ cleaned up afterwards."
 ;; replaced definitions in `function-history', and `unload-feature' revives
 ;; them, so a reloaded helper must not leave any behind.
 (ert-deftest omarchy-org-agenda-test-zz-reload-unload ()
-  (let ((out (expand-file-name "reload/agenda.json" omarchy-org-agenda-test--root)))
+  (let* ((dir (expand-file-name "reload/" omarchy-org-agenda-test--root))
+         (out (expand-file-name "agenda.json" dir)))
+    (make-directory dir t)
     (unwind-protect
-        (progn
+        (let ((timer (omarchy-org-agenda-test--queue-note dir)))
           (load omarchy-org-agenda-test--source nil t)
+          ;; The reload dropped the note it couldn't take any more.
+          (omarchy-org-agenda-test--note-gone timer)
+          (should-not omarchy-org-agenda--note)
           (load omarchy-org-agenda-test--source nil t)
           (should-not (get 'omarchy-org-agenda-export 'function-history))
+          (should-not (get 'omarchy-org-agenda-set-state 'function-history))
           ;; The reload tore the hooks down; the plugin's ensure brings them back.
           (should (equal '(:save 0 :revert 0 :todo 0 :agenda 0 :watcher 0)
                          (omarchy-org-agenda-test--hooks-installed)))
@@ -530,8 +997,14 @@ cleaned up afterwards."
           (unload-feature 'omarchy-org-agenda t)
           (should-not (fboundp 'omarchy-org-agenda-export))
           (should-not (fboundp 'omarchy-org-agenda--on-save))
+          (should-not (fboundp 'omarchy-org-agenda-set-state))
+          (should-not (fboundp 'omarchy-org-agenda-take-note))
+          (should-not (fboundp 'omarchy-org-agenda--around-store-note))
+          (should-not (get 'omarchy-org-agenda-set-state 'function-history))
           (should-not (get-variable-watchers 'org-agenda-files)))
       (load omarchy-org-agenda-test--source nil t)
+      (omarchy-org-agenda-test--clear-notes)
+      (omarchy-org-agenda-test--kill-buffers dir)
       (setq omarchy-org-agenda-output nil
             omarchy-org-agenda-files-override nil))))
 
