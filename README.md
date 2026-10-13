@@ -5,7 +5,7 @@ entry and Emacs opens it at its heading.
 
 ![The bar: the clock, then the next entry and the overdue count](docs/screenshot-bar.png)
 
-![The popout: next up, today's schedule, habits, overdue and upcoming deadlines](docs/screenshot-popout.png)
+![The popout: the next-up card on top, then the agenda grouped into sections](docs/screenshot-popout.png)
 
 ## Requirements
 
@@ -79,7 +79,7 @@ the Emacs window.
 
 **Coming up**
 
-The popout's last section looks ahead. It lists Org's warnings for
+After today's entries, Coming up looks ahead. It lists Org's warnings for
 upcoming deadlines, and the tasks scheduled on the next `upcomingDays`
 days (a week by default), soonest first. Each row starts with the day:
 `Thu` within the week, `27 Oct` further out. A task shows once, on its
