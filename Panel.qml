@@ -12,8 +12,7 @@ import "Model.js" as Model
 // and keeps the keyboard cursor. Opening an entry is the Service's job.
 //
 // The keyboard reaches the next-up card first, then each row of every
-// unfolded section, in order. Overdue starts folded; Tab or a click on its
-// header unfolds it. Hover moves the same cursor as the arrows, so only one
+// section, in order. Hover moves the same cursor as the arrows, so only one
 // row is ever highlighted.
 PanelKeyCatcher {
   id: root
@@ -22,7 +21,6 @@ PanelKeyCatcher {
   property var view: null
   property string fontFamily: Style.font.family
 
-  property bool overdueOpen: false
   property int selected: 0
   // Keyboard moves scroll the cursor into view; hover never scrolls.
   property bool followSelection: false
@@ -33,9 +31,8 @@ PanelKeyCatcher {
   readonly property var payload: view ? view.payload : null
   readonly property string mode: view ? Model.panelMode(view) : "loading"
   readonly property var entries: view && mode === "agenda"
-    ? Model.panelModel(view, overdueOpen) : ({ next: null, sections: [], rows: [] })
+    ? Model.panelModel(view) : ({ next: null, sections: [], rows: [] })
   readonly property var rowKeys: entries.rows.map(function(r) { return r.key })
-  readonly property bool hasOverdue: entries.sections.some(function(s) { return s.foldable })
   readonly property int missingCount: payload && payload.missing ? payload.missing.length : 0
   // Re-read whenever the view changes, which is at least every minute.
   readonly property string todayText: view !== undefined ? Qt.formatDate(new Date(), "ddd d MMM") : ""
@@ -47,9 +44,8 @@ PanelKeyCatcher {
 
   implicitHeight: header.implicitHeight + bodyGap + body.implicitHeight + bodyGap + footer.implicitHeight
 
-  // Back to the top, folded, cursor on the first entry: called on each open.
+  // Back to the top, cursor on the first entry: called on each open.
   function reset() {
-    overdueOpen = false
     selected = 0
     followSelection = false
     pointerGate.reset()
@@ -72,13 +68,6 @@ PanelKeyCatcher {
     if (!pointerGate.moved(area, mouse)) return
     followSelection = false
     selected = sel
-  }
-
-  function toggleOverdue() {
-    if (!hasOverdue) return
-    followSelection = true
-    pointerGate.reset()
-    overdueOpen = !overdueOpen
   }
 
   function openItem(item) {
@@ -121,7 +110,6 @@ PanelKeyCatcher {
 
   onMoveRequested: function(dx, dy) { root.moveSelection(dy) }
   onActivateRequested: root.activate()
-  onTabRequested: function(direction) { root.toggleOverdue() }
   onTextKey: function(t) { if (t === "r" || t === "R") root.refresh() }
 
   TextMetrics {
@@ -288,15 +276,6 @@ PanelKeyCatcher {
               anchors.rightMargin: Style.spacing.md
               spacing: Style.spacing.md
 
-              PlainText {
-                visible: sectionBlock.modelData.foldable
-                Layout.alignment: Qt.AlignVCenter
-                text: sectionBlock.modelData.folded ? "▸" : "▾"
-                color: root.mutedColor
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
-
               PanelSectionHeader {
                 id: sectionTitle
                 Layout.alignment: Qt.AlignVCenter
@@ -324,13 +303,6 @@ PanelKeyCatcher {
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
               }
-            }
-
-            MouseArea {
-              anchors.fill: parent
-              enabled: sectionBlock.modelData.foldable
-              cursorShape: Qt.PointingHandCursor
-              onClicked: root.toggleOverdue()
             }
           }
 
@@ -477,7 +449,7 @@ PanelKeyCatcher {
     PlainText {
       width: parent.width
       text: root.mode === "agenda"
-        ? "↑↓ move · " + root.enterGlyph + " open" + (root.hasOverdue ? " · tab fold" : "") + " · r refresh · esc close"
+        ? "↑↓ move · " + root.enterGlyph + " open · r refresh · esc close"
         : "r refresh · esc close"
       color: root.mutedColor
       font.family: root.fontFamily

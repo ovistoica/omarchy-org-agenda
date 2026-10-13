@@ -333,8 +333,7 @@ eq([sync, late, habit, soon, task, item({ habit: true, time: "07:00" })].map(M.r
 eq([sync, habit, item({ habit: true }), item({ category: null })].map(M.rowTrail),
    ["cal", "2d", "cal", ""], "rowTrail: category, missed days")
 eq(M.rowLocation(sync), "cal.org:63", "rowLocation")
-eq([M.sectionHint("habits", false), M.sectionHint("overdue", true), M.sectionHint("overdue", false), M.sectionHint("today", false)],
-   ["missed days", "tab to unfold", "tab to fold", ""], "sectionHint")
+eq(["habits", "overdue", "today"].map(M.sectionHint), ["missed days", "", ""], "sectionHint")
 {
   const v = M.view(P(all), "ok", "", at(11, 13), {})
   eq(M.nextMeta(v.next, v.nowMin), "13:00 · in 1 h 47 min · cal", "nextMeta: next")
@@ -355,21 +354,21 @@ eq([M.errorMessage(M.view(payloadOf([], { error: "bad" }), "ok", "x", at(11, 13)
     M.errorMessage(M.view(null, "error", "", at(11, 13), {}))], ["bad", "boom", "unknown error"], "errorMessage")
 {
   const v = M.view(P(all), "ok", "", at(11, 13), {})
-  const folded = M.panelModel(v, false)
-  const open = M.panelModel(v, true)
-  eq(folded.sections.map(s => [s.key, s.count, s.folded, s.rows.length, s.hint]),
-     [["schedule", 2, false, 2, ""], ["today", 2, false, 2, ""], ["habits", 1, false, 1, "missed days"],
-      ["overdue", 1, true, 0, "tab to unfold"], ["upcoming", 1, false, 1, ""]], "panelModel: overdue folded")
-  eq(folded.rows.map(r => [r.sel, r.item.line]), [[0, 63], [1, 63], [2, 10], [3, 20], [4, 60], [5, 30], [6, 50]],
-     "panelModel: next card first, folded rows skipped")
-  eq(open.rows.map(r => r.item.line), [63, 63, 10, 20, 60, 30, 40, 50], "panelModel: unfolded")
-  eq([folded.next.key, open.sections[3].hint, open.rows[6].key],
-     ["next", "tab to fold", "overdue:/home/u/org/cal.org:40:scheduled"], "panelModel: keys")
-  eq(M.panelModel(M.view(P([task]), "ok", "", at(11, 13), {}), false).rows.map(r => r.sel), [0], "panelModel: no next")
+  const before = M.panelModel(v)
+  // A refresh after the overdue entry was done: its row is gone.
+  const after = M.panelModel(M.view(P(all.filter(i => i !== late)), "ok", "", at(11, 13), {}))
+  eq(before.sections.map(s => [s.key, s.count, s.rows.length, s.hint]),
+     [["schedule", 2, 2, ""], ["today", 2, 2, ""], ["habits", 1, 1, "missed days"],
+      ["overdue", 1, 1, ""], ["upcoming", 1, 1, ""]], "panelModel: sections")
+  eq(before.rows.map(r => [r.sel, r.item.line]),
+     [[0, 63], [1, 63], [2, 10], [3, 20], [4, 60], [5, 30], [6, 40], [7, 50]],
+     "panelModel: next card first, then every section's rows, overdue included")
+  eq([before.next.key, before.rows[6].key], ["next", "overdue:/home/u/org/cal.org:40:scheduled"], "panelModel: keys")
+  eq(M.panelModel(M.view(P([task]), "ok", "", at(11, 13), {})).rows.map(r => r.sel), [0], "panelModel: no next")
   const keys = m => m.rows.map(r => r.key)
-  eq([M.refocus(keys(open), keys(folded), 6), M.refocus(keys(open), keys(folded), 7),
-      M.refocus(keys(folded), keys(open), 6), M.refocus(keys(folded), keys(open), 3),
-      M.refocus([], keys(open), 0), M.refocus(keys(open), [], 3), M.refocus(["gone"], ["a", "b"], 5)],
+  eq([M.refocus(keys(before), keys(after), 6), M.refocus(keys(before), keys(after), 7),
+      M.refocus(keys(after), keys(before), 6), M.refocus(keys(after), keys(before), 3),
+      M.refocus([], keys(before), 0), M.refocus(keys(before), [], 3), M.refocus(["gone"], ["a", "b"], 5)],
      [5, 6, 7, 3, 0, 0, 1], "refocus: keeps the entry or the one above")
 }
 

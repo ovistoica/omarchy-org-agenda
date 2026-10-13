@@ -455,10 +455,8 @@ function rowTrail(item) {
 function rowLocation(item) { return basename(item.path) + ":" + item.line }
 
 // What the muted tail of a section header explains.
-function sectionHint(key, folded) {
-  if (key === "habits") return "missed days"
-  if (key === "overdue") return "tab to " + (folded ? "unfold" : "fold")
-  return ""
+function sectionHint(key) {
+  return key === "habits" ? "missed days" : ""
 }
 
 function nextMeta(next, nowMin) {
@@ -494,23 +492,19 @@ function errorMessage(view) {
 }
 
 // The popout in display order. `sel` numbers what the keyboard can reach:
-// the next-up card, then every row of an unfolded section. `rows` lists
-// those in `sel` order, keyed so a selection survives a refresh or a fold.
-function panelModel(view, overdueOpen) {
+// the next-up card, then every row of every section. `rows` lists those in
+// `sel` order, keyed so a selection survives a refresh.
+function panelModel(view) {
   let sel = 0
   const next = view.next ? { key: "next", sel: sel++, item: view.next.item } : null
-  const secs = view.sections.map(sec => {
-    const foldable = sec.key === "overdue"
-    const folded = foldable && !overdueOpen
-    return {
-      key: sec.key, title: sec.title, count: sec.items.length,
-      hint: sectionHint(sec.key, folded), foldable: foldable, folded: folded,
-      rows: folded ? [] : sec.items.map(item => ({
-        key: sec.key + ":" + item.path + ":" + item.line + ":" + item.type,
-        sel: sel++, item: item
-      }))
-    }
-  })
+  const secs = view.sections.map(sec => ({
+    key: sec.key, title: sec.title, count: sec.items.length,
+    hint: sectionHint(sec.key),
+    rows: sec.items.map(item => ({
+      key: sec.key + ":" + item.path + ":" + item.line + ":" + item.type,
+      sel: sel++, item: item
+    }))
+  }))
   return { next: next, sections: secs,
            rows: secs.reduce((acc, s) => acc.concat(s.rows), next ? [next] : []) }
 }

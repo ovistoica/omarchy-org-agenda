@@ -69,8 +69,8 @@ never writes to your Emacs config, and its agenda file in
 | Middle | Open your `org-agenda` in Emacs (dispatcher key `agendaKey`) |
 | Right  | Ask Emacs for a fresh export                                 |
 
-**Popout keys:** `↑`/`↓` or `j`/`k` move, `↵` opens, `Tab` folds or unfolds
-Overdue, `r` refreshes, `Esc` closes.
+**Popout keys:** `↑`/`↓` or `j`/`k` move, `↵` opens, `r` refreshes,
+`Esc` closes.
 
 Opening an entry (click or `↵`) shows its file at the heading in the
 current Emacs frame, the way `emacsclient +LINE FILE` would, and focuses
