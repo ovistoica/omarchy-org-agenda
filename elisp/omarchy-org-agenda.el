@@ -149,6 +149,11 @@ Precedence: `omarchy-org-agenda-files-override', then
 Every file in FILES must exist, or Org prompts to remove it from the list."
   (let* ((org-agenda-files files)
          (org-agenda-sorting-strategy-selected nil)
+         ;; Org 9.6's element cache drops DEADLINE entries from the first
+         ;; scan of a freshly visited file; 9.7 fixed it.  Parse without the
+         ;; cache there, at about 5x the cost (still ~40 ms for 10 files).
+         (org-element-use-cache (and (version<= "9.7" (org-release))
+                                     org-element-use-cache))
          (date (calendar-current-date)))
     (org-agenda-prepare-buffers files)
     (org-set-sorting-strategy 'agenda)
