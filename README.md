@@ -44,7 +44,8 @@ This disables the plugin and deletes its folder. Your running Emacs keeps
 the helper loaded until it restarts; `M-x unload-feature RET
 omarchy-org-agenda` removes its functions and hooks right away. The plugin
 never writes to your Emacs config, and its agenda file in
-`$XDG_RUNTIME_DIR/omarchy-org-agenda/` is cleared when you log out.
+`$XDG_RUNTIME_DIR/omarchy-org-agenda/` is cleared when you log out (in
+the fallback `~/.cache/omarchy-org-agenda/`, delete it yourself).
 
 ## How it works
 
@@ -53,7 +54,10 @@ never writes to your Emacs config, and its agenda file in
   running Emacs through `emacsclient`.
 - Emacs writes today's agenda, plus the scheduled tasks and timestamped
   entries of the next few days, as JSON to `$XDG_RUNTIME_DIR/omarchy-org-agenda/`, and the bar
-  watches that file.
+  watches that file. The directory is private (`0700`) and the file is
+  readable only by you (`0600`). Without `XDG_RUNTIME_DIR` it goes to
+  `$XDG_CACHE_HOME/omarchy-org-agenda/` (or `~/.cache/omarchy-org-agenda/`),
+  never `/tmp`.
 - The bar never polls. Emacs pushes a fresh export whenever an Org
   buffer is saved or reverted, a TODO state changes, or an agenda
   buffer is rebuilt.
@@ -188,6 +192,10 @@ The `Count` and `Icon` label modes keep task titles off the bar, which
 helps while screen sharing. In `Icon` mode the tooltip leaves out titles
 too.
 
+The exported agenda stays yours alone: Emacs writes it only into a
+directory you own that nobody else can enter, and refuses to write if
+that directory is a symlink or belongs to someone else.
+
 ## What it changes in Emacs
 
 - It defines only functions and variables prefixed `omarchy-org-agenda-`.
@@ -206,6 +214,8 @@ too.
   hooks and advice included.
 - It never prompts. Agenda files that don't exist are skipped and
   counted in the popout's footer.
+- A pushed export never raises an error in your Emacs: if it can't
+  write the agenda file, it says so in a one-line message.
 
 ## Troubleshooting
 
@@ -216,6 +226,11 @@ too.
   (`server-use-tcp`), set `serverFile` to its server file.
 - **Emacs busy:** if Emacs doesn't answer in time, the bar dims to show
   the agenda is stale and retries with backoff.
+- **"Unsafe agenda directory"** means the agenda directory (see
+  `outputFile` in the status below) is a symlink or isn't yours, so
+  Emacs wrote nothing. Remove it and press Retry; Emacs creates a
+  private one. A directory of yours that others could enter is made
+  private automatically.
 - **Status:** `omarchy-shell ovistoica.org-agenda status` prints the
   status, last error, item count and effective settings.
 - **Logs:** `journalctl --user -b -t omarchy-shell` (lines are prefixed

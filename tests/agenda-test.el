@@ -354,6 +354,130 @@ cleaned up afterwards."
                      (directory-files out-dir nil
                                       directory-files-no-dot-files-regexp))))))
 
+;;;; Private output
+
+(defun omarchy-org-agenda-test--slurp (file)
+  "The contents of FILE."
+  (with-temp-buffer (insert-file-contents file) (buffer-string)))
+
+(defun omarchy-org-agenda-test--mode (file)
+  "The permission bits of FILE itself, a symlink not followed."
+  (file-modes file 'nofollow))
+
+(defmacro omarchy-org-agenda-test--with-out (spec &rest body)
+  "Run BODY in a temp dir with an agenda file ready to export.
+SPEC is (DIR OUT-DIR OUT VICTIMS): OUT is agenda.json in OUT-DIR, a
+subdir of DIR that doesn't exist yet; `omarchy-org-agenda-ensure'
+points at OUT.  VICTIMS is another temp dir, for the targets of
+planted links."
+  (declare (indent 1) (debug ((symbolp symbolp symbolp symbolp) body)))
+  (pcase-let ((`(,dir ,out-dir ,out ,victims) spec))
+    `(omarchy-org-agenda-test--with-dir (,dir)
+       (let* ((,out-dir (expand-file-name "out/" ,dir))
+              (,out (expand-file-name "agenda.json" ,out-dir))
+              (,victims (make-temp-file
+                         (expand-file-name "victims-" omarchy-org-agenda-test--root) t)))
+         (unwind-protect
+             (progn
+               (omarchy-org-agenda-ensure
+                ,out (list (omarchy-org-agenda-test--small ,dir "A")) nil)
+               ,@body)
+           (delete-directory ,victims t))))))
+
+(defun omarchy-org-agenda-test--victim (dir)
+  "A file in DIR that an export must never touch; return its name."
+  (omarchy-org-agenda-test--write (expand-file-name "victim" dir) "precious\n"))
+
+(ert-deftest omarchy-org-agenda-test-private-modes ()
+  (omarchy-org-agenda-test--with-out (dir out-dir out victims)
+    (let ((parent (expand-file-name "parent/" out-dir)))
+      ;; Umask 022: what a plain `make-directory' and `write-region' get.
+      (with-file-modes #o755
+        (omarchy-org-agenda-ensure (expand-file-name "agenda.json" parent)
+                                   omarchy-org-agenda-files-override nil)
+        (should (omarchy-org-agenda-export)))
+      (should (= #o700 (omarchy-org-agenda-test--mode out-dir)))
+      (should (= #o700 (omarchy-org-agenda-test--mode parent)))
+      (should (= #o600 (omarchy-org-agenda-test--mode
+                        (expand-file-name "agenda.json" parent))))
+      (should-not (file-exists-p (expand-file-name "agenda.json.tmp" parent))))))
+
+(ert-deftest omarchy-org-agenda-test-private-tightens-own-dir ()
+  (omarchy-org-agenda-test--with-out (dir out-dir out victims)
+    (with-file-modes #o755 (make-directory out-dir))
+    (should (= #o755 (omarchy-org-agenda-test--mode out-dir)))
+    (should (omarchy-org-agenda-export))
+    (should (= #o700 (omarchy-org-agenda-test--mode out-dir)))
+    (should (= #o600 (omarchy-org-agenda-test--mode out)))
+    (should (equal '("Item in A")
+                   (omarchy-org-agenda-test--titles
+                    (omarchy-org-agenda-test--read out))))))
+
+(ert-deftest omarchy-org-agenda-test-private-tmp-symlink ()
+  (omarchy-org-agenda-test--with-out (dir out-dir out victims)
+    (let ((victim (omarchy-org-agenda-test--victim victims)))
+      (make-directory out-dir)
+      (make-symbolic-link victim (concat out ".tmp"))
+      (should (omarchy-org-agenda-export))
+      (should (equal "precious\n" (omarchy-org-agenda-test--slurp victim)))
+      (should-not (file-symlink-p out))
+      (should (file-regular-p out))
+      (should (= #o600 (omarchy-org-agenda-test--mode out)))
+      (should-not (file-exists-p (concat out ".tmp"))))))
+
+(ert-deftest omarchy-org-agenda-test-private-out-symlink ()
+  (omarchy-org-agenda-test--with-out (dir out-dir out victims)
+    (let ((victim (omarchy-org-agenda-test--victim victims)))
+      (make-directory out-dir)
+      (make-symbolic-link victim out)
+      (should (omarchy-org-agenda-export))
+      (should (equal "precious\n" (omarchy-org-agenda-test--slurp victim)))
+      (should-not (file-symlink-p out))
+      (should (file-regular-p out))
+      (should (= #o600 (omarchy-org-agenda-test--mode out)))
+      (should (equal '("Item in A")
+                     (omarchy-org-agenda-test--titles
+                      (omarchy-org-agenda-test--read out)))))))
+
+(ert-deftest omarchy-org-agenda-test-private-refuses-symlinked-dir ()
+  (omarchy-org-agenda-test--with-out (dir out-dir out victims)
+    (make-symbolic-link victims (directory-file-name out-dir))
+    (should (string-match-p
+             "\\`Unsafe agenda directory .*: not a private directory owned by you\\'"
+             (cadr (should-error (omarchy-org-agenda-export)))))
+    (should-not (directory-files victims nil directory-files-no-dot-files-regexp))
+    ;; Nor a dangling one, which `make-directory' can't create over.
+    (delete-file (directory-file-name out-dir))
+    (make-symbolic-link (expand-file-name "nowhere" victims)
+                        (directory-file-name out-dir))
+    (should-error (omarchy-org-agenda-export))
+    (should-not (directory-files victims nil directory-files-no-dot-files-regexp))))
+
+(ert-deftest omarchy-org-agenda-test-private-refuses-foreign-owner ()
+  (omarchy-org-agenda-test--with-out (dir out-dir out victims)
+    (make-directory out-dir)
+    ;; Someone else's directory, as seen from the uid we pretend to have;
+    ;; root too owns test dirs, so this holds under any uid.
+    (let ((uid (1+ (user-uid))))
+      (cl-letf (((symbol-function 'user-uid) (lambda () uid)))
+        (should-error (omarchy-org-agenda-export))))
+    (should-not (directory-files out-dir nil directory-files-no-dot-files-regexp))))
+
+(ert-deftest omarchy-org-agenda-test-private-push-never-signals ()
+  (omarchy-org-agenda-test--with-out (dir out-dir out victims)
+    (make-symbolic-link victims (directory-file-name out-dir))
+    (let ((messages nil))
+      (cl-letf (((symbol-function 'message)
+                 (lambda (fmt &rest args) (push (apply #'format fmt args) messages))))
+        ;; What the hooks' idle timer runs.
+        (omarchy-org-agenda--schedule "save")
+        (let ((timer omarchy-org-agenda--timer))
+          (should (eq #'omarchy-org-agenda--push-export (timer--function timer)))
+          (should-not (apply (timer--function timer) (timer--args timer)))))
+      (should (= 1 (length messages)))
+      (should (string-match-p "Unsafe agenda directory" (car messages))))
+    (should-not (directory-files victims nil directory-files-no-dot-files-regexp))))
+
 (ert-deftest omarchy-org-agenda-test-locate ()
   (omarchy-org-agenda-test--with-dir (dir)
     (let* ((file (car (omarchy-org-agenda-test--fixture-payload dir)))

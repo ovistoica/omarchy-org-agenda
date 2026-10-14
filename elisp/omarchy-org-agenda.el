@@ -308,15 +308,46 @@ See `omarchy-org-agenda--index'."
 
 ;;;; Output
 
+(defun omarchy-org-agenda--private-dir (dir)
+  "Make sure DIR is a directory only the user can enter; return its name.
+A missing DIR is created, with its missing parents, as 0700.  An
+existing one must be a real directory, not a symlink, owned by the
+user; one others can use is narrowed to 0700.  Anything else signals
+an error: whoever owns DIR could read the agenda or replace it."
+  (let ((dir (directory-file-name (expand-file-name dir))))
+    ;; A dangling symlink can't be created over; the check below names it.
+    (ignore-error file-already-exists
+      (with-file-modes #o700
+        (make-directory dir t)))
+    (let ((attrs (file-attributes dir 'integer)))
+      (unless (and attrs
+                   (not (file-symlink-p dir))
+                   (eq t (file-attribute-type attrs))
+                   (eql (file-attribute-user-id attrs) (user-uid)))
+        (error "Unsafe agenda directory %s: not a private directory owned by you"
+               dir))
+      (unless (zerop (logand #o077 (file-modes dir 'nofollow)))
+        (set-file-modes dir #o700 'nofollow))
+      dir)))
+
 (defun omarchy-org-agenda--write (payload)
-  "Write PAYLOAD as JSON, atomically, so the bar never reads half a file."
-  (let ((tmp (concat omarchy-org-agenda-output ".tmp")))
-    (make-directory (file-name-directory omarchy-org-agenda-output) t)
+  "Write PAYLOAD as JSON, atomically, so the bar never reads half a file.
+The file is readable by the user only, in a private directory; see
+`omarchy-org-agenda--private-dir'.  Neither the temp file nor the
+output follows a symlink planted in their place."
+  (let* ((out omarchy-org-agenda-output)
+         (tmp (concat out ".tmp")))
+    (omarchy-org-agenda--private-dir (file-name-directory out))
+    ;; Removes a leftover, or a symlink itself, never its target; the
+    ;; exclusive create then refuses whatever appears there meanwhile.
+    (delete-file tmp)
     (with-temp-buffer
       (insert (json-serialize payload))
       (let ((coding-system-for-write 'utf-8-unix))
-        (write-region nil nil tmp nil 'silent)))
-    (rename-file tmp omarchy-org-agenda-output t)))
+        (with-file-modes #o600
+          (write-region nil nil tmp nil 'silent nil 'excl))))
+    ;; rename(2) replaces whatever is at OUT, a symlink included.
+    (rename-file tmp out t)))
 
 (defun omarchy-org-agenda-export (&optional reason)
   "Write today's agenda to `omarchy-org-agenda-output'.
@@ -325,7 +356,8 @@ of the next `omarchy-org-agenda-upcoming-days' days follow it, with
 their :inDays.  REASON (default \"pull\") is echoed in
 the payload.  Agenda files that don't exist are skipped and listed
 under :missing.  Errors are written into the file too, so the bar can
-show them."
+show them; only a failure to write it, such as an output directory
+that isn't private (see `omarchy-org-agenda--private-dir'), signals."
   (let* ((omarchy-org-agenda--exporting t)
          ;; Collected afresh from this export's files, without disturbing
          ;; the user's agenda buffer, which reads them too.
@@ -361,12 +393,23 @@ show them."
 
 ;;;; Push: re-export when the agenda can have changed
 
+(defun omarchy-org-agenda--push-export (reason)
+  "Export with REASON for a hook or timer; never signal.
+The user didn't ask for this export, so a failure, such as an unsafe
+output directory, is only mentioned in the echo area; the bar's next
+pull reports it."
+  (condition-case err
+      (omarchy-org-agenda-export reason)
+    (error (message "Org agenda for the bar not updated: %s"
+                    (error-message-string err))
+           nil)))
+
 (defun omarchy-org-agenda--schedule (reason)
   "Export with REASON once Emacs is idle, replacing any pending export."
   (when (timerp omarchy-org-agenda--timer)
     (cancel-timer omarchy-org-agenda--timer))
   (setq omarchy-org-agenda--timer
-        (run-with-idle-timer 0.5 nil #'omarchy-org-agenda-export reason)))
+        (run-with-idle-timer 0.5 nil #'omarchy-org-agenda--push-export reason)))
 
 (defun omarchy-org-agenda--on-save ()
   "Re-export after an Org buffer is saved."

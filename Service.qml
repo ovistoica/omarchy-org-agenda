@@ -5,12 +5,12 @@ import "Model.js" as Model
 
 // Headless agenda service: one per shell, shared by the bar widget on every
 // monitor (bar.shell.serviceFor("ovistoica.org-agenda")). It is the only
-// place that talks to Emacs. Emacs writes the agenda as JSON into the
-// runtime dir — on our pull, or by itself from its save/TODO hooks — and
-// the file is watched, so there is no polling: timers only run for a retry
-// after a failed pull and as a watchdog while a pull or a state change is
-// in flight. A state change is the only write, and only the popout's
-// picker starts one; there is no IPC for it.
+// place that talks to Emacs. Emacs writes the agenda as JSON into a
+// private dir (Model.outputDir) — on our pull, or by itself from its
+// save/TODO hooks — and the file is watched, so there is no polling:
+// timers only run for a retry after a failed pull and as a watchdog
+// while a pull or a state change is in flight. A state change is the only
+// write, and only the popout's picker starts one; there is no IPC for it.
 Item {
   id: root
 
@@ -21,10 +21,13 @@ Item {
 
   readonly property string pluginDir: decodeURIComponent(String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "")).replace(/\/$/, "")
   readonly property string elispFile: pluginDir + "/elisp/omarchy-org-agenda.el"
-  readonly property string outputDir: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/omarchy-org-agenda"
+  // Private to the user, never a shared /tmp; "" when there is no such dir.
+  readonly property string outputDir: Model.outputDir(Quickshell.env("XDG_RUNTIME_DIR"),
+                                                      Quickshell.env("XDG_CACHE_HOME"),
+                                                      Quickshell.env("HOME"))
   // One file per Emacs server, so a socket change never shows another
   // server's agenda.
-  readonly property string outputFile: outputDir + "/" + Model.socketKey(settings) + ".json"
+  readonly property string outputFile: outputDir ? outputDir + "/" + Model.socketKey(settings) + ".json" : ""
 
   property var settings: Model.normalizeSettings({})
   property var payload: null
@@ -75,6 +78,12 @@ Item {
   function pull(reason) {
     if (puller.running) {
       pendingReason = reason
+      return
+    }
+    if (outputFile === "") {
+      status = "error"
+      detail = "No private directory for the agenda file (XDG_RUNTIME_DIR and HOME are unset)"
+      console.warn("org-agenda: cannot pull:", detail)
       return
     }
     var argv

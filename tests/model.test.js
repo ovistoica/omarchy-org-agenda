@@ -10,7 +10,7 @@ const src = fs.readFileSync(path.join(__dirname, "..", "Model.js"), "utf8")
 const M = new Function(src + "; return { PROTOCOL, MAX_ITEMS, MAX_TITLE, ID_RE, NOW_GRACE_MIN," +
   " STALE_AFTER_MS, parse, bounded, classify, sections, openToday, overdueCount, minutesOf," +
   " nextUp, normalizeSettings, barLabel, relTime, tooltip, plain, elispString, clientArgs," +
-  " socketKey, agendaFilesList, filesForm, loadPreamble, pullForm, gotoForm, agendaForm," +
+  " socketKey, outputDir, agendaFilesList, filesForm, loadPreamble, pullForm, gotoForm, agendaForm," +
   " fallbackOpenArgs, isNoServer, backoffMs, dateKey, isNewDay, isOld, keywordColor, view," +
   " basename, isDeadline, rowLead, rowTrail, rowLocation, sectionHint, nextMeta, footerLine," +
   " panelMode, errorMessage, panelModel, refocus, stateChoices, canChangeState, stateForm," +
@@ -464,6 +464,16 @@ eq(M.clientArgs(null), ["emacsclient", "-w", "5"], "clientArgs: null settings")
 eq([M.socketKey({}), M.socketKey({ socketName: "work" }), M.socketKey({ serverFile: "/tmp/a b/srv", socketName: "w" }),
     M.socketKey({ socketName: "x".repeat(200) }).length],
    ["server", "s-work", "f-_tmp_a_b_srv", 82], "socketKey")
+eq(M.outputDir("/run/user/1000", "/home/u/.c", "/home/u"), "/run/user/1000/omarchy-org-agenda", "outputDir: runtime dir wins")
+eq(M.outputDir("run/user/1000", "/home/u/.c", "/home/u"), "/home/u/.c/omarchy-org-agenda", "outputDir: relative runtime dir ignored")
+eq(M.outputDir("", "/home/u/.c", "/home/u"), "/home/u/.c/omarchy-org-agenda", "outputDir: cache home fallback")
+eq([M.outputDir(undefined, undefined, "/home/u"), M.outputDir(null, ".cache", "/home/u")],
+   ["/home/u/.cache/omarchy-org-agenda", "/home/u/.cache/omarchy-org-agenda"], "outputDir: home fallback")
+eq([M.outputDir("/run/user/1000/", null, null), M.outputDir(null, "/c//", null), M.outputDir(null, null, "/home/u/")],
+   ["/run/user/1000/omarchy-org-agenda", "/c/omarchy-org-agenda", "/home/u/.cache/omarchy-org-agenda"], "outputDir: trailing slash")
+eq([M.outputDir(), M.outputDir(null, null, null), M.outputDir("", "", ""), M.outputDir("tmp", "c", "home"),
+    M.outputDir(1, {}, ["/x"]), M.outputDir("/run/\u0001", null, null)],
+   ["", "", "", "", "", ""], "outputDir: none, never /tmp")
 eq(M.agendaFilesList({ agendaFiles: " /a.org : :/b.org::/c\u0001.org:" + "/" + "x".repeat(1100) }), ["/a.org", "/b.org"], "agendaFilesList")
 eq(M.agendaFilesList({ agendaFiles: Array.from({ length: 60 }, (_, i) => "/f" + i).join(":") }).length, 50, "agendaFilesList: capped at 50")
 eq(M.agendaFilesList({}), [], "agendaFilesList: empty")

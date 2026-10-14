@@ -352,6 +352,18 @@ function clientArgs(settings) {
   return [s.emacsclient || "emacsclient"].concat(socket, ["-w", String(s.timeoutSeconds)])
 }
 
+// The agenda file's directory, private to the user: the runtime dir, else
+// the cache dir, never a shared /tmp. "" when there is none. As the XDG
+// spec says, a relative value is ignored like an unset one.
+function outputDir(runtimeDir, cacheHome, home) {
+  const strip = p => p.replace(/\/+$/, "")
+  const base = isAbsPath(runtimeDir) ? strip(runtimeDir)
+    : isAbsPath(cacheHome) ? strip(cacheHome)
+    : isAbsPath(home) ? strip(home) + "/.cache"
+    : null
+  return base === null ? "" : base + "/omarchy-org-agenda"
+}
+
 function sanitizeKey(s) { return s.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 80) }
 
 function socketKey(settings) {
