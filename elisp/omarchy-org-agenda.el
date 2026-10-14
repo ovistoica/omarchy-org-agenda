@@ -2,7 +2,8 @@
 
 ;; Loaded into the user's running Emacs server by the Omarchy plugin through
 ;; emacsclient.  Nothing runs on load: the plugin calls
-;; `omarchy-org-agenda-ensure' and `omarchy-org-agenda-export', and
+;; `omarchy-org-agenda-ensure' and `omarchy-org-agenda-export' (and
+;; `omarchy-org-agenda-week' on demand), and
 ;; `omarchy-org-agenda-teardown' removes every hook this file adds.
 
 ;;; Commentary:
@@ -13,8 +14,13 @@
 ;; The bar's file list is `omarchy-org-agenda-files-override', else
 ;; `omarchy-org-agenda-files', else `org-agenda-files'.
 ;;
-;; `omarchy-org-agenda-set-state' changes an exported entry's TODO state
-;; for the bar, after checking the entry still is what the bar showed.
+;; `omarchy-org-agenda-week' returns another Org week (next week, last
+;; week, ...) as a JSON string, for the popout to browse; it writes no
+;; file.
+;;
+;; `omarchy-org-agenda-set-state' changes an exported or browsed entry's
+;; TODO state for the bar, after checking the entry still is what the bar
+;; showed.
 
 ;;; Code:
 
@@ -83,6 +89,14 @@ precedence over `omarchy-org-agenda-files'.")
   "What the last export wrote, for `omarchy-org-agenda-set-state' to check.
 A hash table keyed by (PATH . LINE), holding (:title :todo :id) as the
 JSON has them, `:null' included.  Diary sexps are left out.")
+
+(defvar omarchy-org-agenda--week-index nil
+  "What the last `omarchy-org-agenda-week' returned, indexed like `--index'.
+`omarchy-org-agenda-set-state' falls back on it, so a row of a browsed
+week can be changed too.")
+
+(defconst omarchy-org-agenda--max-week-offset 52
+  "How many weeks `omarchy-org-agenda-week' reaches back or ahead.")
 
 (defvar omarchy-org-agenda-max-detail 200
   "Bound on the user-visible detail of a state change result.")
@@ -184,34 +198,48 @@ Precedence: `omarchy-org-agenda-files-override', then
     ;; asks about missing files.
     (org-agenda-files nil 'ifmode)))
 
-(defun omarchy-org-agenda--days-ahead (dow start)
-  "How many days after today the Org week still has, 0..6.
+(defun omarchy-org-agenda--days-back (dow start)
+  "How many days before today the Org week started, 0..6.
 DOW is today's weekday, 0 for Sunday, as `calendar-day-of-week' gives.
 START is the value of `org-agenda-start-on-weekday': a weekday 0..6
-starts the week on it, so the day before it ends the week; anything
-else, nil included, is Org's week starting today, which ends 6 days on.
+starts the week on it; anything else, nil included, is Org's week
+starting today."
+  (if (and (integerp start) (<= 0 start 6))
+      (mod (- dow start) 7)
+    0))
+
+(defun omarchy-org-agenda--days-ahead (dow start)
+  "How many days after today the Org week still has, 0..6.
+DOW and START are as for `omarchy-org-agenda--days-back': a weekday
+START ends the week the day before it; anything else is Org's week
+starting today, which ends 6 days on.
 The plugin follows `org-agenda-start-on-weekday' and ignores
 `org-agenda-span': the bar always shows this week."
-  (if (and (integerp start) (<= 0 start 6))
-      (- 6 (mod (- dow start) 7))
-    6))
+  (- 6 (omarchy-org-agenda--days-back dow start)))
+
+(defun omarchy-org-agenda--week-start (offset)
+  "First day of the Org week OFFSET weeks from this one, in days from today.
+Negative for this week's start (unless it starts today) and past weeks."
+  (+ (* 7 offset)
+     (- (omarchy-org-agenda--days-back
+         (calendar-day-of-week (calendar-current-date))
+         org-agenda-start-on-weekday))))
 
 (defun omarchy-org-agenda--day-entries (files date types)
   "Agenda entries of TYPES on DATE in FILES, sorted like a day agenda.
 DATE is (MONTH DAY YEAR); TYPES are `org-agenda-get-day-entries' keywords.
-Call it within `omarchy-org-agenda--entries', which prepares FILES."
+Call it within `omarchy-org-agenda--collect', which prepares FILES."
   (sort (mapcan (lambda (file)
                   (apply #'org-agenda-get-day-entries file date types))
                 files)
         #'org-entries-lessp))
 
-(defun omarchy-org-agenda--entries (files &optional days)
-  "Agenda entries in FILES for today and the DAYS days after it.
-Returns a list of (OFFSET . ENTRIES), one per day in order: OFFSET 0
-holds today's whole agenda, each later day only its scheduled tasks
-and timestamped entries (such as calendar events): no deadlines, whose
-warnings today's agenda already has, and no diary sexps.
-Each day is sorted like the user's own day agenda.
+(defun omarchy-org-agenda--collect (files specs)
+  "Agenda entries in FILES for the day SPECS.
+SPECS is a list of (OFFSET . TYPES): OFFSET counts days from today,
+TYPES are `org-agenda-get-day-entries' keywords.  Returns a list of
+\(OFFSET . ENTRIES), one per spec in order, each day sorted like the
+user's own day agenda.
 Every file in FILES must exist, or Org prompts to remove it from the list."
   (let* ((org-agenda-files files)
          (org-agenda-sorting-strategy-selected nil)
@@ -223,20 +251,57 @@ Every file in FILES must exist, or Org prompts to remove it from the list."
          (today (calendar-absolute-from-gregorian (calendar-current-date))))
     (org-agenda-prepare-buffers files)
     (org-set-sorting-strategy 'agenda)
-    (cons (cons 0 (omarchy-org-agenda--day-entries
-                   files (calendar-current-date)
-                   '(:deadline :scheduled :timestamp :sexp)))
-          (mapcar (lambda (offset)
-                    (cons offset (omarchy-org-agenda--day-entries
-                                  files
-                                  (calendar-gregorian-from-absolute (+ today offset))
-                                  ;; :timestamp covers date ranges too.
-                                  '(:scheduled :timestamp))))
-                  (number-sequence 1 (or days 0))))))
+    (mapcar (pcase-lambda (`(,offset . ,types))
+              (cons offset (omarchy-org-agenda--day-entries
+                            files
+                            (calendar-gregorian-from-absolute (+ today offset))
+                            types)))
+            specs)))
+
+(defun omarchy-org-agenda--entries (files &optional days)
+  "Agenda entries in FILES for today and the DAYS days after it.
+Returns a list of (OFFSET . ENTRIES), one per day in order: OFFSET 0
+holds today's whole agenda, each later day only its scheduled tasks
+and timestamped entries (such as calendar events): no deadlines, whose
+warnings today's agenda already has, and no diary sexps.
+See `omarchy-org-agenda--collect'."
+  (omarchy-org-agenda--collect
+   files
+   (cons '(0 :deadline :scheduled :timestamp :sexp)
+         (mapcar (lambda (offset)
+                   ;; :timestamp covers date ranges too.
+                   (cons offset '(:scheduled :timestamp)))
+                 (number-sequence 1 (or days 0))))))
+
+(defun omarchy-org-agenda--week-entries (files start)
+  "Agenda entries in FILES for the 7 days from START, in days from today.
+Returns (OFFSET . ENTRIES) per day, like `omarchy-org-agenda--entries'.
+Every day has its deadlines due, scheduled tasks and timestamped
+entries; no diary sexps, as on the later days of the export."
+  (omarchy-org-agenda--collect
+   files
+   (mapcar (lambda (offset) (cons offset '(:deadline :scheduled :timestamp)))
+           (number-sequence start (+ start 6)))))
 
 (defun omarchy-org-agenda--key (item)
   "The (PATH . LINE) of the heading behind the JSON ITEM."
   (cons (plist-get item :path) (plist-get item :line)))
+
+(defun omarchy-org-agenda--later-items (days today seen)
+  "JSON plists for DAYS, (OFFSET . ENTRIES) collected for later days.
+TODAY is an absolute day number; every entry gets its day's :inDays.
+An entry is dropped when its heading is in SEEN, a hash table of
+`omarchy-org-agenda--key's, which this updates: so a repeating task or
+event shows once, at its first occurrence, and a date range once, on
+its first day."
+  (let ((items nil))
+    (pcase-dolist (`(,offset . ,entries) days)
+      (dolist (entry entries)
+        (let ((item (omarchy-org-agenda--item entry today (+ today offset))))
+          (unless (gethash (omarchy-org-agenda--key item) seen)
+            (puthash (omarchy-org-agenda--key item) t seen)
+            (push item items)))))
+    (nreverse items)))
 
 (defun omarchy-org-agenda--items (days today)
   "JSON plists for DAYS, the (OFFSET . ENTRIES) list of `--entries'.
@@ -248,20 +313,25 @@ and a date range once, on its first day.  At most
   (let* ((max omarchy-org-agenda-max-items)
          (now (mapcar (lambda (entry) (omarchy-org-agenda--item entry today))
                       (seq-take (cdar days) max)))
-         (seen (make-hash-table :test #'equal))
-         (later nil))
+         (seen (make-hash-table :test #'equal)))
     ;; A diary sexp's row isn't its heading's, which may be scheduled.
     (dolist (item now)
       (unless (equal (plist-get item :type) "sexp")
         (puthash (omarchy-org-agenda--key item) t seen)))
-    (when (< (length now) max)
-      (pcase-dolist (`(,offset . ,entries) (cdr days))
-        (dolist (entry entries)
-          (let ((item (omarchy-org-agenda--item entry today (+ today offset))))
-            (unless (gethash (omarchy-org-agenda--key item) seen)
-              (puthash (omarchy-org-agenda--key item) t seen)
-              (push item later))))))
-    (seq-take (append now (nreverse later)) max)))
+    (seq-take (append now
+                      (and (< (length now) max)
+                           (omarchy-org-agenda--later-items (cdr days) today seen)))
+              max)))
+
+(defun omarchy-org-agenda--week-items (days today)
+  "JSON plists for DAYS, the (OFFSET . ENTRIES) list of `--week-entries'.
+TODAY is an absolute day number.  Every day counts as a later day, so
+:overdueDays is 0 and :inDays the day's distance from today, negative
+for a past week.  One row per heading, at its earliest day; at most
+`omarchy-org-agenda-max-items', the earliest days kept."
+  (seq-take (omarchy-org-agenda--later-items
+             days today (make-hash-table :test #'equal))
+            omarchy-org-agenda-max-items))
 
 (defun omarchy-org-agenda--color (kwd)
   "Foreground of the TODO face for KWD as #rrggbb, or nil."
@@ -366,41 +436,99 @@ don't exist are skipped and listed under :missing.  Errors are written
 into the file too, so the bar can show them; only a failure to write
 it, such as an output directory that isn't private (see
 `omarchy-org-agenda--private-dir'), signals."
+  (let* ((today (calendar-absolute-from-gregorian (calendar-current-date)))
+         (payload
+          (omarchy-org-agenda--payload
+           (or reason "pull")
+           (lambda (files)
+             (let ((ahead (omarchy-org-agenda--days-ahead
+                           (calendar-day-of-week (calendar-current-date))
+                           org-agenda-start-on-weekday)))
+               (list :items (vconcat (omarchy-org-agenda--items
+                                      (omarchy-org-agenda--entries files ahead)
+                                      today))
+                     :daysAhead ahead))))))
+    (setq omarchy-org-agenda--index
+          (omarchy-org-agenda--build-index (append (plist-get payload :items) nil)))
+    (omarchy-org-agenda--write payload)
+    t))
+
+(defun omarchy-org-agenda--payload (reason collect)
+  "The payload for REASON around what COLLECT returns, as a plist.
+COLLECT is called with the agenda files that exist, and returns a
+plist with :items, a vector of JSON plists, and any other fields.
+The payload has the base fields, the files' keywords, COLLECT's fields,
+the agenda files that don't exist under :missing, and :error.  Any
+error becomes a payload with no items and the message under :error."
   (let* ((omarchy-org-agenda--exporting t)
-         ;; Collected afresh from this export's files, without disturbing
-         ;; the user's agenda buffer, which reads them too.
+         ;; Collected afresh from these files, without disturbing the
+         ;; user's agenda buffer, which reads them too.
          (org-todo-keywords-for-agenda nil)
          (org-done-keywords-for-agenda nil)
-         (today (calendar-absolute-from-gregorian (calendar-current-date)))
          (base (list :version omarchy-org-agenda-protocol
                      :date (format-time-string "%F")
                      :generatedAt (format-time-string "%FT%T%z")
-                     :reason (or reason "pull")
+                     :reason reason
                      :emacs emacs-version
                      :org (org-version))))
-    (omarchy-org-agenda--write
-     (condition-case err
-         (let* ((files (omarchy-org-agenda--files))
-                (missing (seq-remove #'file-exists-p files))
-                (present (seq-difference files missing))
-                (ahead (omarchy-org-agenda--days-ahead
-                        (calendar-day-of-week (calendar-current-date))
-                        org-agenda-start-on-weekday))
-                (items (omarchy-org-agenda--items
-                        (omarchy-org-agenda--entries present ahead)
-                        today)))
-           (setq omarchy-org-agenda--index (omarchy-org-agenda--build-index items))
-           (append base
-                   (list :keywords (omarchy-org-agenda--keywords present)
-                         :items (vconcat items)
-                         :daysAhead ahead
-                         :missing (vconcat missing)
-                         :error :null)))
-       (error (setq omarchy-org-agenda--index (omarchy-org-agenda--build-index nil))
-              (append base (list :items []
-                                 :missing []
-                                 :error (error-message-string err))))))
-    t))
+    (condition-case err
+        (let* ((files (omarchy-org-agenda--files))
+               (missing (seq-remove #'file-exists-p files))
+               (present (seq-difference files missing))
+               (fields (funcall collect present)))
+          (append base
+                  (list :keywords (omarchy-org-agenda--keywords present))
+                  fields
+                  (list :missing (vconcat missing)
+                        :error :null)))
+      (error (append base (list :items []
+                                :missing []
+                                :error (error-message-string err)))))))
+
+(defun omarchy-org-agenda--week-fields (offset start today)
+  "The fields saying which week a payload is: OFFSET weeks from this one.
+START is its first day, in days from TODAY, an absolute day number."
+  (list :weekOffset offset
+        :weekStart (pcase-let ((`(,month ,day ,year)
+                                (calendar-gregorian-from-absolute (+ today start))))
+                     (format "%04d-%02d-%02d" year month day))
+        :startInDays start))
+
+(defun omarchy-org-agenda-week (offset)
+  "The Org week OFFSET weeks from this one, as a JSON string.
+OFFSET is an integer: 1 is next week, -1 last week; it is clamped to
+`omarchy-org-agenda--max-week-offset' either way.  The week follows
+`org-agenda-start-on-weekday', like the export's.  Called by the plugin
+through `emacsclient --eval'; never prompts, and writes no file.
+
+The payload is shaped like the export's, with reason \"week\", plus
+weekOffset (the clamped OFFSET), weekStart (its first day, YYYY-MM-DD)
+and startInDays (that day's distance from today).  Each day of the week
+lists its deadlines due, scheduled tasks and timestamped entries, each
+heading once, at its earliest day, with :inDays counted from today.
+Errors, a non-integer OFFSET included, come back under error, with no
+items.  The rows are remembered in `omarchy-org-agenda--week-index', so
+`omarchy-org-agenda-set-state' can change them.  Non-ASCII chars are
+\\u escaped."
+  (let* ((limit omarchy-org-agenda--max-week-offset)
+         (week (and (integerp offset) (max (- limit) (min limit offset))))
+         (start (and week (omarchy-org-agenda--week-start week)))
+         (today (calendar-absolute-from-gregorian (calendar-current-date)))
+         (payload
+          (omarchy-org-agenda--payload
+           "week"
+           (lambda (files)
+             (unless week
+               (signal 'wrong-type-argument (list 'integerp offset)))
+             (list :items (vconcat (omarchy-org-agenda--week-items
+                                    (omarchy-org-agenda--week-entries files start)
+                                    today)))))))
+    (setq omarchy-org-agenda--week-index
+          (omarchy-org-agenda--build-index (append (plist-get payload :items) nil)))
+    (omarchy-org-agenda--ascii
+     (json-serialize
+      (append payload
+              (and week (omarchy-org-agenda--week-fields week start today)))))))
 
 ;;;; Push: re-export when the agenda can have changed
 
@@ -483,11 +611,12 @@ export follows the Org week instead (see `org-agenda-start-on-weekday')."
 
 (defun omarchy-org-agenda-teardown ()
   "Remove every hook, watcher, advice and timer this package installed.
-A note a state change left queued is dropped too, and the export index
-is cleared."
+A note a state change left queued is dropped too, and the export and
+week indexes are cleared."
   (omarchy-org-agenda--remove-push-hooks)
   (omarchy-org-agenda--drop-note)
-  (setq omarchy-org-agenda--index nil)
+  (setq omarchy-org-agenda--index nil
+        omarchy-org-agenda--week-index nil)
   t)
 
 (defun omarchy-org-agenda-unload-function ()
@@ -769,10 +898,15 @@ buffer had unsaved edits before the change, so it isn't saved."
               (append (list :state state :saved saved :detail detail) result))
           (append (list :state (and (plist-get change :changed) state)) result)))))))
 
+(defun omarchy-org-agenda--indexed (path line)
+  "The index entry for LINE of PATH: the export's, else the browsed week's."
+  (seq-some (lambda (index)
+              (and index (gethash (cons path line) index)))
+            (list omarchy-org-agenda--index omarchy-org-agenda--week-index)))
+
 (defun omarchy-org-agenda--set-state (path line id from to)
   "The steps of `omarchy-org-agenda-set-state'; return a result plist."
-  (let ((entry (and omarchy-org-agenda--index
-                    (gethash (cons path line) omarchy-org-agenda--index)))
+  (let ((entry (omarchy-org-agenda--indexed path line))
         (buf (and (stringp path) (find-buffer-visiting path))))
     (cond
      ((not (omarchy-org-agenda--valid-args-p path line id from to))
@@ -788,6 +922,7 @@ buffer had unsaved edits before the change, so it isn't saved."
 
 (defun omarchy-org-agenda-set-state (path line id from to)
   "Change the TODO state of the exported entry at LINE of PATH to TO.
+The entry may also be one the last `omarchy-org-agenda-week' returned.
 ID, when non-nil, finds the entry if lines moved.  FROM is the keyword
 the bar showed (nil for none).  Called by the plugin through
 `emacsclient --eval'; never prompts.

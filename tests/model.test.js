@@ -14,7 +14,8 @@ const M = new Function(src + "; return { PROTOCOL, MAX_ITEMS, MAX_TITLE, ID_RE, 
   " fallbackOpenArgs, isNoServer, backoffMs, dateKey, isNewDay, isOld, keywordColor, view," +
   " basename, isDeadline, rowLead, rowTrail, rowLocation, sectionHint, nextMeta, footerLine," +
   " panelMode, errorMessage, panelModel, refocus, stateChoices, canChangeState, stateForm," +
-  " takeNoteForm, parseStateResult, stateMessage, entryKey, pickerHint, ITEM_TYPES, payloadDay }")()
+  " takeNoteForm, parseStateResult, stateMessage, entryKey, pickerHint, ITEM_TYPES, payloadDay," +
+  " weekForm, parseWeekResult, elispStringValue }")()
 
 let failed = 0
 let count = 0
@@ -91,8 +92,44 @@ eq(parsedItems([item({ priority: "A", tags: ["a", "b"] })]).map(i => [i.priority
 {
   const old = item({ type: "upcoming-deadline" }); delete old.inDays
   eq(parsedItems([old])[0].inDays, 0, "parse: payload without inDays (pre-0.3) -> 0")
-  eq(parsedItems([4, -1, 1.5, "3", null, 0].map(d => item({ inDays: d }))).map(i => i.inDays),
-     [4, 0, 0, 0, 0, 0], "parse: inDays validated")
+  // Signed since 0.3: a past week's rows lie before today.
+  eq(parsedItems([4, -1, 1.5, "3", null, 0, -3660, 3660, -3661, 3661, NaN].map(d => item({ inDays: d })))
+       .map(i => i.inDays),
+     [4, -1, 0, 0, 0, 0, -3660, 3660, 0, 0, 0], "parse: inDays validated, signed, bounded")
+}
+{
+  // A negative inDays reads like the 0 it was clamped to before 0.3:
+  // never "upcoming", and the bar's counts and next-up don't move.
+  const past = [item({ line: 70, title: "Past task", inDays: -5 }),
+                item({ line: 71, title: "Past meeting", time: "11:30", durationMin: 30, inDays: -3 }),
+                item({ line: 72, type: "deadline", title: "Past deadline", inDays: -2 }),
+                item({ line: 73, type: "past-scheduled", title: "Past repeat", inDays: -1 })]
+  const zeroed = past.map(i => Object.assign({}, i, { inDays: 0 }))
+  const neg = parsedItems(past), zero = parsedItems(zeroed)
+  eq(neg.map(i => i.inDays), [-5, -3, -2, -1], "parse: negative inDays kept")
+  eq(neg.map(M.classify), zero.map(M.classify), "classify: negative inDays like 0")
+  eq(neg.map(M.classify).indexOf("upcoming"), -1, "classify: negative inDays never upcoming")
+  const nextOf = items => { const n = M.nextUp(items, at(11, 0)); return n && [n.item.line, n.state, n.startMin, n.endMin] }
+  const counts = items => [M.openToday(items), M.overdueCount(items, {}), M.overdueCount(items, { habitsInBadge: true }),
+                           nextOf(items)]
+  const main = parsedItems(all)
+  eq(counts(main.concat(neg)), counts(main.concat(zero)), "counts/nextUp: negative inDays like 0")
+  eq(counts(main).slice(0, 3), [3, 1, 2], "counts: main payload unchanged")
+  eq([M.nextUp(main.concat(neg), at(11, 0)).item.title, M.nextUp(main.concat(neg), at(11, 0)).state],
+     ["Past meeting", "next"], "nextUp: a negative-inDays timed row counts as today's, as when clamped to 0")
+}
+{
+  const week = { weekOffset: 1, weekStart: "2026-10-19", startInDays: 5 }
+  const fields = v => [v.weekOffset, v.weekStart, v.startInDays]
+  eq(fields(parsed(payloadOf([])).value), [null, null, null], "parse: no week fields in the bar's file -> null")
+  eq(fields(parsed(payloadOf([], week)).value), [1, "2026-10-19", 5], "parse: week fields")
+  eq(fields(parsed(payloadOf([], { weekOffset: -52, weekStart: "2025-10-13", startInDays: -400 })).value),
+     [-52, "2025-10-13", -400], "parse: week fields at their bounds")
+  eq([{ weekOffset: 53, weekStart: "2026-10-19 Mon", startInDays: 401 },
+      { weekOffset: -53, weekStart: 20261019, startInDays: -401 },
+      { weekOffset: 1.5, weekStart: "", startInDays: "5" },
+      { weekOffset: "1", weekStart: null, startInDays: 2.5 }].map(w => fields(parsed(payloadOf([], w)).value)),
+     [[null, null, null], [null, null, null], [null, null, null], [null, null, null]], "parse: bad week fields -> null")
 }
 {
   const v = parsed(payloadOf([], { keywords: { todo: ["A", 1, "B"], done: "x",
@@ -311,6 +348,25 @@ eq(["Save", "a\"b", "x".repeat(21), undefined, "new-day"].map(r => /export "([^"
 eq([throws(() => M.pullForm("x.el", OUT, {}, "pull")), throws(() => M.pullForm(ELISP, "out.json", {}, "pull")),
     throws(() => M.pullForm(ELISP, null, {}, "pull"))], [true, true, true], "pullForm: relative paths throw")
 
+{
+  const ENSURE = " (omarchy-org-agenda-ensure \"" + OUT + "\" nil t)"
+  eq(M.weekForm(ELISP, OUT, {}, 1), "(progn " + PRE + ENSURE + " (omarchy-org-agenda-week 1))", "weekForm: exact, next week")
+  eq(M.weekForm(ELISP, OUT, {}, -1), "(progn " + PRE + ENSURE + " (omarchy-org-agenda-week -1))", "weekForm: exact, last week")
+  eq([99, -99, 52, 0].map(k => M.weekForm(ELISP, OUT, {}, k).split(ENSURE)[1]),
+     [" (omarchy-org-agenda-week 52))", " (omarchy-org-agenda-week -52))", " (omarchy-org-agenda-week 52))",
+      " (omarchy-org-agenda-week 0))"], "weekForm: offset clamped to ±52")
+  eq(M.weekForm(ELISP, OUT, { agendaFiles: "/home/u/org/a.org:/home/u/org/b.org", pushUpdates: false }, 2),
+     "(progn " + PRE + " (omarchy-org-agenda-ensure \"" + OUT + "\" (list \"/home/u/org/a.org\" \"/home/u/org/b.org\") nil)" +
+     " (omarchy-org-agenda-week 2))", "weekForm: files and push as in pullForm")
+  const s = { agendaFiles: "/home/u/org/a.org", pushUpdates: false }
+  eq(M.weekForm(ELISP, OUT, s, 3).split(" (omarchy-org-agenda-week")[0],
+     M.pullForm(ELISP, OUT, s, "pull").split(" (omarchy-org-agenda-export")[0], "weekForm: same preamble and ensure as pullForm")
+  eq([1.5, "1", NaN, Infinity, null, undefined, 2 ** 53].map(k => throws(() => M.weekForm(ELISP, OUT, {}, k))),
+     [true, true, true, true, true, true, true], "weekForm: non-integer offsets throw")
+  eq([throws(() => M.weekForm("x.el", OUT, {}, 1)), throws(() => M.weekForm(ELISP, "out.json", {}, 1)),
+      throws(() => M.weekForm(ELISP, null, {}, 1))], [true, true, true], "weekForm: relative paths throw")
+}
+
 const gp = payloadOf([sync, item({ id: "abc-1", path: "/home/u/org/it's \"q\".org", line: 7 })])
 eq(M.gotoForm(sync, gp, ELISP), "(progn " + PRE + " (omarchy-org-agenda-goto \"/home/u/org/cal.org\" 63 nil))", "gotoForm: exact")
 eq(M.gotoForm(gp.items[1], gp, ELISP).split(PRE)[1],
@@ -411,6 +467,66 @@ eq(["", null, undefined, "t\n", "nil\n", "\"{\\\"result\\\":\\\"maybe\\\"}\"", "
    [false, false, false, false, false, false, false, false, false, false, false, false, false],
    "parseStateResult: malformed or unknown -> not ok")
 eq(M.parseStateResult("\"{\\\"result\\\":\\\"done\\\"}\"").ok, true, "parseStateResult: minimal")
+
+// ---------------------------------------------------------------- week
+
+// Captured from `emacsclient --eval (omarchy-org-agenda-week 1)' on an
+// isolated -Q daemon (Emacs 31.1, Org 9.8.7) with a one-entry agenda.
+const OUT_WEEK = "\"{\\\"version\\\":1,\\\"date\\\":\\\"2026-10-14\\\",\\\"generatedAt\\\":\\\"2026-10-14T07:50:43+0300\\\"," +
+  "\\\"reason\\\":\\\"week\\\",\\\"emacs\\\":\\\"31.1\\\",\\\"org\\\":\\\"9.8.7\\\",\\\"keywords\\\":{\\\"todo\\\":[\\\"TODO\\\"]," +
+  "\\\"done\\\":[\\\"DONE\\\"],\\\"colors\\\":{},\\\"keys\\\":{\\\"TODO\\\":\\\"t\\\",\\\"DONE\\\":\\\"d\\\"}},\\\"items\\\":[{\\\"id\\\":null," +
+  "\\\"path\\\":\\\"/tmp/oa-week/tiny.org\\\",\\\"line\\\":2,\\\"type\\\":\\\"scheduled\\\",\\\"todo\\\":\\\"TODO\\\",\\\"done\\\":false," +
+  "\\\"title\\\":\\\"Caf\\\\u00e9 review\\\",\\\"priority\\\":null,\\\"category\\\":\\\"tiny\\\",\\\"tags\\\":[],\\\"time\\\":null," +
+  "\\\"durationMin\\\":null,\\\"overdueDays\\\":0,\\\"inDays\\\":6,\\\"habit\\\":false}],\\\"missing\\\":[],\\\"error\\\":null," +
+  "\\\"weekOffset\\\":1,\\\"weekStart\\\":\\\"2026-10-19\\\",\\\"startInDays\\\":5}\"\n"
+{
+  const r = M.parseWeekResult(OUT_WEEK)
+  eq([r.ok, r.value.reason, r.value.weekOffset, r.value.weekStart, r.value.startInDays, r.value.error, r.value.daysAhead],
+     [true, "week", 1, "2026-10-19", 5, null, 0], "parseWeekResult: real stdout")
+  eq(r.value.items.map(i => [i.title, i.type, i.inDays, i.overdueDays, i.todo, i.line]),
+     [["Café review", "scheduled", 6, 0, "TODO", 2]], "parseWeekResult: real stdout, items with \\u escapes decoded")
+  eq(r.value.keywords.keys, { TODO: "t", DONE: "d" }, "parseWeekResult: keywords")
+  const bare = M.elispStringValue(OUT_WEEK)
+  eq(M.parseWeekResult("  " + bare + "\n"), r, "parseWeekResult: bare JSON accepted")
+  const raw = JSON.parse(bare)
+  const without = k => { const o = Object.assign({}, raw); delete o[k]; return JSON.stringify(o) }
+  eq(["weekOffset", "weekStart", "startInDays"].map(k => M.parseWeekResult(without(k))),
+     [{ ok: false, reason: "not a week" }, { ok: false, reason: "not a week" }, { ok: false, reason: "not a week" }],
+     "parseWeekResult: a week field missing -> not ok")
+  eq(M.parseWeekResult(JSON.stringify(Object.assign({}, raw, { weekOffset: 60 }))).ok, false,
+     "parseWeekResult: out-of-range week field -> not ok")
+  eq(M.parseWeekResult(JSON.stringify(Object.assign({}, raw, { version: 2 }))), { ok: false, reason: "unsupported version" },
+     "parseWeekResult: payload checks still apply")
+  // An error inside Emacs still says its week, so the popout can show it.
+  const err = M.parseWeekResult(JSON.stringify(JSON.stringify(Object.assign({}, raw, { items: [], error: "boom" }))))
+  eq([err.ok, err.value.error, err.value.items.length, err.value.weekOffset], [true, "boom", 0, 1],
+     "parseWeekResult: error payload with its week")
+  eq([42, null, undefined, {}, [], true].map(v => M.parseWeekResult(v).ok), [false, false, false, false, false, false],
+     "parseWeekResult: non-strings -> not ok")
+  eq(["", "t\n", "nil\n", "*ERROR*: boom", "\"\\q\"", "\"{\\\"a\\\":1\"", "\"not json\"", "{not json"]
+       .map(s => M.parseWeekResult(s).reason),
+     ["not an elisp string", "not an elisp string", "not an elisp string", "not an elisp string", "not an elisp string",
+      "invalid JSON", "invalid JSON", "invalid JSON"], "parseWeekResult: malformed -> not ok")
+  // prin1 escapes the JSON's own backslashes: \\\" is an escaped quote
+  // inside a title, \\\\ a literal backslash.
+  const tricky = Object.assign({}, raw, { items: [Object.assign({}, raw.items[0], { title: "a \"q\" \\ b \\u00e9" })] })
+  eq(M.parseWeekResult(JSON.stringify(JSON.stringify(tricky))).value.items[0].title, "a \"q\" \\ b \\u00e9",
+     "parseWeekResult: escaped quotes and backslashes")
+}
+{
+  // ~120 KB of prin1 output: what 200 long rows can reach.
+  const rows = Array.from({ length: 200 }, (_, i) => Object.assign({}, item({ line: i + 1, inDays: 6 }),
+    { title: "Row \"" + i + "\" \\ " + "x".repeat(300) }))
+  const stdout = JSON.stringify(JSON.stringify(payloadOf(rows, { reason: "week", weekOffset: 1, weekStart: "2026-10-19",
+                                                                 startInDays: 5 }))) + "\n"
+  const t0 = Date.now()
+  const runs = 20
+  let r
+  for (let i = 0; i < runs; i++) r = M.parseWeekResult(stdout)
+  const ms = (Date.now() - t0) / runs
+  console.log("     parseWeekResult on " + Math.round(stdout.length / 1024) + " KB: " + ms.toFixed(2) + " ms per call")
+  eq([r.ok, r.value.items.length, ms < 100], [true, 200, true], "parseWeekResult: ~120 KB in well under 100 ms")
+}
 
 {
   const msg = (v, kw) => M.stateMessage(Object.assign({ state: null, saved: false, detail: null }, v), kw)

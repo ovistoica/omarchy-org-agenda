@@ -11,6 +11,11 @@ const MAX_TITLE = 200
 const ID_RE = /^[A-Za-z0-9._:-]{1,128}$/
 const NOW_GRACE_MIN = 30
 const STALE_AFTER_MS = 60000
+const MAX_IN_DAYS = 3660
+// Weeks `omarchy-org-agenda-week' reaches either way; a week's first day
+// is within MAX_START_DAYS of today.
+const MAX_WEEK_OFFSET = 52
+const MAX_START_DAYS = 400
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/
 const TIME_RE = /^\d{2}:\d{2}$/
@@ -70,6 +75,7 @@ function bounded(s, n) {
 function text(v, n) { return isStr(v) ? bounded(v.replace(CONTROL_RE_G, " "), n) : "" }
 
 function nonNegInt(v) { return Number.isSafeInteger(v) && v >= 0 }
+function intIn(v, lo, hi) { return Number.isSafeInteger(v) && v >= lo && v <= hi }
 
 // ---------------------------------------------------------------- parsing
 
@@ -94,8 +100,8 @@ function normalizeItem(raw) {
     durationMin: nonNegInt(raw.durationMin) ? raw.durationMin : null,
     overdueDays: nonNegInt(raw.overdueDays) ? raw.overdueDays : 0,
     // Days until a later day's scheduled task or an upcoming deadline;
-    // older payloads have none.
-    inDays: nonNegInt(raw.inDays) ? raw.inDays : 0,
+    // older payloads have none. Negative only in a past week's payload.
+    inDays: intIn(raw.inDays, -MAX_IN_DAYS, MAX_IN_DAYS) ? raw.inDays : 0,
     habit: raw.habit === true
   }
 }
@@ -152,7 +158,12 @@ function normalizePayload(raw) {
       error: isStr(raw.error) ? text(raw.error, 300) : null,
       missing: Array.isArray(raw.missing)
         ? raw.missing.slice(0, 50).filter(isStr).map(s => text(s, 1024))
-        : []
+        : [],
+      // Which week an `omarchy-org-agenda-week' payload is; null in the
+      // bar's file.
+      weekOffset: intIn(raw.weekOffset, -MAX_WEEK_OFFSET, MAX_WEEK_OFFSET) ? raw.weekOffset : null,
+      weekStart: isStr(raw.weekStart) && DATE_RE.test(raw.weekStart) ? raw.weekStart : null,
+      startInDays: intIn(raw.startInDays, -MAX_START_DAYS, MAX_START_DAYS) ? raw.startInDays : null
     }
   }
 }
@@ -408,6 +419,18 @@ function pullForm(elispFile, outputFile, settings, reason) {
     " (omarchy-org-agenda-export " + elispString(why) + "))"
 }
 
+// Another Org week, `offset` weeks from this one, fetched on demand. The
+// ensure keeps Emacs's file list the bar's, even after a shell restart.
+function weekForm(elispFile, outputFile, settings, offset) {
+  if (!Number.isSafeInteger(offset)) throw new Error("week offset must be an integer")
+  const s = normalizeSettings(settings)
+  const out = elispString(requireAbs(outputFile, "output file"))
+  return "(progn " + loadPreamble(elispFile) +
+    " (omarchy-org-agenda-ensure " + out + " " + filesForm(agendaFilesList(s)) + " " +
+    (s.pushUpdates ? "t" : "nil") + ")" +
+    " (omarchy-org-agenda-week " + clamp(offset, -MAX_WEEK_OFFSET, MAX_WEEK_OFFSET) + "))"
+}
+
 // The UI may only jump to a location Emacs itself reported.
 function knownItem(item, payload) {
   const ok = isObj(item) && Number.isSafeInteger(item.line) && item.line > 0 && isAbsPath(item.path)
@@ -514,6 +537,19 @@ function parseStateResult(stdout) {
     saved: raw.saved === true,
     detail: detail === "" ? null : detail
   } }
+}
+
+// What `omarchy-org-agenda-week' printed: a payload that says its week.
+function parseWeekResult(stdout) {
+  const s = String(stdout == null ? "" : stdout).trim()
+  const json = s.charAt(0) === "{" ? s : elispStringValue(s)
+  if (json === null) return { ok: false, reason: "not an elisp string" }
+  const res = parse(json)
+  if (!res.ok) return res
+  const v = res.value
+  return v.weekOffset === null || v.weekStart === null || v.startInDays === null
+    ? { ok: false, reason: "not a week" }
+    : res
 }
 
 // One line for the popout after a state change: {text, tone}.

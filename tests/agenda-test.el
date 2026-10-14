@@ -1392,6 +1392,253 @@ Deadline warnings count days ahead too, but come from today's agenda."
         (should (equal '("Range from yesterday to tomorrow")
                        (mapcar (lambda (i) (plist-get i :title)) items)))))))
 
+;;;; Browsing other weeks: `omarchy-org-agenda-week'
+
+(ert-deftest omarchy-org-agenda-test-days-back ()
+  (dolist (start '(0 1 2 3 4 5 6 nil 7 -1 monday))
+    (dolist (dow (number-sequence 0 6))
+      (let ((back (omarchy-org-agenda--days-back dow start)))
+        (should (<= 0 back 6))
+        (should (= 6 (+ back (omarchy-org-agenda--days-ahead dow start))))
+        (if (and (integerp start) (<= 0 start 6))
+            ;; The week's first day is START's weekday.
+            (should (= start (mod (- dow back) 7)))
+          (should (= 0 back)))))))
+
+(defconst omarchy-org-agenda-test--week-back 2
+  "Days the Org week of the week tests started before today.
+Next week then covers days 5..11 from today, last week -9..-3.")
+
+(defun omarchy-org-agenda-test--week-text ()
+  "The week fixture: entries next week, last week and beyond."
+  (let* ((ts #'omarchy-org-agenda-test--ts)
+         (range (lambda (from to) (concat (funcall ts from) "--" (funcall ts to))))
+         (sexp-day (omarchy-org-agenda-test--day 6)))
+    (concat
+     "#+TODO: NEXT TODO WAIT | DONE CANCELED\n\n"
+     "* TODO Task today\n"
+     "SCHEDULED: " (funcall ts 0) "\n"
+     "* TODO Task next week\n"
+     "SCHEDULED: " (funcall ts 6) "\n"
+     "* Meeting next week\n"
+     (funcall ts 7 "14:00-15:00") "\n"
+     "* TODO Deadline next week\n"
+     "DEADLINE: " (funcall ts 8) "\n"
+     "* Trip from next week on\n"
+     (funcall range 9 13) "\n"
+     "* NEXT Daily repeater\n"
+     "SCHEDULED: " (funcall ts -1 nil "+1d") "\n"
+     "* TODO Ședință next week\n"
+     "SCHEDULED: " (funcall ts 10) "\n"
+     "* TODO Task in two weeks\n"
+     "SCHEDULED: " (funcall ts 13) "\n"
+     "* TODO Task last week\n"
+     "SCHEDULED: " (funcall ts -5) "\n"
+     "* Event last week\n"
+     (funcall ts -4 "10:00-11:00") "\n"
+     "* Sexps\n"
+     (format "%%%%(diary-date %d %d %d) Sexp event next week\n"
+             (decoded-time-month sexp-day) (decoded-time-day sexp-day)
+             (decoded-time-year sexp-day)))))
+
+(defun omarchy-org-agenda-test--week (dir files offset)
+  "`omarchy-org-agenda-week' OFFSET for FILES, after the plugin's ensure.
+Returns (JSON . PAYLOAD), the string and its parsed plist."
+  (omarchy-org-agenda-ensure (expand-file-name "agenda.json" dir) files nil)
+  (let ((json (omarchy-org-agenda-week offset)))
+    (should (stringp json))
+    (cons json (json-parse-string json :object-type 'plist
+                                  :null-object :null :false-object :false))))
+
+(defmacro omarchy-org-agenda-test--with-week (spec &rest body)
+  "Run BODY with (FILE) of SPEC bound to the week fixture in DIR.
+The Org week started `omarchy-org-agenda-test--week-back' days ago."
+  (declare (indent 1) (debug ((symbolp) body)))
+  `(omarchy-org-agenda-test--with-dir (dir)
+     (let* ((org-agenda-show-future-repeats t)
+            (calendar-date-style 'american)
+            (org-agenda-start-on-weekday
+             (omarchy-org-agenda-test--week-start
+              (- 6 omarchy-org-agenda-test--week-back)))
+            (,(car spec) (omarchy-org-agenda-test--write
+                          (expand-file-name "week.org" dir)
+                          (omarchy-org-agenda-test--week-text))))
+       ,@body)))
+
+(defun omarchy-org-agenda-test--date (offset)
+  "The date OFFSET days from today, as YYYY-MM-DD."
+  (format-time-string "%F" (encode-time (omarchy-org-agenda-test--day offset))))
+
+(ert-deftest omarchy-org-agenda-test-week-shape ()
+  (omarchy-org-agenda-test--with-week (file)
+    (pcase-let ((`(,json . ,payload) (omarchy-org-agenda-test--week dir (list file) 1)))
+      (should (equal '(version date generatedAt reason emacs org keywords items
+                               missing error weekOffset weekStart startInDays)
+                     (mapcar #'car (json-parse-string json :object-type 'alist))))
+      (should (equal 1 (plist-get payload :version)))
+      (should (equal (format-time-string "%F") (plist-get payload :date)))
+      (should (stringp (plist-get payload :generatedAt)))
+      (should (equal "week" (plist-get payload :reason)))
+      (should (equal emacs-version (plist-get payload :emacs)))
+      (should (equal (org-version) (plist-get payload :org)))
+      (should (equal ["NEXT" "TODO" "WAIT"]
+                     (plist-get (plist-get payload :keywords) :todo)))
+      (should (equal ["DONE" "CANCELED"]
+                     (plist-get (plist-get payload :keywords) :done)))
+      (should (equal [] (plist-get payload :missing)))
+      (should (eq :null (plist-get payload :error)))
+      (should (equal 1 (plist-get payload :weekOffset)))
+      (should (equal (omarchy-org-agenda-test--date 5) (plist-get payload :weekStart)))
+      (should (equal 5 (plist-get payload :startInDays)))
+      (should-not (plist-member payload :daysAhead)))
+    (let ((payload (cdr (omarchy-org-agenda-test--week dir (list file) -1))))
+      (should (equal -1 (plist-get payload :weekOffset)))
+      (should (equal (omarchy-org-agenda-test--date -9) (plist-get payload :weekStart)))
+      (should (equal -9 (plist-get payload :startInDays))))
+    ;; Org's week starting today: week k starts 7k days on.
+    (let* ((org-agenda-start-on-weekday nil)
+           (payload (cdr (omarchy-org-agenda-test--week dir (list file) -1))))
+      (should (equal (omarchy-org-agenda-test--date -7) (plist-get payload :weekStart)))
+      (should (equal -7 (plist-get payload :startInDays))))))
+
+(ert-deftest omarchy-org-agenda-test-week-next ()
+  (omarchy-org-agenda-test--with-week (file)
+    (let* ((payload (cdr (omarchy-org-agenda-test--week dir (list file) 1)))
+           (item (apply-partially #'omarchy-org-agenda-test--item payload)))
+      (let ((task (funcall item "Task next week")))
+        (should (equal "scheduled" (plist-get task :type)))
+        (should (equal 6 (plist-get task :inDays)))
+        (should (equal 0 (plist-get task :overdueDays))))
+      (let ((meeting (funcall item "Meeting next week")))
+        (should (equal "timestamp" (plist-get meeting :type)))
+        (should (equal 7 (plist-get meeting :inDays)))
+        (should (equal "14:00" (plist-get meeting :time)))
+        (should (eql 60 (plist-get meeting :durationMin))))
+      ;; On its due day, not today, Org lists a deadline as plain "deadline".
+      (let ((deadline (funcall item "Deadline next week")))
+        (should (equal "deadline" (plist-get deadline :type)))
+        (should (equal 8 (plist-get deadline :inDays)))
+        (should (equal 0 (plist-get deadline :overdueDays))))
+      ;; A range shows once, on its first day; it runs past the week's end.
+      (let ((trip (funcall item "Trip from next week")))
+        (should (equal "block" (plist-get trip :type)))
+        (should (equal 9 (plist-get trip :inDays))))
+      ;; A daily repeater: one row, on the week's first day.
+      (let ((daily (funcall item "Daily repeater")))
+        (should (equal 5 (plist-get daily :inDays)))
+        (should (equal 0 (plist-get daily :overdueDays))))
+      (should-not (omarchy-org-agenda-test--matching payload "Sexp event"))
+      (should-not (omarchy-org-agenda-test--matching payload "Task today"))
+      (should-not (omarchy-org-agenda-test--matching payload "in two weeks"))
+      (should-not (omarchy-org-agenda-test--matching payload "last week"))
+      (let ((days (mapcar (lambda (i) (plist-get i :inDays))
+                          (omarchy-org-agenda-test--items payload))))
+        (should (equal days (sort (copy-sequence days) #'<)))
+        (should (seq-every-p (lambda (d) (<= 5 d 11)) days)))
+      (let ((keys (mapcar #'omarchy-org-agenda--key
+                          (omarchy-org-agenda-test--items payload))))
+        (should (equal keys (seq-uniq keys)))
+        (dolist (key keys)
+          (should (gethash key omarchy-org-agenda--week-index)))))))
+
+(ert-deftest omarchy-org-agenda-test-week-last ()
+  (omarchy-org-agenda-test--with-week (file)
+    (let ((payload (cdr (omarchy-org-agenda-test--week dir (list file) -1))))
+      (let ((task (omarchy-org-agenda-test--item payload "Task last week")))
+        (should (equal -5 (plist-get task :inDays)))
+        (should (equal 0 (plist-get task :overdueDays))))
+      (let ((event (omarchy-org-agenda-test--item payload "Event last week")))
+        (should (equal "timestamp" (plist-get event :type)))
+        (should (equal -4 (plist-get event :inDays)))
+        (should (equal 0 (plist-get event :overdueDays))))
+      (should-not (omarchy-org-agenda-test--matching payload "next week"))
+      (dolist (item (omarchy-org-agenda-test--items payload))
+        (should (<= -9 (plist-get item :inDays) -3))
+        (should (equal 0 (plist-get item :overdueDays)))))))
+
+(ert-deftest omarchy-org-agenda-test-week-cap ()
+  (omarchy-org-agenda-test--with-week (file)
+    (let* ((omarchy-org-agenda-max-items 2)
+           (payload (cdr (omarchy-org-agenda-test--week dir (list file) 1))))
+      ;; The earliest days are kept.
+      (should (equal '(5 6) (mapcar (lambda (i) (plist-get i :inDays))
+                                    (omarchy-org-agenda-test--items payload)))))))
+
+(ert-deftest omarchy-org-agenda-test-week-ascii ()
+  (omarchy-org-agenda-test--with-week (file)
+    (pcase-let ((`(,json . ,payload) (omarchy-org-agenda-test--week dir (list file) 1)))
+      (should-not (string-match-p "[^[:ascii:]]" json))
+      (should (string-search "\\u0218" json))
+      (should (omarchy-org-agenda-test--item payload "Ședință next week")))))
+
+(ert-deftest omarchy-org-agenda-test-week-clamp ()
+  (omarchy-org-agenda-test--with-week (file)
+    (dolist (case '((100 . 52) (-100 . -52) (52 . 52) (0 . 0)))
+      (let ((payload (cdr (omarchy-org-agenda-test--week dir (list file) (car case)))))
+        (should (equal (cdr case) (plist-get payload :weekOffset)))
+        (should (equal (- (* 7 (cdr case)) omarchy-org-agenda-test--week-back)
+                       (plist-get payload :startInDays)))))))
+
+(ert-deftest omarchy-org-agenda-test-week-missing-file ()
+  (omarchy-org-agenda-test--with-week (file)
+    (let ((gone (expand-file-name "gone.org" dir)))
+      (cl-letf (((symbol-function 'read-char-exclusive)
+                 (lambda (&rest _) (error "Prompted")))
+                ((symbol-function 'read-from-minibuffer)
+                 (lambda (&rest _) (error "Prompted"))))
+        (let ((payload (cdr (omarchy-org-agenda-test--week dir (list file gone) 1))))
+          (should (eq :null (plist-get payload :error)))
+          (should (equal (vector gone) (plist-get payload :missing)))
+          (should (omarchy-org-agenda-test--item payload "Task next week")))))))
+
+(ert-deftest omarchy-org-agenda-test-week-errors ()
+  (omarchy-org-agenda-test--with-week (file)
+    (omarchy-org-agenda-test--week dir (list file) 1)
+    (should (< 0 (hash-table-count omarchy-org-agenda--week-index)))
+    (cl-letf (((symbol-function 'org-agenda-get-day-entries)
+               (lambda (&rest _) (error "boom"))))
+      (let ((payload (cdr (omarchy-org-agenda-test--week dir (list file) 1))))
+        (should (equal "boom" (plist-get payload :error)))
+        (should (equal [] (plist-get payload :items)))
+        (should (equal [] (plist-get payload :missing)))
+        (should (equal "week" (plist-get payload :reason)))
+        (should (equal 1 (plist-get payload :weekOffset)))
+        (should (equal 5 (plist-get payload :startInDays)))
+        (should (= 0 (hash-table-count omarchy-org-agenda--week-index)))))
+    ;; Not an integer: an error payload, which can't say its week.
+    (dolist (offset '(1.5 "1" nil))
+      (let ((payload (cdr (omarchy-org-agenda-test--week dir (list file) offset))))
+        (should (string-match-p "integerp" (plist-get payload :error)))
+        (should (equal [] (plist-get payload :items)))
+        (should-not (plist-member payload :weekOffset))))))
+
+(ert-deftest omarchy-org-agenda-test-week-set-state ()
+  (omarchy-org-agenda-test--with-week (file)
+    (let* ((export (omarchy-org-agenda-test--export dir (list file)))
+           (line (with-temp-buffer
+                   (insert-file-contents file)
+                   (re-search-forward "^\\* TODO Task next week")
+                   (line-number-at-pos))))
+      ;; Past this week's end: the export doesn't have it.
+      (should-not (omarchy-org-agenda-test--matching export "Task next week"))
+      (should (equal "changed" (plist-get (omarchy-org-agenda-test--set-state
+                                           file line nil "TODO" "DONE")
+                                          :result)))
+      (let ((payload (cdr (omarchy-org-agenda-test--week dir (list file) 1))))
+        (should (equal line (plist-get (omarchy-org-agenda-test--item
+                                        payload "Task next week")
+                                       :line))))
+      (let ((r (omarchy-org-agenda-test--set-state file line nil "TODO" "DONE")))
+        (should (equal "done" (plist-get r :result)))
+        (should (eq t (plist-get r :saved))))
+      (should (string-search "* DONE Task next week"
+                             (omarchy-org-agenda-test--disk file)))
+      (should (equal "changed" (plist-get (omarchy-org-agenda-test--set-state
+                                           file 9999 nil "TODO" "DONE")
+                                          :result)))
+      (omarchy-org-agenda-teardown)
+      (should-not omarchy-org-agenda--week-index))))
+
 (defun omarchy-org-agenda-test--queue-note (dir)
   "Leave a state-change note queued for a fixture in DIR; return its timer."
   (let* ((file (omarchy-org-agenda-test--write
@@ -1437,6 +1684,7 @@ Deadline warnings count days ahead too, but come from today's agenda."
           (should-not (get-variable-watchers 'org-agenda-files))
           (omarchy-org-agenda-test--note-gone timer)
           (should-not (boundp 'omarchy-org-agenda--index))
+          (should-not (boundp 'omarchy-org-agenda--week-index))
           (should-not (boundp 'omarchy-org-agenda--note))
           (should-not (boundp 'omarchy-org-agenda-upcoming-days)))
       (load omarchy-org-agenda-test--source nil t)
@@ -1454,10 +1702,12 @@ Deadline warnings count days ahead too, but come from today's agenda."
     (make-directory dir t)
     (unwind-protect
         (let ((timer (omarchy-org-agenda-test--queue-note dir)))
+          (setq omarchy-org-agenda--week-index (make-hash-table :test #'equal))
           (load omarchy-org-agenda-test--source nil t)
           ;; The reload dropped the note it couldn't take any more.
           (omarchy-org-agenda-test--note-gone timer)
           (should-not omarchy-org-agenda--note)
+          (should-not omarchy-org-agenda--week-index)
           (load omarchy-org-agenda-test--source nil t)
           (should-not (get 'omarchy-org-agenda-export 'function-history))
           (should-not (get 'omarchy-org-agenda-set-state 'function-history))
