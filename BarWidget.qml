@@ -4,13 +4,16 @@ import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
 import qs.Ui as Ui
+import "Model.js" as Model
 
 // Bar label for today's Org agenda. One of these exists per monitor; all of
 // them read the one Service, which does every pull. What to show comes from
 // Model.view (via service.view), so this file only lays it out.
 //
-// Left click opens the popout, middle click opens the agenda in Emacs, and
-// right click asks Emacs for a fresh export.
+// Left click opens the popout (a click on the overdue badge opens it on
+// Overdue), middle click opens the agenda in Emacs, and right click asks
+// Emacs for a fresh export. The popout's layout is this widget's `layout`
+// setting; switching it in the popout saves it here.
 //
 // The root is qualified because this plugin's own Panel.qml (the popout
 // content) would otherwise shadow the shell's Panel.
@@ -48,14 +51,49 @@ Ui.Panel {
   onSettingsChanged: configureService()
   Component.onCompleted: configureService()
 
+  readonly property string layout: Model.normalizeSettings(root.settings).layout
+
   // The popout's content is built on first open and kept from then on.
   property bool panelBuilt: false
+  // Set by a click on the overdue badge, for the open it causes.
+  property bool overdueOnOpen: false
 
   onOpenedChanged: {
     if (!opened) return
-    panelBuilt = true
-    if (panelContent.item) panelContent.item.reset()
+    // The first open builds the content, whose onLoaded prepares it.
+    if (panelBuilt) prepareOpen()
+    else panelBuilt = true
     if (service) service.ensureFresh()
+  }
+
+  function prepareOpen() {
+    var panelItem = panelContent.item
+    if (!panelItem) return
+    panelItem.reset()
+    if (overdueOnOpen) panelItem.focusOverdue()
+    overdueOnOpen = false
+  }
+
+  function openOverdue() {
+    button.hideOwnTooltip()
+    if (root.opened) {
+      if (panelContent.item) panelContent.item.focusOverdue()
+      return
+    }
+    overdueOnOpen = true
+    root.open()
+  }
+
+  // Like the clock's format: the whole entry, applied here first so the
+  // popout switches on the key press, then written to shell.json, which
+  // sends the same value back through `settings`.
+  function setLayout(next) {
+    var entry = { id: root.moduleName }
+    for (var key in root.settings) if (key !== "id") entry[key] = root.settings[key]
+    entry.layout = Model.normalizeSettings({ layout: next }).layout
+    root.settings = entry
+    if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function")
+      root.bar.shell.updateEntryInline(root.moduleName, entry)
   }
 
   implicitWidth: button.implicitWidth
@@ -130,6 +168,7 @@ Ui.Panel {
         color: root.urgentColor
         fontFamily: button.fontFamily
         fontSize: button.fontSize
+        onClicked: root.openOverdue()
       }
     }
 
@@ -171,6 +210,7 @@ Ui.Panel {
           color: root.urgentColor
           fontFamily: button.fontFamily
           fontSize: button.fontSize
+          onClicked: root.openOverdue()
         }
       }
     }
@@ -183,7 +223,8 @@ Ui.Panel {
     bar: root.bar
     open: root.opened
     focusTarget: panelContent.item
-    contentWidth: panel.fittedContentWidth(Style.space(500))
+    // Columns puts two panes side by side.
+    contentWidth: panel.fittedContentWidth(Style.space(root.layout === "Columns" ? 980 : 500))
     contentHeight: panel.fittedContentHeight(
       panelContent.item ? panelContent.item.implicitHeight : Style.space(120),
       Math.round(panel.screenH * 0.7))
@@ -197,6 +238,9 @@ Ui.Panel {
         item.service = Qt.binding(function() { return root.service })
         item.view = Qt.binding(function() { return root.view })
         item.fontFamily = Qt.binding(function() { return button.fontFamily })
+        item.layout = Qt.binding(function() { return root.layout })
+        item.shown = Qt.binding(function() { return root.opened })
+        if (root.opened) root.prepareOpen()
       }
     }
   }
@@ -204,18 +248,31 @@ Ui.Panel {
   Connections {
     target: panelContent.item
     function onCloseRequested() { root.close() }
+    function onLayoutRequested(next) { root.setLayout(next) }
   }
 
   // Overdue count: urgent pill with the number in the bar background colour.
   // Inline components don't see this file's ids, hence the bindings.
+  // Its own left click opens the popout on Overdue; middle and right
+  // clicks fall through to the widget.
   component Badge: Rectangle {
+    id: badge
     property int count: 0
     property string fontFamily: Style.font.family
     property real fontSize: Style.font.body
+    signal clicked()
 
     implicitHeight: Math.round(fontSize * 0.7 + Style.spaceReal(4))
     implicitWidth: Math.max(implicitHeight, badgeText.implicitWidth + Style.spaceReal(6))
     radius: implicitHeight / 2
+
+    MouseArea {
+      anchors.fill: parent
+      anchors.margins: -Style.spaceReal(2)
+      acceptedButtons: Qt.LeftButton
+      cursorShape: Qt.PointingHandCursor
+      onClicked: badge.clicked()
+    }
 
     PlainText {
       id: badgeText

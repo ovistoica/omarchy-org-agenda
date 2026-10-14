@@ -9,8 +9,10 @@ import "Model.js" as Model
 // private dir (Model.outputDir) — on our pull, or by itself from its
 // save/TODO hooks — and the file is watched, so there is no polling:
 // timers only run for a retry after a failed pull and as a watchdog
-// while a pull or a state change is in flight. A state change is the only
-// write, and only the popout's picker starts one; there is no IPC for it.
+// while a pull, a week fetch or a state change is in flight. Another Org
+// week comes back on emacsclient's stdout when the popout asks for it
+// (fetchWeek). A state change is the only write, and only the popout's
+// picker starts one; there is no IPC for it.
 Item {
   id: root
 
@@ -54,25 +56,41 @@ Item {
   property bool stateStarted: false
   property bool stateTimedOut: false
 
+  // Another Org week, fetched on demand for the popout (`f`/`b`): `week` is
+  // the last one fetched (a normalized payload with weekOffset/weekStart),
+  // `weekError` why the last fetch failed. A fetch asked for mid-fetch only
+  // remembers its offset, and runs once the current one is done.
+  property var week: null
+  property string weekError: ""
+  property bool weekBusy: false
+  property int weekOffset: 0
+  property var weekPending: null
+  property bool weekStarted: false
+  property bool weekTimedOut: false
+
   // Emacs needs the user now (a note to write, or a hook asking something):
   // the popout should get out of the way.
   signal stateNeedsEmacs()
 
   function errorText(e) { return String(e && e.message ? e.message : e) }
 
-  // Widgets on every monitor call this with the same settings; only a real
-  // change may cost a pull.
+  // Widgets on every monitor call this with the same settings. Every change
+  // is stored, so the view follows UI-only ones such as the layout, but only
+  // a change to what a pull sends to Emacs costs one.
   function configure(raw) {
     var next = Model.normalizeSettings(raw)
     if (JSON.stringify(next) === JSON.stringify(settings)) return
+    var repull = Model.pullKey(next) !== Model.pullKey(settings)
     if (Model.socketKey(next) !== Model.socketKey(settings)) {
       // Another server is another agenda; don't show the old one as its.
       payload = null
       status = "loading"
       detail = ""
+      week = null
+      weekError = ""
     }
     settings = next
-    pull("settings")
+    if (repull) pull("settings")
   }
 
   function pull(reason) {
@@ -160,6 +178,8 @@ Item {
     }
     // A leftover from yesterday is not today's agenda; the pull replaces it.
     if (Model.isNewDay(parsed.value, new Date())) return
+    // A week's offset counts from the day it was fetched on.
+    if (payload && payload.date !== parsed.value.date) week = null
     payload = parsed.value
     // Also covers a push arriving while we thought Emacs was offline.
     status = parsed.value.error ? "error" : "ok"
@@ -185,12 +205,89 @@ Item {
     opener.running = true
   }
 
+  // The payload that reported `item`: the bar's, or the fetched week's.
+  function payloadOf(item) {
+    return Model.payloadFor(item, [payload, week])
+  }
+
   function open(item) {
+    var from = payloadOf(item)
     try {
-      launch(Model.gotoForm(item, payload, elispFile), Model.fallbackOpenArgs(settings, item, payload))
+      launch(Model.gotoForm(item, from, elispFile), Model.fallbackOpenArgs(settings, item, from))
     } catch (e) {
       console.warn("org-agenda: cannot open item:", errorText(e))
     }
+  }
+
+  // ---- another week. Stateless in Emacs: the payload comes back on
+  // emacsclient's stdout and lives here until the next fetch.
+
+  function fetchWeek(offset) {
+    if (weekBusy) {
+      weekPending = offset
+      return
+    }
+    if (outputFile === "") {
+      weekError = "No private directory for the agenda file (XDG_RUNTIME_DIR and HOME are unset or not absolute paths)"
+      console.warn("org-agenda: cannot fetch a week:", weekError)
+      return
+    }
+    var argv
+    try {
+      argv = Model.clientArgs(settings).concat(["--eval", Model.weekForm(elispFile, outputFile, settings, offset)])
+    } catch (e) {
+      weekError = errorText(e)
+      console.warn("org-agenda: cannot build the week fetch:", weekError)
+      return
+    }
+    console.log("org-agenda: fetch week " + offset)
+    weekOffset = offset
+    weekError = ""
+    weekStarted = false
+    weekTimedOut = false
+    weekBusy = true
+    weeker.command = argv
+    // Armed before starting: a failed start may be reported synchronously.
+    weekWatchdog.restart()
+    weeker.running = true
+  }
+
+  function weekFailed(why) {
+    weekError = why
+    console.warn("org-agenda: week " + weekOffset + " failed:", why)
+  }
+
+  function runPendingWeek() {
+    if (weekPending === null) return
+    var offset = weekPending
+    weekPending = null
+    // Deferred: the finished Process still reports running inside its handlers.
+    Qt.callLater(function() { root.fetchWeek(offset) })
+  }
+
+  function weekExited(code) {
+    weekWatchdog.stop()
+    weekBusy = false
+    if (weekTimedOut) {
+      weekFailed("Emacs didn't answer within " + Math.round(weekWatchdog.interval / 1000) + "s")
+    } else if (code !== 0) {
+      var err = String(weekErr.text || "").trim()
+      weekFailed(Model.isNoServer(err) ? "Emacs isn't reachable"
+                 : Model.bounded(err || ("emacsclient exited with code " + code), 300))
+    } else {
+      var parsed = Model.parseWeekResult(weekOut.text)
+      if (parsed.ok) week = parsed.value
+      else weekFailed("Unexpected answer from Emacs: " + parsed.reason)
+    }
+    runPendingWeek()
+  }
+
+  function weekFailedToStart() {
+    weekWatchdog.stop()
+    weekBusy = false
+    weekFailed(Model.plain("Couldn't run " + Model.bounded(weeker.command[0] || "emacsclient", 100)
+                           + " — check the emacsclient setting"))
+    runPendingWeek()
   }
 
   function openAgenda() {
@@ -225,7 +322,7 @@ Item {
     stateKeyword = String(keyword || "")
     var argv
     try {
-      argv = Model.clientArgs(settings).concat(["--eval", Model.stateForm(item, payload, keyword, elispFile)])
+      argv = Model.clientArgs(settings).concat(["--eval", Model.stateForm(item, payloadOf(item), keyword, elispFile)])
     } catch (e) {
       stateFailed(errorText(e))
       return
@@ -392,6 +489,27 @@ Item {
       if (!setter.running) return
       root.stateTimedOut = true
       setter.signal(15)
+    }
+  }
+
+  Process {
+    id: weeker
+    stdout: StdioCollector { id: weekOut }
+    stderr: StdioCollector { id: weekErr }
+    onStarted: root.weekStarted = true
+    onExited: function(exitCode, exitStatus) { root.weekExited(exitCode) }
+    onRunningChanged: if (!running && !root.weekStarted && root.weekBusy) root.weekFailedToStart()
+  }
+
+  // Same bound as a pull.
+  Timer {
+    id: weekWatchdog
+    interval: (root.settings.timeoutSeconds + 2) * 1000
+    repeat: false
+    onTriggered: {
+      if (!weeker.running) return
+      root.weekTimedOut = true
+      weeker.signal(15)
     }
   }
 

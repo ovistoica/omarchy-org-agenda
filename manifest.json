@@ -19,6 +19,7 @@
     "defaultSection": "center",
     "defaults": {
       "label": "Next item",
+      "layout": "Org",
       "maxTitleChars": 28,
       "overdueBadge": true,
       "habitsInBadge": false,
@@ -34,6 +35,7 @@
     },
     "schema": [
       { "key": "label", "type": "enum", "label": "Bar label", "options": ["Next item", "Count", "Icon"], "defaultValue": "Next item", "description": "Next item shows the next entry's time and title. Count and Icon keep task titles off the bar, e.g. while screen sharing." },
+      { "key": "layout", "type": "enum", "label": "Popout layout", "options": ["Org", "Tabs", "Columns"], "defaultValue": "Org", "description": "Org is your week agenda as Emacs shows it. Tabs splits it into Today, Week and Overdue. Columns puts Today beside Overdue and the week, in a wider popout. Press v in the popout to switch." },
       { "key": "maxTitleChars", "type": "integer", "label": "Max title length in the bar", "min": 10, "max": 80, "step": 2, "defaultValue": 28 },
       { "key": "overdueBadge", "type": "boolean", "label": "Show overdue count", "defaultValue": true },
       { "key": "habitsInBadge", "type": "boolean", "label": "Count missed habits as overdue", "defaultValue": false },

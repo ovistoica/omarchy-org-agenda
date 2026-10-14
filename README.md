@@ -5,7 +5,7 @@ entry and Emacs opens it at its heading.
 
 ![The bar: the clock, then the next entry and the overdue count](docs/screenshot-bar.png)
 
-![The popout: the next-up card on top, then the agenda grouped into sections](docs/screenshot-popout.png)
+![The Org layout: the week agenda as Emacs shows it, today first, with the now line and overdue entries inside today](docs/screenshot-popout-org.png)
 
 ## Requirements
 
@@ -70,30 +70,64 @@ the fallback `~/.cache/omarchy-org-agenda/`, delete it yourself).
 
 | Click  | Action                                                       |
 | ------ | ------------------------------------------------------------ |
-| Left   | Open the popout                                              |
-| Middle | Open your `org-agenda` in Emacs (dispatcher key `agendaKey`) |
-| Right  | Ask Emacs for a fresh export                                 |
+| Left   | Open the popout; on the red overdue badge, open it on Overdue |
+| Middle | Open your `org-agenda` in Emacs (dispatcher key `agendaKey`)  |
+| Right  | Ask Emacs for a fresh export                                  |
 
-**Popout keys:** `↑`/`↓` or `j`/`k` move, `↵` opens, `t` changes the
-state, `r` refreshes, `Esc` closes.
+**The popout's layouts**
 
-Opening an entry (click or `↵`) shows its file at the heading in the
-current Emacs frame, the way `emacsclient +LINE FILE` would, and focuses
-the Emacs window.
+- **Org**: your week agenda as Emacs shows it: today in Org's order with
+  the `now` line and overdue entries inside it, then each remaining day
+  of the week, with your category column and Org's `Scheduled:`,
+  `Sched. 3x:`, `Deadline:` and `In 5 d.:` leaders.
+- **Tabs**: one tab at a time: Today (next up, schedule, tasks and
+  habits), the rest of the Week by day, and Overdue.
+- **Columns**: a wider popout with Today on the left, and Overdue above
+  the rest of the week on the right.
 
-**Coming up**
+![The Tabs layout on its Today tab, with the Week and Overdue tabs beside it](docs/screenshot-popout-tabs.png)
 
-After today's entries and habits, Coming up looks ahead. It lists Org's
-warnings for upcoming deadlines, and the scheduled tasks and timestamped
-entries (like calendar events, including multi-day ones) of the rest of
-the week, soonest first, like your Org week agenda: the week starts on
-`org-agenda-start-on-weekday` (Monday by default), so on Sundays only
-deadline warnings look ahead. Each row starts with the day: `Thu` within
-the week, `27 Oct` further out. Each heading shows once, at its next
-date: a repeating entry at its next occurrence, a multi-day event on its
-first day, and an entry that is already on today's agenda (such as an
-event under way) isn't listed again. Diary entries on later days aren't
-included.
+![The Columns layout: today on the left; overdue and the rest of the week on the right](docs/screenshot-popout-columns.png)
+
+Press `v` to switch to the next layout, or click one in the header's
+`Org | Tabs | Columns` switcher. The choice is saved as the widget's
+`layout` setting, so it survives restarts, and you can also set it in
+the widget's settings.
+
+**Popout keys**
+
+| Key                            | Action                                        |
+| ------------------------------ | --------------------------------------------- |
+| `↑` `↓`, `k` `j`, `p` `n`      | Move up and down                              |
+| `↵`                            | Open the entry in Emacs                       |
+| `t`                            | Change the entry's state (see below)          |
+| `f` `b`, `.`                   | Next and previous week; back to this week     |
+| `v`                            | Next layout                                   |
+| `1` `2` `3`, `←` `→` (Tabs)    | Today, Week, Overdue                          |
+| `←` `→` (Columns)              | The other column, at the same position        |
+| `r`                            | Refresh                                       |
+| `Esc`                          | Close                                         |
+
+Letters are case-sensitive, as in Org's agenda, and `h`/`l` work like
+`←`/`→`. Opening an entry (click or `↵`) shows its file at the heading in
+the current Emacs frame, the way `emacsclient +LINE FILE` would, and
+focuses the Emacs window.
+
+**The week**
+
+Like your Org week agenda, the popout stops at the end of the week, which
+starts on `org-agenda-start-on-weekday` (Monday by default); on Sundays
+only deadline warnings look further ahead. Each heading shows once, at
+its next date: a repeating entry at its next occurrence, a multi-day
+event on its first day, and an entry already on today's agenda (such as
+an event under way) isn't listed again on a later day. Diary entries on
+later days aren't included.
+
+`f` and `b`, or the `‹` `›` around the week in the header, show the
+next and previous weeks; `.` or a click on the week's name comes back.
+Emacs builds another week when you ask for it, and refreshes it when an
+Org file changes while you look at it. You can open entries and change
+their state there too. The popout always opens on this week.
 
 **Changing a state**
 
@@ -154,6 +188,7 @@ omarchy bar set ovistoica.org-agenda label Count
 | Key              | Type    | Default       | Meaning                                                                                                   |
 | ---------------- | ------- | ------------- | --------------------------------------------------------------------------------------------------------- |
 | `label`          | enum    | `"Next item"` | Bar label: `Next item` (next entry's time and title), `Count` (open entries today) or `Icon` (icon only) |
+| `layout`         | enum    | `"Org"`       | Popout layout: `Org`, `Tabs` or `Columns`; `v` in the popout switches and saves it                       |
 | `maxTitleChars`  | integer | `28`          | Longest title shown in the bar (10–80)                                                                    |
 | `overdueBadge`   | boolean | `true`        | Show the overdue count badge                                                                              |
 | `habitsInBadge`  | boolean | `false`       | Count missed habits as overdue                                                                            |

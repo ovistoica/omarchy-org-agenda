@@ -5,18 +5,26 @@ import qs.Commons as Commons
 import qs.Ui
 import "Model.js" as Model
 
-// One agenda entry in the popout, on a single line:
-//   time | KEYWORD [A] title ……………… category
-// The highlight comes from `hasCursor` (keyboard and hover alike, set by the
-// panel), and only then does the right column turn into the entry's
-// file:line, the place ↵ jumps to. Clicking the keyword chip asks for the
-// state picker instead; while a change is in flight the row dims and its
-// time reads "…".
+// One list-style agenda entry in the popout (Tabs, Columns), on one line:
+//   lead | KEYWORD [A] title ……………… trail
+// `lead` and `trail` are a row block's {text, tone} (Model.layoutModel);
+// `tones` maps a tone to its colour. The highlight comes from `hasCursor`
+// (keyboard and hover alike, set by the panel), and only then does the
+// trail turn into the entry's file:line, the place ↵ jumps to. Clicking the
+// keyword chip asks for the state picker instead; while a change is in
+// flight the row dims and its lead reads "…". `dense` is the shorter row of
+// Columns' right pane.
 CursorSurface {
   id: root
 
   property var item: null
   property var payload: null
+  property var lead: null
+  property var trail: null
+  property bool past: false
+  property bool flag: false
+  property bool dense: false
+  property var tones: ({})
   property string fontFamily: Style.font.family
   property int leadWidth: Style.space(40)
   property bool stateEnabled: false
@@ -28,17 +36,18 @@ CursorSurface {
 
   readonly property color textColor: Commons.Color.popups.text
   readonly property color mutedColor: Commons.Color.muted
-  // A coming-up entry's lead names its day, counted from the export's day.
-  readonly property var lead: item ? Model.rowLead(item, Model.payloadDay(payload))
-                                   : ({ text: "", urgent: false })
   readonly property string keyword: item && item.todo ? item.todo : ""
   readonly property string keywordHex: keyword ? Model.keywordColor(payload, keyword) : ""
   readonly property color keywordColor: keywordHex !== "" ? keywordHex : mutedColor
   readonly property bool done: !!item && item.done
-  readonly property bool deadline: !!item && Model.isDeadline(item)
+  readonly property bool leadUrgent: !!lead && (lead.tone === "urgent" || lead.tone === "late")
+
+  function toneColor(cell, fallback) {
+    return cell && tones[cell.tone] !== undefined ? tones[cell.tone] : fallback
+  }
 
   foreground: textColor
-  implicitHeight: Style.spacing.popupRowHeight
+  implicitHeight: dense ? Style.space(23) : Style.spacing.popupRowHeight
 
   MouseArea {
     id: mouse
@@ -60,8 +69,8 @@ CursorSurface {
       Layout.preferredWidth: root.leadWidth
       Layout.alignment: Qt.AlignVCenter
       horizontalAlignment: Text.AlignRight
-      text: root.pending ? "…" : root.lead.text
-      color: root.lead.urgent && !root.pending ? Commons.Color.urgent : root.mutedColor
+      text: root.pending ? "…" : root.lead ? root.lead.text : ""
+      color: root.pending ? root.mutedColor : root.toneColor(root.lead, root.mutedColor)
       font.family: root.fontFamily
       font.pixelSize: Style.font.bodySmall
       font.features: { "tnum": 1 }
@@ -110,7 +119,7 @@ CursorSurface {
       Layout.fillWidth: true
       Layout.alignment: Qt.AlignVCenter
       text: root.item ? root.item.title : ""
-      color: root.textColor
+      color: root.past ? root.mutedColor : root.textColor
       font.family: root.fontFamily
       font.pixelSize: Style.font.body
       font.strikeout: root.done
@@ -118,10 +127,10 @@ CursorSurface {
 
     // nf-md-flag: the entry carries a deadline.
     PlainText {
-      visible: root.deadline
+      visible: root.flag
       Layout.alignment: Qt.AlignVCenter
       text: String.fromCodePoint(0xf023b)
-      color: root.lead.urgent ? Commons.Color.urgent : Commons.Color.accent
+      color: root.leadUrgent ? Commons.Color.urgent : Commons.Color.accent
       font.family: root.fontFamily
       font.pixelSize: Style.font.bodySmall
     }
@@ -131,8 +140,8 @@ CursorSurface {
       Layout.maximumWidth: Style.space(150)
       text: !root.item ? ""
         : root.hasCursor ? Model.rowLocation(root.item) + " " + String.fromCodePoint(0xf0311)   // nf-md-keyboard-return
-        : Model.rowTrail(root.item)
-      color: root.mutedColor
+        : root.trail ? root.trail.text : ""
+      color: root.hasCursor ? root.mutedColor : root.toneColor(root.trail, root.mutedColor)
       elide: root.hasCursor ? Text.ElideLeft : Text.ElideRight
       font.family: root.fontFamily
       font.pixelSize: Style.font.caption

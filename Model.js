@@ -449,13 +449,22 @@ function weekForm(elispFile, outputFile, settings, offset) {
     " (omarchy-org-agenda-week " + clamp(offset, -MAX_WEEK_OFFSET, MAX_WEEK_OFFSET) + "))"
 }
 
-// The UI may only jump to a location Emacs itself reported.
-function knownItem(item, payload) {
-  const ok = isObj(item) && Number.isSafeInteger(item.line) && item.line > 0 && isAbsPath(item.path)
+function hasItem(payload, item) {
+  return isObj(item) && Number.isSafeInteger(item.line) && item.line > 0 && isAbsPath(item.path)
     && isObj(payload) && Array.isArray(payload.items)
     && payload.items.some(i => isObj(i) && i.path === item.path && i.line === item.line)
-  if (!ok) throw new Error("item is not in the agenda payload")
+}
+
+// The UI may only jump to a location Emacs itself reported.
+function knownItem(item, payload) {
+  if (!hasItem(payload, item)) throw new Error("item is not in the agenda payload")
   return item
+}
+
+// The first of `payloads` (the bar's, then a fetched week's) that reported
+// `item`, or null: what gotoForm and stateForm check it against.
+function payloadFor(item, payloads) {
+  return (Array.isArray(payloads) ? payloads : []).filter(p => hasItem(p, item))[0] || null
 }
 
 function gotoForm(item, payload, elispFile) {
@@ -741,24 +750,6 @@ function panelMode(view) {
 
 function errorMessage(view) {
   return (view.payload && view.payload.error) || view.detail || "unknown error"
-}
-
-// The popout in display order. `sel` numbers what the keyboard can reach:
-// the next-up card, then every row of every section. `rows` lists those in
-// `sel` order, keyed so a selection survives a refresh.
-function panelModel(view) {
-  let sel = 0
-  const next = view.next ? { key: "next", sel: sel++, item: view.next.item } : null
-  const secs = view.sections.map(sec => ({
-    key: sec.key, title: sec.title, count: sec.items.length,
-    hint: sectionHint(sec.key),
-    rows: sec.items.map(item => ({
-      key: sec.key + ":" + item.path + ":" + item.line + ":" + item.type,
-      sel: sel++, item: item
-    }))
-  }))
-  return { next: next, sections: secs,
-           rows: secs.reduce((acc, s) => acc.concat(s.rows), next ? [next] : []) }
 }
 
 // Index in `after` (keys) for what was selected at `index` in `before`:
@@ -1201,11 +1192,43 @@ function overdueUi(ui) {
                        u.layout === "Tabs" ? { tab: "overdue" } : {})
 }
 
+// The popout's key map, as in Org's agenda: what a key press asks for, or
+// null. `ctx` = {layout, tab, pickerOpen}; `key` is a named key ("Up",
+// "Down", "Left", "Right", "Return", "Escape") or ""; `text` is the event's
+// text. Letters are case-sensitive, like Org's. The state picker, while it
+// is open, keeps every key for itself.
+//   {move: ±1} {open} {state} {refresh} {close} {layout: "next"}
+//   {week: +1 | -1 | 0} (Tabs: also {tab: "week"}) {tab: …} {pane: ±1}
+function keyAction(ctx, key, text) {
+  const c = isObj(ctx) ? ctx : {}
+  if (c.pickerOpen) return null
+  const layout = normalizeSettings({ layout: c.layout }).layout
+  const k = isStr(key) && key !== "" ? key : isStr(text) && text.length === 1 ? text : ""
+  const side = k === "Left" || k === "h" ? -1 : k === "Right" || k === "l" ? 1 : 0
+  const step = { f: 1, b: -1, ".": 0 }
+  if (k === "Up" || k === "k" || k === "p") return { move: -1 }
+  if (k === "Down" || k === "j" || k === "n") return { move: 1 }
+  if (k === "Return") return { open: true }
+  if (k === "Escape") return { close: true }
+  if (k === "t") return { state: true }
+  if (k === "r" || k === "R") return { refresh: true }
+  if (k === "v") return { layout: "next" }
+  if (hasOwn(step, k))
+    return layout === "Tabs" && k !== "." ? { week: step[k], tab: "week" } : { week: step[k] }
+  if (layout === "Tabs") {
+    if (side !== 0) return { tab: tabStep(c.tab, side) }
+    const tab = /^[0-9]$/.test(k) ? tabAt(Number(k)) : null
+    return tab ? { tab: tab } : null
+  }
+  if (layout === "Columns" && side !== 0) return { pane: side }
+  return null
+}
+
 // The footer's key hints.
 function layoutHints(layout) {
   const l = normalizeSettings({ layout: layout }).layout
   const base = "↑↓ move · ↵ open · t state · f b week · v layout · r refresh · esc"
-  return (l === "Tabs" ? "1 2 3 tabs · " : l === "Columns" ? "←→ column · " : "") + base
+  return (l === "Tabs" ? "1 2 3 tabs · " : l === "Columns" ? "← → column · " : "") + base
 }
 
 // ---------------------------------------------------------------- view

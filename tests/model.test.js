@@ -13,11 +13,12 @@ const M = new Function(src + "; return { PROTOCOL, MAX_ITEMS, MAX_TITLE, ID_RE, 
   " socketKey, outputDir, agendaFilesList, filesForm, loadPreamble, pullForm, gotoForm, agendaForm," +
   " fallbackOpenArgs, isNoServer, backoffMs, dateKey, isNewDay, isOld, keywordColor, view," +
   " basename, isDeadline, rowLead, rowTrail, rowLocation, sectionHint, nextMeta, footerLine," +
-  " panelMode, errorMessage, panelModel, refocus, stateChoices, canChangeState, stateForm," +
+  " panelMode, errorMessage, refocus, stateChoices, canChangeState, stateForm," +
   " takeNoteForm, parseStateResult, stateMessage, entryKey, pickerHint, ITEM_TYPES, payloadDay," +
   " weekForm, parseWeekResult, elispStringValue, LAYOUTS, MAX_WEEK_OFFSET, pullKey, nextLayout," +
   " orgCategory, orgLeader, orgWhen, orgDayTitle, isoWeek, compactDayTitle, browseOffset, weekNav," +
-  " weekWanted, layoutModel, paneSel, tabStep, tabAt, overdueFocus, overdueUi, layoutHints }")()
+  " weekWanted, layoutModel, paneSel, tabStep, tabAt, overdueFocus, overdueUi, layoutHints, keyAction," +
+  " payloadFor }")()
 
 let failed = 0
 let count = 0
@@ -696,24 +697,14 @@ eq([M.errorMessage(M.view(payloadOf([], { error: "bad" }), "ok", "x", at(11, 13)
     M.errorMessage(M.view(null, "error", "boom", at(11, 13), {})),
     M.errorMessage(M.view(null, "error", "", at(11, 13), {}))], ["bad", "boom", "unknown error"], "errorMessage")
 {
-  const v = M.view(P(all), "ok", "", at(11, 13), {})
-  const before = M.panelModel(v)
   // A refresh after the habit was done: its row is gone, the rows below it move up.
-  const after = M.panelModel(M.view(P(all.filter(i => i !== habit)), "ok", "", at(11, 13), {}))
-  eq(before.sections.map(s => [s.key, s.count, s.rows.length, s.hint]),
-     [["schedule", 2, 2, ""], ["today", 2, 2, ""], ["habits", 1, 1, "missed days"],
-      ["upcoming", 1, 1, ""], ["overdue", 1, 1, ""]], "panelModel: sections")
-  eq(before.rows.map(r => [r.sel, r.item.line]),
-     [[0, 63], [1, 63], [2, 10], [3, 20], [4, 60], [5, 30], [6, 50], [7, 40]],
-     "panelModel: next card first, then every section's rows, overdue included")
-  eq([before.next.key, before.rows[7].key], ["next", "overdue:/home/u/org/cal.org:40:scheduled"], "panelModel: keys")
-  eq(M.panelModel(M.view(P([task]), "ok", "", at(11, 13), {})).rows.map(r => r.sel), [0], "panelModel: no next")
-  const keys = m => m.rows.map(r => r.key)
-  eq([M.refocus(keys(before), keys(after), 5), M.refocus(keys(before), keys(after), 6),
-      M.refocus(keys(before), keys(after), 7),
-      M.refocus(keys(after), keys(before), 6), M.refocus(keys(after), keys(before), 3),
-      M.refocus([], keys(before), 0), M.refocus(keys(before), [], 3), M.refocus(["gone"], ["a", "b"], 5)],
-     [4, 5, 6, 7, 3, 0, 0, 1], "refocus: keeps the entry or the one above")
+  const before = ["next", "a", "b", "c", "habit", "d", "e", "f"]
+  const after = before.filter(k => k !== "habit")
+  eq([M.refocus(before, after, 5), M.refocus(before, after, 6), M.refocus(before, after, 7),
+      M.refocus(after, before, 6), M.refocus(after, before, 3),
+      M.refocus([], before, 0), M.refocus(before, [], 3), M.refocus(["gone"], ["a", "b"], 5),
+      M.refocus(before, after, 4)],
+     [4, 5, 6, 7, 3, 0, 0, 1, 3], "refocus: keeps the entry or the one above")
 }
 
 // ---------------------------------------------------------------- layouts: settings
@@ -1104,8 +1095,53 @@ eq([1, 2, 3, 0, 4, "1", 1.5].map(M.tabAt), ["today", "week", "overdue", null, nu
   const hints = ["Org", "Tabs", "Columns"].map(l => M.layoutHints(l))
   eq(hints, ["↑↓ move · ↵ open · t state · f b week · v layout · r refresh · esc",
              "1 2 3 tabs · ↑↓ move · ↵ open · t state · f b week · v layout · r refresh · esc",
-             "←→ column · ↑↓ move · ↵ open · t state · f b week · v layout · r refresh · esc"], "layoutHints")
+             "← → column · ↑↓ move · ↵ open · t state · f b week · v layout · r refresh · esc"], "layoutHints")
   eq(hints.map(h => h.length <= 80), [true, true, true], "layoutHints: under 80 chars")
+}
+
+{
+  // [named key, text] → action, per layout.
+  const act = (layout, tab, key, text) => M.keyAction({ layout: layout, tab: tab, pickerOpen: false }, key, text)
+  const shared = [["Up", ""], ["Down", ""], ["", "k"], ["", "j"], ["", "p"], ["", "n"], ["Return", ""],
+                  ["", "t"], ["", "r"], ["", "R"], ["Escape", ""], ["", "v"]]
+  const sharedWant = [{ move: -1 }, { move: 1 }, { move: -1 }, { move: 1 }, { move: -1 }, { move: 1 }, { open: true },
+                      { state: true }, { refresh: true }, { refresh: true }, { close: true }, { layout: "next" }]
+  eq(["Org", "Tabs", "Columns"].map(l => shared.map(([k, t]) => act(l, "today", k, t))),
+     [sharedWant, sharedWant, sharedWant], "keyAction: shared keys in every layout")
+  eq(["Org", "Tabs", "Columns"].map(l => [["", "f"], ["", "b"], ["", "."]].map(([k, t]) => act(l, "today", k, t))),
+     [[{ week: 1 }, { week: -1 }, { week: 0 }],
+      [{ week: 1, tab: "week" }, { week: -1, tab: "week" }, { week: 0 }],
+      [{ week: 1 }, { week: -1 }, { week: 0 }]], "keyAction: f b . browse weeks; Tabs shows the week tab")
+  eq([["", "1"], ["", "2"], ["", "3"], ["", "4"], ["", "0"], ["Left", ""], ["Right", ""], ["", "h"], ["", "l"]]
+       .map(([k, t]) => act("Tabs", "week", k, t)),
+     [{ tab: "today" }, { tab: "week" }, { tab: "overdue" }, null, null,
+      { tab: "today" }, { tab: "overdue" }, { tab: "today" }, { tab: "overdue" }], "keyAction: Tabs 1 2 3 and ←→ h l")
+  eq([act("Tabs", "overdue", "Right", ""), act("Tabs", "today", "Left", "")],
+     [{ tab: "overdue" }, { tab: "today" }], "keyAction: Tabs ←→ stop at the ends")
+  eq([["Left", ""], ["Right", ""], ["", "h"], ["", "l"], ["", "1"]].map(([k, t]) => act("Columns", "today", k, t)),
+     [{ pane: -1 }, { pane: 1 }, { pane: -1 }, { pane: 1 }, null], "keyAction: Columns ←→ h l switch panes")
+  eq([["Left", ""], ["Right", ""], ["", "h"], ["", "l"], ["", "1"]].map(([k, t]) => act("Org", "today", k, t)),
+     [null, null, null, null, null], "keyAction: Org ignores ←→ and digits")
+  eq([["", "F"], ["", "B"], ["", "N"], ["", "P"], ["", "T"], ["", "V"], ["", "J"], ["", "x"], ["", ""], ["", "ff"],
+      ["Tab", ""]].map(([k, t]) => act("Tabs", "today", k, t)),
+     [null, null, null, null, null, null, null, null, null, null, null], "keyAction: case-sensitive, unknown keys")
+  eq([M.keyAction({ layout: "Tabs", tab: "today", pickerOpen: true }, "Down", ""),
+      M.keyAction({ layout: "Org", pickerOpen: true }, "", "f"),
+      M.keyAction({ layout: "Columns", pickerOpen: true }, "Escape", "")],
+     [null, null, null], "keyAction: the picker keeps its keys")
+  eq([M.keyAction(null, "", "j"), M.keyAction({ layout: "bogus" }, "Left", ""), M.keyAction({ layout: "Tabs" }, "", "3"),
+      M.keyAction({}, "Down", "x")],
+     [{ move: 1 }, null, { tab: "overdue" }, { move: 1 }], "keyAction: defaults; the named key wins over text")
+}
+{
+  const a = item({ path: "/home/u/org/a.org", line: 3 })
+  const b = item({ path: "/home/u/org/b.org", line: 9 })
+  const main = { items: [a] }
+  const week = { items: [b, a] }
+  eq([M.payloadFor(a, [main, week]) === main, M.payloadFor(b, [main, week]) === week,
+      M.payloadFor(item({ path: "/x.org", line: 1 }), [main, week]), M.payloadFor(b, [main, null]),
+      M.payloadFor(b, null), M.payloadFor(null, [main])],
+     [true, true, null, null, null, null], "payloadFor: the bar's payload, then the week's")
 }
 
 eq([M.PROTOCOL, M.MAX_ITEMS, M.MAX_TITLE, M.NOW_GRACE_MIN, M.STALE_AFTER_MS, M.ID_RE.test("a:b")],

@@ -6,16 +6,22 @@ import qs.Commons as Commons
 import qs.Ui
 import "Model.js" as Model
 
-// Popout content: today's agenda, read from the shared Service. BarWidget
-// hosts it in a KeyboardPanel and builds it on first open. Everything shown
-// comes from Model (view, panelModel, row helpers); this file lays it out
-// and keeps the keyboard cursor. Opening an entry is the Service's job.
+// Popout content: the agenda in one of three layouts, read from the shared
+// Service. BarWidget hosts it in a KeyboardPanel, builds it on first open
+// and owns the `layout` setting (it persists a change asked for here).
+// Everything shown comes from Model.layoutModel; this file draws the chrome
+// (header, tabs, footer), hands each pane's blocks to a BlockList, and
+// keeps the keyboard cursor. Opening an entry is the Service's job.
 //
-// The keyboard reaches the next-up card first, then each row of every
-// section, in order. Hover moves the same cursor as the arrows, so only one
-// row is ever highlighted.
+//   Org      the Org week agenda, today first
+//   Tabs     Today · Week · Overdue
+//   Columns  Today on the left; Overdue and the week on the right
 //
-// `t` (or a click on a row's keyword chip) opens the state picker under the
+// Keys come from Model.keyAction. The cursor (`selected`) indexes
+// model.rows; hover moves it too, so only one row is ever highlighted, and
+// it follows its entry across layouts, tabs, weeks and refreshes.
+//
+// `t` (or a click on a row's keyword) opens the state picker under the
 // selected entry. While it is open every key goes to it first (forwarded
 // below), except ↑↓, which close it and move on.
 PanelKeyCatcher {
@@ -24,6 +30,17 @@ PanelKeyCatcher {
   property var service: null
   property var view: null
   property string fontFamily: Style.font.family
+  // From the widget's settings; a change asked for here goes out through
+  // layoutRequested and comes back in this binding.
+  property string layout: "Org"
+  // Whether the popout is open: another week is only fetched while it is.
+  property bool shown: false
+
+  signal layoutRequested(string layout)
+
+  // Session state: which tab, which week. Both reset on open.
+  property string tab: "today"
+  property int offset: 0
 
   property int selected: 0
   // Keyboard moves scroll the cursor into view; hover never scrolls.
@@ -36,37 +53,86 @@ PanelKeyCatcher {
   property string pickerEntry: ""
   property var picker: null
   readonly property bool pickerOpen: pickerKey !== ""
-  readonly property var stateChoices: Model.stateChoices(payload)
   readonly property var pickerItem: {
-    var rows = entries.rows
     for (var i = 0; i < rows.length; i++) if (rows[i].key === pickerKey) return rows[i].item
     return null
   }
+  // The picker offers the keywords of the payload its entry came from.
+  readonly property var stateChoices: Model.stateChoices(pickerItem ? rowPayload(pickerItem) : payload)
   readonly property var stateResult: service ? service.stateResult : null
 
   readonly property color textColor: Commons.Color.popups.text
   readonly property color mutedColor: Commons.Color.muted
+  readonly property color urgentColor: Commons.Color.urgent
+  // Commons has no orange or yellow; Org's late (scheduled earlier) and
+  // soon (deadline coming) faces are the urgent colour turned warmer.
+  readonly property var tones: ({
+    normal: textColor,
+    muted: mutedColor,
+    urgent: urgentColor,
+    late: warmer(urgentColor, 0.06, urgentColor),
+    soon: warmer(urgentColor, 0.11, textColor)
+  })
+
   readonly property var payload: view ? view.payload : null
-  readonly property string mode: view ? Model.panelMode(view) : "loading"
-  readonly property var entries: view && mode === "agenda"
-    ? Model.panelModel(view) : ({ next: null, sections: [], rows: [] })
-  readonly property var rowKeys: entries.rows.map(function(r) { return r.key })
+  readonly property var weekPayload: service ? service.week : null
+  readonly property var model: view
+    ? Model.layoutModel(view, { layout: layout, tab: tab, offset: offset, week: weekPayload,
+                                weekError: service ? service.weekError : "" })
+    : ({ layout: layout, tab: tab, tabs: [], nav: { offset: 0, label: "", range: "" },
+         panes: [], rows: [], empty: true })
+  readonly property var rows: model.rows
+  readonly property var rowKeys: rows.map(function(r) { return r.key })
+  readonly property string mode: {
+    if (!view) return "loading"
+    var m = Model.panelMode(view)
+    return m === "agenda" || m === "empty" ? (model.empty ? "empty" : "agenda") : m
+  }
+  readonly property bool hasAgenda: mode === "agenda" || mode === "empty"
+
+  // The week to fetch, or noWeek: changes only when another one is needed.
+  readonly property int noWeek: 1000
+  readonly property int wantedWeek: {
+    if (!shown || !service || !hasAgenda) return noWeek
+    var w = Model.weekWanted(offset, weekPayload)
+    return w === null ? noWeek : w
+  }
+  onWantedWeekChanged: if (wantedWeek !== noWeek) service.fetchWeek(wantedWeek)
+
   readonly property int missingCount: payload && payload.missing ? payload.missing.length : 0
   // Re-read whenever the view changes, which is at least every minute.
   readonly property string todayText: view !== undefined ? Qt.formatDate(new Date(), "ddd d MMM") : ""
   readonly property int leadWidth: Math.ceil(leadMetrics.advanceWidth)
+  // Org's 12-column cells.
+  readonly property int orgCell: Math.ceil(orgMetrics.advanceWidth)
   readonly property int bodyGap: Style.spacing.xxl
+  readonly property int paneGap: Style.space(16)
+  readonly property int paneWidth: model.panes.length > 1
+    ? Math.floor((width - (paneGap * 2 + 1) * (model.panes.length - 1)) / model.panes.length) : width
   // nf-md-keyboard-return: the bar's Nerd Font has it, unlike a bare ↵,
   // whose fallback glyph overhangs the next word.
   readonly property string enterGlyph: String.fromCodePoint(0xf0311)
-  // The picker's chips line up under the rows' keyword chips.
+  // The picker's chips line up under the rows' keywords.
   readonly property int pickerIndent: Style.spacing.md + leadWidth + Style.spacing.lg
+  readonly property int orgPickerIndent: Style.spacing.md + orgCell * 2
+  readonly property Component pickerComponent: pickerComponentDef
 
-  implicitHeight: header.implicitHeight + bodyGap + body.implicitHeight + bodyGap + footer.implicitHeight
+  implicitHeight: header.implicitHeight
+    + (tabBar.visible ? Style.spacing.lg + tabBar.implicitHeight : 0)
+    + bodyGap + body.implicitHeight + bodyGap + footer.implicitHeight
 
-  // Back to the top, cursor on the first entry, no picker and no leftover
-  // result line: called on each open.
+  // The same hue family, turned towards orange/yellow; `fallback` for a
+  // colourless urgent.
+  function warmer(c, turn, fallback) {
+    return c.hslHue < 0 || c.hslSaturation < 0.15 ? fallback
+      : Qt.hsla((c.hslHue + turn) % 1, c.hslSaturation, c.hslLightness, 1)
+  }
+
+  // This week, the first tab, the top, cursor on the first entry, no
+  // picker and no leftover result line: called on each open.
   function reset() {
+    tab = "today"
+    offset = 0
     selected = 0
     followSelection = false
     pointerGate.reset()
@@ -75,6 +141,8 @@ PanelKeyCatcher {
     clearResult()
   }
 
+  onShownChanged: if (!shown) offset = 0
+
   onRowKeysChanged: {
     selected = Model.refocus(shownKeys, rowKeys, selected)
     shownKeys = rowKeys
@@ -82,10 +150,15 @@ PanelKeyCatcher {
 
   // A refresh may drop the picker's row, or put another entry in the
   // next-up card; the picker only ever applies to the entry it opened for.
-  onEntriesChanged: {
+  onRowsChanged: {
     if (!pickerOpen) return
-    var row = entries.rows.filter(function(r) { return r.key === pickerKey })[0]
+    var row = rows.filter(function(r) { return r.key === pickerKey })[0]
     if (!row || Model.entryKey(row.item) !== pickerEntry) closePicker()
+  }
+
+  // The payload a row's entry came from: the bar's, or a fetched week's.
+  function rowPayload(item) {
+    return Model.payloadFor(item, [payload, weekPayload]) || payload
   }
 
   function clearResult() {
@@ -93,11 +166,12 @@ PanelKeyCatcher {
   }
 
   function canPick(item) {
-    return !!service && !!payload && stateChoices.length > 0 && Model.canChangeState(item)
+    return !!service && !!item && Model.canChangeState(item)
+      && Model.stateChoices(rowPayload(item)).length > 0
   }
 
   function openPicker(sel) {
-    var row = entries.rows[sel]
+    var row = rows[sel]
     if (!row || !canPick(row.item)) return
     if (service.stateBusy) {
       console.warn("org-agenda: a state change is already in progress")
@@ -110,9 +184,9 @@ PanelKeyCatcher {
     pickerKey = row.key
   }
 
-  // The keyword chip toggles the picker for its row.
+  // The keyword toggles the picker for its row.
   function togglePicker(sel) {
-    var row = entries.rows[sel]
+    var row = rows[sel]
     if (row && row.key === pickerKey) closePicker()
     else openPicker(sel)
   }
@@ -157,6 +231,32 @@ PanelKeyCatcher {
   Connections {
     target: root.service
     function onStateNeedsEmacs() { root.closeRequested() }
+    // A push or a pull may have changed the week being browsed too.
+    function onPayloadChanged() {
+      if (root.shown && root.offset !== 0 && root.hasAgenda) root.service.fetchWeek(root.offset)
+    }
+  }
+
+  // ---- keys: PanelKeyCatcher's signals, through Model.keyAction. Esc
+  // never gets here: the catcher closes the popout itself.
+  onMoveRequested: function(dx, dy) {
+    root.dispatch(dy > 0 ? "Down" : dy < 0 ? "Up" : dx > 0 ? "Right" : "Left", "")
+  }
+  onActivateRequested: root.dispatch("Return", "")
+  onTextKey: function(t) { root.dispatch("", t) }
+
+  function dispatch(key, text) {
+    var a = Model.keyAction({ layout: layout, tab: tab, pickerOpen: pickerOpen }, key, text)
+    if (!a) return
+    if (a.move !== undefined) moveSelection(a.move)
+    else if (a.open) activate()
+    else if (a.state) openPicker(selected)
+    else if (a.refresh) refresh()
+    else if (a.close) closeRequested()
+    else if (a.layout) chooseLayout(Model.nextLayout(layout))
+    else if (a.week !== undefined) browse(a.week, a.tab || "")
+    else if (a.tab) chooseTab(a.tab)
+    else if (a.pane) movePane(a.pane)
   }
 
   function moveSelection(dy) {
@@ -164,6 +264,64 @@ PanelKeyCatcher {
     followSelection = true
     pointerGate.reset()
     selected = Math.max(0, Math.min(rowKeys.length - 1, selected + dy))
+  }
+
+  // Columns: the same position in the other pane.
+  function movePane(dir) {
+    var next = Model.paneSel(model, selected, dir)
+    if (next === selected) return
+    followSelection = true
+    pointerGate.reset()
+    selected = next
+  }
+
+  function toTop() {
+    followSelection = false
+    selected = 0
+    scroll.contentY = 0
+  }
+
+  function chooseLayout(next) {
+    if (next === layout) return
+    closePicker()
+    followSelection = true
+    root.layoutRequested(next)
+  }
+
+  function chooseTab(next) {
+    if (next === tab) return
+    closePicker()
+    tab = next
+    toTop()
+  }
+
+  // f (+1), b (-1), . (0); in Tabs, f and b also show the week tab. Org's
+  // list and the week tab are all that week, so they start at the top.
+  function browse(step, toTab) {
+    if (!hasAgenda) return
+    var next = Model.browseOffset(offset, step)
+    var tabChanged = toTab !== "" && toTab !== tab
+    if (next === offset && !tabChanged) return
+    closePicker()
+    if (tabChanged) tab = toTab
+    offset = next
+    if (layout !== "Columns") toTop()
+  }
+
+  // The bar's overdue badge: this week, Tabs on Overdue, the cursor on the
+  // first overdue entry and scrolled to it.
+  function focusOverdue() {
+    var ui = Model.overdueUi({ layout: layout, tab: tab, offset: offset })
+    closePicker()
+    if (ui.tab) tab = ui.tab
+    offset = ui.offset
+    var at = rowKeys.indexOf(Model.overdueFocus(model))
+    pointerGate.reset()
+    followSelection = at >= 0
+    if (at < 0) scroll.contentY = 0
+    // Through -1, so the row sees its cursor arrive and scrolls to it.
+    selected = -1
+    selected = Math.max(0, at)
   }
 
   function pointed(sel, area, mouse) {
@@ -180,7 +338,7 @@ PanelKeyCatcher {
   }
 
   function activate() {
-    var row = entries.rows[selected]
+    var row = rows[selected]
     if (row) openItem(row.item)
   }
 
@@ -198,11 +356,11 @@ PanelKeyCatcher {
   }
 
   // Scroll so `bottomItem` is in view and, where it fits, `topItem` too (a
-  // section's first row brings its header along).
+  // row brings its section or day header along).
   function reveal(topItem, bottomItem) {
     if (!followSelection) return
     Qt.callLater(function() {
-      if (!topItem || !bottomItem) return
+      if (!topItem || !bottomItem || !topItem.parent || !bottomItem.parent) return
       var margin = Style.space(6)
       var top = topItem.mapToItem(scroll.contentItem, 0, 0).y
       var bottom = bottomItem.mapToItem(scroll.contentItem, 0, 0).y + bottomItem.height
@@ -214,15 +372,8 @@ PanelKeyCatcher {
     })
   }
 
-  onMoveRequested: function(dx, dy) { root.moveSelection(dy) }
-  onActivateRequested: root.activate()
-  onTextKey: function(t) {
-    if (t === "r" || t === "R") root.refresh()
-    else if (t === "t") root.openPicker(root.selected)
-  }
-
-  // The widest lead: a coming-up date ("27 Oct") is a cell wider than a
-  // time ("13:00") in Omarchy's monospace font.
+  // The widest list lead: a date ("27 Oct") is a cell wider than a time
+  // ("13:00") in Omarchy's monospace font.
   TextMetrics {
     id: leadMetrics
     font.family: root.fontFamily
@@ -230,40 +381,186 @@ PanelKeyCatcher {
     text: "30 May"
   }
 
+  // Org's %-12:c and %?-12t cells: twelve characters, plus a gap so a full
+  // cell never touches the next one.
+  TextMetrics {
+    id: orgMetrics
+    font.family: root.fontFamily
+    font.pixelSize: Style.font.body
+    text: "0000000000000"
+  }
+
   PointerMoveGate {
     id: pointerGate
     referenceItem: root
   }
 
-  // ---- header: the day, and the two things you can do from here.
+  // ---- header: the day, the week, the layout, and what you can do from here.
   RowLayout {
     id: header
     anchors.top: parent.top
     anchors.left: parent.left
     anchors.right: parent.right
-    spacing: Style.spacing.lg
+    spacing: Style.spacing.md
 
     PlainText {
       Layout.alignment: Qt.AlignVCenter
-      text: "Today"
+      Layout.rightMargin: Style.spacing.xs
+      text: root.todayText
       color: root.textColor
       font.family: root.fontFamily
       font.pixelSize: Style.font.title
       font.bold: true
     }
 
-    PlainText {
-      Layout.fillWidth: true
+    // ‹ This week · 12–18 Oct ›; the label goes back to this week.
+    RowLayout {
+      id: navigator
+      visible: root.hasAgenda
       Layout.alignment: Qt.AlignVCenter
-      text: root.todayText
-      color: root.mutedColor
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.title
+      // Shrinks (the label elides) only when the header is too narrow.
+      Layout.fillWidth: true
+      Layout.minimumWidth: 0
+      Layout.maximumWidth: implicitWidth
+      spacing: Style.spacing.xs
+
+      NavArrow {
+        glyph: "‹"
+        tip: "Previous week (b)"
+        fontFamily: root.fontFamily
+        onClicked: root.browse(-1, root.layout === "Tabs" ? "week" : "")
+      }
+
+      // "This week" (or "Next week", "W44") then its days, muted; only the
+      // days elide when the header runs out of room.
+      PlainText {
+        Layout.alignment: Qt.AlignVCenter
+        Layout.leftMargin: Style.spacing.xxs
+        text: root.model.nav.label
+        color: root.model.nav.offset === 0 ? root.mutedColor : root.textColor
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        font.bold: root.model.nav.offset !== 0
+
+        MouseArea {
+          id: navTitleMouse
+          anchors.fill: parent
+          enabled: root.model.nav.offset !== 0
+          hoverEnabled: true
+          cursorShape: Qt.PointingHandCursor
+          onClicked: root.browse(0, "")
+        }
+
+        PanelToolTip {
+          visible: navTitleMouse.enabled && navTitleMouse.containsMouse
+          text: "Back to this week (.)"
+          fontFamily: root.fontFamily
+        }
+      }
+
+      PlainText {
+        Layout.fillWidth: true
+        Layout.minimumWidth: 0
+        Layout.maximumWidth: implicitWidth
+        Layout.rightMargin: Style.spacing.xxs
+        Layout.alignment: Qt.AlignVCenter
+        text: root.model.nav.range
+        color: root.mutedColor
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+
+        MouseArea {
+          anchors.fill: parent
+          enabled: root.model.nav.offset !== 0
+          cursorShape: Qt.PointingHandCursor
+          onClicked: root.browse(0, "")
+        }
+      }
+
+      NavArrow {
+        glyph: "›"
+        tip: "Next week (f)"
+        fontFamily: root.fontFamily
+        onClicked: root.browse(1, root.layout === "Tabs" ? "week" : "")
+      }
+    }
+
+    Item {
+      Layout.fillWidth: true
+    }
+
+    // Org | Tabs | Columns
+    BorderSurface {
+      id: switcher
+      Layout.alignment: Qt.AlignVCenter
+      implicitWidth: segments.implicitWidth
+      implicitHeight: segments.implicitHeight
+      radius: Style.cornerRadius
+      color: "transparent"
+      borderSpec: Border.controlSpec("normal", root.textColor, Commons.Color.accent)
+      clip: true
+
+      Row {
+        id: segments
+
+        Repeater {
+          model: Model.LAYOUTS
+
+          Rectangle {
+            id: segment
+            required property string modelData
+            required property int index
+            readonly property bool on: root.layout === modelData
+
+            implicitWidth: segmentText.implicitWidth + Style.spacing.md * 2
+            implicitHeight: Math.max(Style.space(22), segmentText.implicitHeight + Style.spacing.xs * 2)
+            color: on ? Util.alpha(root.textColor, 0.14)
+              : segmentMouse.containsMouse ? Style.hoverFillFor(root.textColor, Commons.Color.accent)
+              : "transparent"
+
+            Rectangle {
+              visible: segment.index > 0
+              width: 1
+              height: parent.height
+              color: Util.alpha(root.textColor, 0.18)
+            }
+
+            PlainText {
+              id: segmentText
+              anchors.centerIn: parent
+              text: segment.modelData
+              color: segment.on ? root.textColor : root.mutedColor
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              font.bold: segment.on
+            }
+
+            MouseArea {
+              id: segmentMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.chooseLayout(segment.modelData)
+            }
+          }
+        }
+      }
+
+      HoverHandler { id: switcherHover }
+
+      PanelToolTip {
+        visible: switcherHover.hovered
+        text: "Layout (v)"
+        fontFamily: root.fontFamily
+      }
     }
 
     TextAction {
       Layout.alignment: Qt.AlignVCenter
-      label: String.fromCodePoint(0xf0450) + " Refresh"   // nf-md-refresh
+      label: String.fromCodePoint(0xf0450)   // nf-md-refresh
+      labelSize: Style.font.title
+      square: true
+      tip: "Refresh (r)"
       fontFamily: root.fontFamily
       onClicked: root.refresh()
     }
@@ -271,15 +568,86 @@ PanelKeyCatcher {
     TextAction {
       Layout.alignment: Qt.AlignVCenter
       label: "Agenda"
+      tip: "Open the agenda in Emacs"
       fontFamily: root.fontFamily
       onClicked: root.openAgenda()
+    }
+  }
+
+  // ---- Tabs: Today · Week · Overdue, with their counts.
+  Row {
+    id: tabBar
+    visible: root.layout === "Tabs" && root.mode === "agenda" && root.model.tabs.length > 0
+    anchors.top: header.bottom
+    anchors.topMargin: Style.spacing.lg
+    anchors.left: parent.left
+    spacing: Style.spacing.md
+
+    Repeater {
+      model: root.model.tabs
+
+      BorderSurface {
+        id: tabButton
+        required property var modelData
+        required property int index
+        readonly property bool on: root.tab === modelData.key
+
+        implicitWidth: tabRow.implicitWidth + Style.spacing.xl * 2
+        implicitHeight: tabRow.implicitHeight + Style.spacing.sm * 2
+        radius: Style.cornerRadius
+        color: on ? Util.alpha(root.textColor, 0.14)
+          : tabMouse.containsMouse ? Style.hoverFillFor(root.textColor, Commons.Color.accent) : "transparent"
+        borderSpec: Border.controlSpec(on ? "selected" : "normal", root.textColor, Commons.Color.accent)
+
+        Row {
+          id: tabRow
+          anchors.centerIn: parent
+          spacing: Style.spacing.md
+
+          PlainText {
+            anchors.verticalCenter: parent.verticalCenter
+            text: tabButton.modelData.title
+            color: tabButton.on ? root.textColor : root.mutedColor
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            font.bold: tabButton.on
+          }
+
+          // Overdue's count is an urgent pill, like the bar's badge.
+          Rectangle {
+            anchors.verticalCenter: parent.verticalCenter
+            implicitWidth: Math.max(implicitHeight, countText.implicitWidth + Style.spacing.md * 2)
+            implicitHeight: countText.implicitHeight + Style.spacing.xxs * 2
+            radius: Style.cornerRadius
+            color: tabButton.modelData.urgent ? root.urgentColor : "transparent"
+
+            PlainText {
+              id: countText
+              anchors.centerIn: parent
+              text: String(tabButton.modelData.count)
+              color: tabButton.modelData.urgent ? Commons.Color.popups.background : root.mutedColor
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: tabButton.modelData.urgent
+            }
+          }
+        }
+
+        MouseArea {
+          id: tabMouse
+          anchors.fill: parent
+          hoverEnabled: true
+          cursorShape: Qt.PointingHandCursor
+          onClicked: root.chooseTab(tabButton.modelData.key)
+        }
+      }
     }
   }
 
   // ---- body: capped by the KeyboardPanel, scrolls beyond that.
   Flickable {
     id: scroll
-    anchors.top: header.bottom
+    anchors.top: tabBar.visible ? tabBar.bottom : header.bottom
     anchors.topMargin: root.bodyGap
     anchors.bottom: footer.top
     anchors.bottomMargin: root.bodyGap
@@ -298,170 +666,50 @@ PanelKeyCatcher {
       width: scroll.width
       spacing: Style.spacing.xxl
 
-      // Next up / Now.
-      CursorSurface {
-        id: card
-        visible: root.entries.next !== null
+      // One pane, or two side by side with a hairline between them.
+      Row {
+        id: panes
+        visible: root.mode === "agenda"
         width: parent.width
-        implicitHeight: cardColumn.implicitHeight + Style.spacing.xl * 2
-        bordered: true
-        foreground: root.textColor
-        hasCursor: root.entries.next !== null && root.selected === 0
-        onHasCursorChanged: if (hasCursor) root.reveal(card, card)
 
-        readonly property var next: root.view ? root.view.next : null
+        Repeater {
+          model: root.mode === "agenda" ? root.model.panes : []
 
-        MouseArea {
-          id: cardMouse
-          anchors.fill: parent
-          hoverEnabled: true
-          cursorShape: Qt.PointingHandCursor
-          onPositionChanged: function(mouse) { root.pointed(0, cardMouse, mouse) }
-          onClicked: if (card.next) root.openItem(card.next.item)
-        }
+          Row {
+            id: paneSlot
+            required property var modelData
+            required property int index
 
-        Column {
-          id: cardColumn
-          anchors.left: parent.left
-          anchors.right: parent.right
-          anchors.verticalCenter: parent.verticalCenter
-          anchors.leftMargin: Style.spacing.xl
-          anchors.rightMargin: Style.spacing.xl
-          spacing: Style.spacing.xs
-          opacity: card.next && root.isPending(card.next.item) ? 0.45 : 1
+            Item {
+              visible: paneSlot.index > 0
+              width: root.paneGap * 2 + 1
 
-          RowLayout {
-            width: parent.width
-            PlainText {
-              Layout.fillWidth: true
-              text: card.next && card.next.state === "now" ? "NOW" : "NEXT UP"
-              color: Commons.Color.accent
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              font.bold: true
-              font.letterSpacing: Style.spaceReal(1)
-            }
-            PlainText {
-              visible: card.hasCursor
-              text: root.enterGlyph + " Open in Emacs"
-              color: root.mutedColor
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-            }
-          }
-
-          PlainText {
-            width: parent.width
-            text: card.next ? card.next.item.title : ""
-            color: root.textColor
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.heading
-            font.bold: true
-          }
-
-          PlainText {
-            width: parent.width
-            text: card.next && root.view ? Model.nextMeta(card.next, root.view.nowMin) : ""
-            color: root.mutedColor
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.bodySmall
-          }
-
-          Loader {
-            id: cardPicker
-            property int indent: 0
-            active: root.pickerKey === "next"
-            visible: active
-            width: parent.width
-            sourceComponent: pickerComponent
-            onLoaded: root.reveal(card, card)
-          }
-        }
-      }
-
-      Repeater {
-        model: root.entries.sections
-
-        Column {
-          id: sectionBlock
-          required property var modelData
-          width: body.width
-          spacing: Style.spacing.xxs
-
-          Item {
-            width: parent.width
-            implicitHeight: sectionTitle.implicitHeight + Style.spacing.xs
-
-            RowLayout {
-              anchors.fill: parent
-              anchors.leftMargin: Style.spacing.md
-              anchors.rightMargin: Style.spacing.md
-              spacing: Style.spacing.md
-
-              PanelSectionHeader {
-                id: sectionTitle
-                Layout.alignment: Qt.AlignVCenter
-                text: sectionBlock.modelData.title.toUpperCase()
-                foreground: root.textColor
-                fontFamily: root.fontFamily
-                font.letterSpacing: Style.spaceReal(1)
+              Rectangle {
+                x: root.paneGap
+                width: 1
+                height: panes.height
+                color: Util.alpha(root.textColor, 0.12)
               }
+            }
+
+            Column {
+              width: root.paneWidth
+              spacing: Style.spacing.xs
 
               PlainText {
-                Layout.alignment: Qt.AlignVCenter
-                text: String(sectionBlock.modelData.count)
-                color: sectionBlock.modelData.key === "overdue" ? Commons.Color.urgent : root.mutedColor
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                font.bold: true
-              }
-
-              PlainText {
-                Layout.fillWidth: true
-                Layout.alignment: Qt.AlignVCenter
-                horizontalAlignment: Text.AlignRight
-                text: sectionBlock.modelData.hint
+                visible: paneSlot.modelData.title !== ""
+                leftPadding: Style.spacing.md
+                text: paneSlot.modelData.title.toUpperCase()
                 color: root.mutedColor
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
-              }
-            }
-          }
-
-          Repeater {
-            model: sectionBlock.modelData.rows
-
-            // The row, and its state picker right under it while open.
-            Column {
-              id: rowBlock
-              required property var modelData
-              required property int index
-              width: sectionBlock.width
-
-              AgendaRow {
-                id: row
-                width: parent.width
-                item: rowBlock.modelData.item
-                payload: root.payload
-                fontFamily: root.fontFamily
-                leadWidth: root.leadWidth
-                hasCursor: root.selected === rowBlock.modelData.sel
-                stateEnabled: root.canPick(rowBlock.modelData.item)
-                pending: root.isPending(rowBlock.modelData.item)
-                onHasCursorChanged: if (hasCursor) root.reveal(rowBlock.index === 0 ? sectionBlock : row, row)
-                onPointerMoved: function(area, mouse) { root.pointed(rowBlock.modelData.sel, area, mouse) }
-                onActivated: root.openItem(rowBlock.modelData.item)
-                onKeywordClicked: root.togglePicker(rowBlock.modelData.sel)
+                font.letterSpacing: Style.spaceReal(1.5)
               }
 
-              Loader {
-                id: rowPicker
-                property int indent: root.pickerIndent
-                active: root.pickerKey === rowBlock.modelData.key
-                visible: active
+              BlockList {
                 width: parent.width
-                sourceComponent: pickerComponent
-                onLoaded: root.reveal(row, rowPicker)
+                panel: root
+                blocks: paneSlot.modelData.blocks
               }
             }
           }
@@ -475,7 +723,7 @@ PanelKeyCatcher {
         topPadding: Style.spacing.huge
         bottomPadding: Style.spacing.huge
         horizontalAlignment: Text.AlignHCenter
-        text: root.mode === "loading" ? "Loading agenda…" : "Nothing on the agenda today"
+        text: root.mode === "loading" ? "Loading agenda…" : "Nothing on the agenda this week"
         color: root.mutedColor
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
@@ -592,7 +840,7 @@ PanelKeyCatcher {
     }
 
     PlainText {
-      visible: root.mode === "agenda" || root.mode === "empty"
+      visible: root.hasAgenda
       width: parent.width
       text: root.view ? Model.footerLine(root.view) : ""
       color: root.mutedColor
@@ -603,9 +851,7 @@ PanelKeyCatcher {
     PlainText {
       width: parent.width
       text: root.pickerOpen ? Model.pickerHint(root.stateChoices, root.enterGlyph)
-        : root.mode === "agenda"
-        ? "↑↓ move · " + root.enterGlyph + " open" + (root.stateChoices.length > 0 ? " · t state" : "")
-          + " · r refresh · esc close"
+        : root.hasAgenda ? Model.layoutHints(root.layout).replace("↵", root.enterGlyph)
         : "r refresh · esc close"
       color: root.mutedColor
       font.family: root.fontFamily
@@ -613,10 +859,11 @@ PanelKeyCatcher {
     }
   }
 
-  // Loaded under the row (or inside the next-up card) whose key is
-  // `pickerKey`; the Loader's `indent` lines the chips up with its content.
+  // Loaded under the row (or inside the next-up card, or under the habit
+  // chips) whose key is `pickerKey`; the Loader's `indent` lines the chips
+  // up with its content.
   Component {
-    id: pickerComponent
+    id: pickerComponentDef
 
     Item {
       id: pickerHost
@@ -650,12 +897,16 @@ PanelKeyCatcher {
   component TextAction: BorderSurface {
     id: action
     property string label: ""
+    property string tip: ""
     property string fontFamily: Style.font.family
+    property int labelSize: Style.font.bodySmall
+    // An icon button: as wide as it is high.
+    property bool square: false
     readonly property color ink: Commons.Color.popups.text
     signal clicked()
 
-    implicitWidth: actionLabel.implicitWidth + Style.spacing.controlPaddingX * 2
-    implicitHeight: Math.max(Style.space(22), actionLabel.implicitHeight + Style.spacing.xs * 2)
+    implicitWidth: square ? implicitHeight : actionLabel.implicitWidth + Style.spacing.lg * 2
+    implicitHeight: Style.space(24)
     radius: Style.cornerRadius
     color: actionMouse.containsMouse ? Style.hoverFillFor(ink, Commons.Color.accent) : "transparent"
     borderSpec: Border.controlSpec(actionMouse.containsMouse ? "hover-cursor" : "normal", ink, Commons.Color.accent)
@@ -666,7 +917,7 @@ PanelKeyCatcher {
       text: action.label
       color: action.ink
       font.family: action.fontFamily
-      font.pixelSize: Style.font.bodySmall
+      font.pixelSize: action.labelSize
     }
 
     MouseArea {
@@ -675,6 +926,56 @@ PanelKeyCatcher {
       hoverEnabled: true
       cursorShape: Qt.PointingHandCursor
       onClicked: action.clicked()
+    }
+
+    PanelToolTip {
+      visible: action.tip !== "" && actionMouse.containsMouse
+      text: action.tip
+      fontFamily: action.fontFamily
+    }
+  }
+
+  // ‹ or › of the week navigator.
+  component NavArrow: Item {
+    id: arrow
+    property string glyph: ""
+    property string tip: ""
+    property string fontFamily: Style.font.family
+    readonly property color ink: Commons.Color.popups.text
+    signal clicked()
+
+    Layout.alignment: Qt.AlignVCenter
+    implicitWidth: Math.max(Style.space(16), arrowText.implicitWidth + Style.spacing.sm * 2)
+    implicitHeight: Style.space(22)
+
+    Rectangle {
+      anchors.fill: parent
+      radius: Style.cornerRadius
+      color: arrowMouse.containsMouse ? Style.hoverFillFor(arrow.ink, Commons.Color.accent) : "transparent"
+    }
+
+    PlainText {
+      id: arrowText
+      anchors.centerIn: parent
+      text: arrow.glyph
+      color: arrow.ink
+      font.family: arrow.fontFamily
+      font.pixelSize: Style.font.title
+      font.bold: true
+    }
+
+    MouseArea {
+      id: arrowMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: arrow.clicked()
+    }
+
+    PanelToolTip {
+      visible: arrow.tip !== "" && arrowMouse.containsMouse
+      text: arrow.tip
+      fontFamily: arrow.fontFamily
     }
   }
 }
