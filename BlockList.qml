@@ -12,7 +12,8 @@ import "Model.js" as Model
 //   day      Org's day line ("Wednesday  14 October 2026  TODAY  W42") or a
 //            compact one ("THU 15 · nothing scheduled")
 //   now      Org's now line
-//   row      an entry: OrgRow (style "org") or AgendaRow (style "list")
+//   row      an entry: OrgRow (style "org") or AgendaRow (style "list"),
+//            tinted while Org's clock runs on it (`clocked`)
 //   chips    habits as a wrapping row of chips
 //   message  a muted or error line (a week loading or failing)
 // Everything stateful (the cursor, the picker, opening, revealing) is the
@@ -327,6 +328,9 @@ Column {
         tones: list.panel.tones
         fontFamily: list.panel.fontFamily
         cellWidth: list.panel.orgCell
+        clocked: !!rowBlock.block && rowBlock.block.clocked === true
+        clock: rowBlock.block && rowBlock.block.clock ? rowBlock.block.clock : ""
+        clockColor: list.panel.clockColor
         hasCursor: !!rowBlock.block && list.panel.selected === rowBlock.block.sel
         stateEnabled: list.panel.canPick(item)
         pending: list.panel.isPending(item)
@@ -371,6 +375,7 @@ Column {
         tones: list.panel.tones
         fontFamily: list.panel.fontFamily
         leadWidth: list.panel.leadWidth
+        clocked: !!rowBlock.block && rowBlock.block.clocked === true
         hasCursor: !!rowBlock.block && list.panel.selected === rowBlock.block.sel
         stateEnabled: list.panel.canPick(item)
         pending: list.panel.isPending(item)
@@ -420,6 +425,9 @@ Column {
             implicitHeight: chipRow.implicitHeight + Style.spacing.xs * 2
             bordered: true
             foreground: list.textColor
+            // The clocked habit is tinted like a clocked row.
+            color: hasCursor ? fill
+              : chip.modelData.clocked === true ? Util.alpha(Commons.Color.accent, 0.12) : "transparent"
             hasCursor: list.panel.selected === modelData.sel
             onHasCursorChanged: if (hasCursor) list.panel.reveal(chip, chip)
             Component.onCompleted: if (hasCursor) list.panel.reveal(chip, chip)

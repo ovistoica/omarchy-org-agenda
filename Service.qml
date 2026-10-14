@@ -11,8 +11,9 @@ import "Model.js" as Model
 // timers only run for a retry after a failed pull and as a watchdog
 // while a pull, a week fetch or a state change is in flight. Another Org
 // week comes back on emacsclient's stdout when the popout asks for it
-// (fetchWeek). A state change is the only write, and only the popout's
-// picker starts one; there is no IPC for it.
+// (fetchWeek). State changes and timer actions (clock in/out/cancel,
+// pomodoro) are the only writes, and only the popout starts them; there
+// is no IPC for them.
 Item {
   id: root
 
@@ -36,7 +37,11 @@ Item {
   property string status: "loading"
   property string detail: ""
   property int pullCount: 0
-  readonly property var view: Model.view(payload, status, detail, clock.date, settings)
+  // The view's time: the minute tick's, and a new agenda's arrival time, so
+  // a timer that just started or changed is counted from now, not from the
+  // last whole minute.
+  property var now: new Date()
+  readonly property var view: Model.view(payload, status, detail, now, settings)
 
   // Pull bookkeeping. A trigger that lands mid-pull is coalesced into one
   // follow-up pull, so a burst of triggers costs at most two emacsclients.
@@ -56,6 +61,14 @@ Item {
   property bool stateStarted: false
   property bool stateTimedOut: false
 
+  // Timer actions (clock in/out/cancel, pomodoro): one at a time, their
+  // outcome on the same result line. `actionName` is actionMessage's
+  // (in, out, cancel, start, break, stop).
+  property bool actionBusy: false
+  property string actionName: ""
+  property bool actionStarted: false
+  property bool actionTimedOut: false
+
   // Another Org week, fetched on demand for the popout (`f`/`b`): `week` is
   // the last one fetched (a normalized payload with weekOffset/weekStart),
   // `weekError` why the last fetch failed. A fetch asked for mid-fetch only
@@ -71,6 +84,9 @@ Item {
   // Emacs needs the user now (a note to write, or a hook asking something):
   // the popout should get out of the way.
   signal stateNeedsEmacs()
+  // org-pomodoro wants its stop confirmed (the popout's P raced a state
+  // change in Emacs): the popout asks.
+  signal pomodoroNeedsConfirm()
 
   function errorText(e) { return String(e && e.message ? e.message : e) }
 
@@ -180,6 +196,7 @@ Item {
     if (Model.isNewDay(parsed.value, new Date())) return
     // A week's offset counts from the day it was fetched on.
     if (payload && payload.date !== parsed.value.date) week = null
+    now = new Date()
     payload = parsed.value
     // Also covers a push arriving while we thought Emacs was offline.
     status = parsed.value.error ? "error" : "ok"
@@ -303,10 +320,13 @@ Item {
 
   function clearStateResult() { stateResult = null }
 
-  function showStateResult(value, message) {
-    stateResult = { key: stateItemKey, keyword: stateKeyword, value: value,
-                    text: message.text, tone: message.tone }
+  // The result line, shared by state changes and timer actions (whose key
+  // and keyword are "").
+  function showResult(key, keyword, value, message) {
+    stateResult = { key: key, keyword: keyword, value: value, text: message.text, tone: message.tone }
   }
+
+  function showStateResult(value, message) { showResult(stateItemKey, stateKeyword, value, message) }
 
   function stateFailed(why) {
     console.warn("org-agenda: state change failed:", why)
@@ -401,6 +421,116 @@ Item {
     noteTaker.running = true
   }
 
+  // ---- timer actions: Org's clock and org-pomodoro. Emacs never prompts
+  // for them (it answers needs-emacs instead); this runs the call and puts
+  // its answer on the result line, as a state change does.
+
+  function clockIn(item) {
+    runAction("in", function() { return Model.clockInForm(item, root.payloadOf(item), root.elispFile) })
+  }
+
+  function clockOut() { runAction("out", function() { return Model.clockOutForm(root.elispFile) }) }
+
+  function clockCancel() { runAction("cancel", function() { return Model.clockCancelForm(root.elispFile) }) }
+
+  // P: start on `item`; without one, end the overtime into its break
+  // (confirm false) or stop a running pomodoro or break (confirm true).
+  function pomodoro(item, confirm) {
+    var it = item || null
+    runAction(it ? "start" : confirm ? "stop" : "break", function() {
+      return Model.pomodoroForm(it, it ? root.payloadOf(it) : root.payload, confirm === true, root.elispFile)
+    })
+  }
+
+  // J: the clocked entry in Emacs; its file at the line if the jump fails.
+  function clockGoto() {
+    try {
+      launch(Model.clockGotoForm(elispFile), Model.clockFallbackArgs(settings, payload))
+    } catch (e) {
+      console.warn("org-agenda: cannot jump to the clock:", errorText(e))
+    }
+  }
+
+  function actionFailed(why) {
+    console.warn("org-agenda: timer " + actionName + " failed:", why)
+    showResult("", "", null, Model.actionMessage(actionName, { result: "error", detail: why }))
+  }
+
+  function runAction(name, buildForm) {
+    if (actionBusy || actor.running) {
+      console.warn("org-agenda: a timer action is already in progress")
+      showResult("", "", null, { text: "Emacs is still on the last action; try again in a moment", tone: "warn" })
+      return
+    }
+    actionName = name
+    var argv
+    try {
+      argv = Model.clientArgs(settings).concat(["--eval", buildForm()])
+    } catch (e) {
+      actionFailed(errorText(e))
+      return
+    }
+    console.log("org-agenda: timer " + name)
+    stateResult = null
+    actionStarted = false
+    actionTimedOut = false
+    actionBusy = true
+    actor.command = argv
+    // Armed before starting: a failed start may be reported synchronously.
+    actionWatchdog.restart()
+    actor.running = true
+  }
+
+  function actionExited(code) {
+    actionWatchdog.stop()
+    actionBusy = false
+    if (actionTimedOut) {
+      console.warn("org-agenda: timer " + actionName + " timed out")
+      showResult("", "", null, { text: "Emacs didn't answer. It may be asking you something.", tone: "warn" })
+      focusEmacs()
+      stateNeedsEmacs()
+      return
+    }
+    if (code !== 0) {
+      var err = String(actErr.text || "").trim()
+      if (Model.isNoServer(err)) {
+        console.warn("org-agenda: timer " + actionName + ": no server")
+        showResult("", "", null, { text: "Can't reach your Emacs server", tone: "error" })
+      } else {
+        actionFailed(Model.bounded(err || ("emacsclient exited with code " + code), 200))
+      }
+      return
+    }
+    var parsed = Model.parseActionResult(actOut.text)
+    if (!parsed.ok) console.warn("org-agenda: timer " + actionName + ": unexpected answer:", parsed.reason)
+    var value = parsed.ok ? parsed.value : null
+    var result = value ? value.result : ""
+    if (result === "confirm") {
+      pomodoroNeedsConfirm()
+      return
+    }
+    showResult("", "", value, Model.actionMessage(actionName, value))
+    // With pushUpdates off, nothing else tells the bar the clock changed.
+    if (!settings.pushUpdates && ["done", "note", "note-frame", "changed", "not-clocking"].indexOf(result) >= 0)
+      pull("timer")
+    if (result === "note") {
+      focusEmacs()
+      stateNeedsEmacs()
+    } else if (result === "note-frame") {
+      takeNote()
+      stateNeedsEmacs()
+    }
+  }
+
+  function actionFailedToStart() {
+    actionWatchdog.stop()
+    actionBusy = false
+    var bin = actor.command[0] || "emacsclient"
+    console.warn("org-agenda: timer " + actionName + ": couldn't run", bin)
+    showResult("", "", null, { text: Model.plain("Couldn't run " + Model.bounded(bin, 100) + " — check the emacsclient setting"),
+                               tone: "error" })
+  }
+
   Process {
     id: puller
     stderr: StdioCollector { id: pullErr }
@@ -439,12 +569,15 @@ Item {
     onLoaded: root.load(text())
   }
 
-  // A clock, not a poll: the view's "next"/"now" follows the minute, and
-  // Emacs is only asked again when the date rolls over.
+  // A clock, not a poll: the view's "next"/"now" and a running timer's
+  // minutes (bar, tooltip, rows, strip) follow the minute, and Emacs is
+  // only asked again when the date rolls over. It reads the wall clock
+  // only; the timers' start and end times come from Emacs' pushes.
   SystemClock {
     id: clock
     precision: SystemClock.Minutes
     onDateChanged: {
+      root.now = new Date()
       var day = Qt.formatDate(date, "yyyy-MM-dd")
       if (Model.isNewDay(root.payload, date) && root.midnightPulledFor !== day) {
         root.midnightPulledFor = day
@@ -489,6 +622,27 @@ Item {
       if (!setter.running) return
       root.stateTimedOut = true
       setter.signal(15)
+    }
+  }
+
+  Process {
+    id: actor
+    stdout: StdioCollector { id: actOut }
+    stderr: StdioCollector { id: actErr }
+    onStarted: root.actionStarted = true
+    onExited: function(exitCode, exitStatus) { root.actionExited(exitCode) }
+    onRunningChanged: if (!running && !root.actionStarted && root.actionBusy) root.actionFailedToStart()
+  }
+
+  // Same bound as a state change.
+  Timer {
+    id: actionWatchdog
+    interval: (root.settings.timeoutSeconds + 2) * 1000
+    repeat: false
+    onTriggered: {
+      if (!actor.running) return
+      root.actionTimedOut = true
+      actor.signal(15)
     }
   }
 
@@ -544,7 +698,12 @@ Item {
         generatedAt: root.payload ? root.payload.generatedAt : "",
         reason: root.payload ? root.payload.reason : "",
         outputFile: root.outputFile,
-        settings: root.settings
+        settings: root.settings,
+        // Whether timers run; never their titles or paths.
+        clock: {
+          active: !!root.payload && !!root.payload.clock,
+          pomodoro: root.payload && root.payload.pomodoro ? root.payload.pomodoro.state : "none"
+        }
       })
     }
   }

@@ -34,7 +34,15 @@ Ui.Panel {
   readonly property color urgentColor: bar ? bar.urgent : Commons.Color.urgent
 
   readonly property string mode: label.mode
-  readonly property bool showsText: ["next", "now", "today", "count"].indexOf(mode) >= 0
+  readonly property bool showsText: ["next", "now", "today", "count", "timer"].indexOf(mode) >= 0
+  // A running clock or pomodoro, {glyph, time, tone}, in every label mode:
+  // before the title in Next item, instead of the count in Count, after
+  // the icon in Icon.
+  readonly property var timer: label.timer ? label.timer : null
+  readonly property color timerColor: !timer ? foreground
+    : timer.tone === "urgent" ? urgentColor
+    : timer.tone === "accent" ? Commons.Color.accent
+    : foreground
   // Nerd Font MD: calendar-check normally, calendar-remove when Emacs is gone.
   readonly property string glyph: String.fromCodePoint(mode === "offline" ? 0xf00f4 : 0xf00ef)
   readonly property color glyphColor: mode === "error" ? urgentColor : foreground
@@ -143,6 +151,19 @@ Ui.Panel {
         color: root.urgentColor
       }
 
+      // ◷ 0:23 / ● 13m: tabular digits, so the minute ticking by never
+      // shifts what follows.
+      PlainText {
+        visible: root.timer !== null
+        anchors.verticalCenter: parent.verticalCenter
+        text: root.timer ? root.timer.glyph + " " + root.timer.time : ""
+        color: root.timerColor
+        font.family: button.fontFamily
+        font.pixelSize: button.fontSize
+        font.bold: true
+        font.features: { "tnum": 1 }
+      }
+
       PlainText {
         visible: root.mode === "now"
         anchors.verticalCenter: parent.verticalCenter
@@ -188,13 +209,16 @@ Ui.Panel {
         font.pixelSize: Style.bar.iconFont
       }
 
+      // The count, or a running timer's time (no title: the column is narrow).
       PlainText {
-        visible: root.showsText && root.view !== null
+        visible: (root.showsText || root.timer !== null) && root.view !== null
         width: button.width
         height: Style.bar.iconSlot
         horizontalAlignment: Text.AlignHCenter
-        text: root.view ? String(root.view.openToday) : ""
-        color: root.foreground
+        text: root.timer ? root.timer.time : root.view ? String(root.view.openToday) : ""
+        color: root.timerColor
+        font.bold: root.timer !== null
+        font.features: { "tnum": 1 }
         font.family: button.fontFamily
         font.pixelSize: button.fontSize
       }

@@ -27,6 +27,11 @@ CursorSurface {
   property int cellWidth: Style.space(84)
   property bool stateEnabled: false
   property bool pending: false
+  // The entry Org's clock runs on: tinted like org-agenda-clocking, with
+  // its time (`clock`, "◷ 0:23") at the right end in `clockColor`.
+  property bool clocked: false
+  property string clock: ""
+  property color clockColor: Commons.Color.accent
 
   signal pointerMoved(var area, var mouse)
   signal activated()
@@ -43,6 +48,8 @@ CursorSurface {
   function trimmed(s) { return String(s || "").replace(/\s+$/, "") }
 
   foreground: textColor
+  // The cursor's highlight wins over the clock's tint.
+  color: hasCursor ? fill : clocked ? Util.alpha(Commons.Color.accent, 0.12) : "transparent"
   implicitHeight: Style.space(22)
 
   MouseArea {
@@ -117,6 +124,18 @@ CursorSurface {
       font.family: root.fontFamily
       font.pixelSize: Style.font.body
       font.strikeout: root.done
+    }
+
+    PlainText {
+      visible: root.clock !== ""
+      Layout.alignment: Qt.AlignVCenter
+      Layout.leftMargin: Style.spacing.lg
+      text: root.clock
+      color: root.clockColor
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.body
+      font.bold: true
+      font.features: { "tnum": 1 }
     }
 
     PlainText {

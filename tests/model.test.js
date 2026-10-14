@@ -19,7 +19,7 @@ const M = new Function(src + "; return { PROTOCOL, MAX_ITEMS, MAX_TITLE, ID_RE, 
   " orgCategory, orgLeader, orgWhen, orgDayTitle, isoWeek, compactDayTitle, browseOffset, weekNav," +
   " weekWanted, layoutModel, paneSel, tabStep, tabAt, overdueFocus, overdueUi, layoutHints, keyAction," +
   " payloadFor, timerState, pomodoroStep, clockInForm, clockOutForm, clockCancelForm, clockGotoForm," +
-  " pomodoroForm, parseActionResult, actionMessage }")()
+  " pomodoroForm, parseActionResult, actionMessage, clockFallbackArgs }")()
 
 let failed = 0
 let count = 0
@@ -1414,6 +1414,13 @@ eq(M.timerState(Object.assign({}, TV(clockAt({})), { payload: Object.assign({}, 
   eq([M.clockOutForm(ELISP), M.clockCancelForm(ELISP), M.clockGotoForm(ELISP)],
      ["(progn " + PRE + " (omarchy-org-agenda-clock-out))", "(progn " + PRE + " (omarchy-org-agenda-clock-cancel))",
       "(progn " + PRE + " (omarchy-org-agenda-clock-goto))"], "clock out/cancel/goto forms")
+  const clocked = c => parsed(timerPayload(c)).value
+  eq([M.clockFallbackArgs({ socketName: "work" }, clocked(clockAt({}))),
+      M.clockFallbackArgs({}, clocked(clockAt({ path: "rel.org" }))),
+      M.clockFallbackArgs({}, clocked(clockAt({ line: 0 }))),
+      M.clockFallbackArgs({}, clocked(null)), M.clockFallbackArgs({}, null)],
+     [["emacsclient", "-s", "work", "-w", "5", "-r", "-n", "+130", "/home/u/org/cal.org"], null, null, null, null],
+     "clockFallbackArgs: the clock's file and line, else null")
   eq([M.pomodoroForm(task, sp, false, ELISP), M.pomodoroForm(sp.items[4], sp, true, ELISP).split(PRE)[1],
       M.pomodoroForm(null, sp, true, ELISP).split(PRE)[1], M.pomodoroForm(undefined, null, false, ELISP).split(PRE)[1],
       M.pomodoroForm(null, null, "yes", ELISP).split(PRE)[1]],

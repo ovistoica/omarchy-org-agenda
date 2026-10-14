@@ -637,6 +637,14 @@ function fallbackOpenArgs(settings, item, payload) {
   return clientArgs(settings).concat(["-r", "-n", "+" + it.line, it.path])
 }
 
+// J's fallback: the clocked entry's file at its line, as fallbackOpenArgs
+// opens a row; null when the clock reported no place (or none runs).
+function clockFallbackArgs(settings, payload) {
+  const c = isObj(payload) && isObj(payload.clock) ? payload.clock : null
+  return c && isAbsPath(c.path) && Number.isSafeInteger(c.line) && c.line > 0
+    ? clientArgs(settings).concat(["-r", "-n", "+" + c.line, c.path]) : null
+}
+
 // ---------------------------------------------------------------- state change
 
 function isKeyword(k) { return isStr(k) && KEYWORD_RE.test(k) }

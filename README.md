@@ -105,6 +105,11 @@ the widget's settings.
 | `v`                            | Next layout                                   |
 | `1` `2` `3`, `←` `→` (Tabs)    | Today, Week, Overdue                          |
 | `←` `→` (Columns)              | The other column, at the same position        |
+| `I`                            | Clock in the entry (see Timers)               |
+| `O`                            | Clock out                                     |
+| `X`                            | Cancel the clock, at once, as in Org's agenda |
+| `J`                            | Jump to the clocked entry in Emacs            |
+| `P`                            | org-pomodoro's next step (when installed)     |
 | `r`                            | Refresh                                       |
 | `Esc`                          | Close                                         |
 
@@ -161,11 +166,62 @@ What happens next:
 - If Emacs doesn't answer (say one of your hooks asks a question), the
   bar focuses Emacs so you can answer it there.
 
+**Timers**
+
+Org's clock works for everyone; org-pomodoro adds pomodoros when it is
+installed.
+
+- While a clock runs, a strip under the popout's header shows it in
+  every layout: `CLOCKED IN`, the entry, the time (`0:23 / 1:00 effort`
+  when the entry has an Effort, with a progress bar) and the `Out`,
+  `Jump` and `●` controls. Click the entry's name to jump to it.
+- The clocked entry is tinted in the list and shows its time on the
+  right, like Org's own clocking highlight.
+- The bar shows `◷ 0:23 Title` instead of the next entry. With the
+  `Count` and `Icon` labels it shows only the time, so titles stay off
+  the bar. Past the effort, the time turns red.
+
+![The Org layout with a clock running: the strip under the header and the tinted entry](docs/screenshot-popout-clock.png)
+
+![The bar with a clock running](docs/screenshot-bar-clock.png)
+
+The keys are Org's agenda keys: `I` clocks in the selected entry, `O`
+clocks out, `X` cancels the clock at once (its `CLOCK:` line is
+removed, as in Org's agenda), and `J` shows the clocked entry in Emacs
+and closes the popout.
+
+With [org-pomodoro](https://github.com/marcinkoziej/org-pomodoro):
+
+- `P` and the `●` control appear only when org-pomodoro is installed.
+  The plugin never loads it just to check; it is loaded the first time
+  you press `P`, as `M-x org-pomodoro` would load it.
+- `P` starts a pomodoro on the selected entry, including the entry that
+  is already clocked. The strip turns red and counts down
+  (`POMODORO 2 · 12:41 left`), and the bar shows `● 13m Title`.
+- In overtime, `P` ends the pomodoro and starts the break.
+- On a running pomodoro or break, `P` stops it. When
+  `org-pomodoro-ask-upon-killing` is set (its default), the footer asks
+  "Stop the pomodoro? P again" first; any other key keeps it running.
+- The pomodoro count starts again once `org-pomodoro-expiry-time` has
+  passed since the last one, which is what org-pomodoro's own question
+  asks.
+
+![A pomodoro running on the clocked entry](docs/screenshot-popout-pomodoro.png)
+
+When Org would ask something (a dangling clock to resolve, say), the
+popout changes nothing and says "Org wants to ask: … — do it in Emacs".
+Do it there, then come back.
+
+The strip, rows and bar follow the minute on their own; while the popout
+is open, a pomodoro or break counts down by the second. Changes made in
+Emacs reach the bar through the same pushes as the rest of the agenda,
+so they need `pushUpdates` on.
+
 **IPC**
 
 ```sh
 omarchy-shell ovistoica.org-agenda refresh   # re-export now
-omarchy-shell ovistoica.org-agenda status    # status, item count, settings as JSON
+omarchy-shell ovistoica.org-agenda status    # status, item count, settings, whether a timer runs, as JSON
 omarchy-shell shell toggle ovistoica.org-agenda '{}'   # open/close the popout
 ```
 
@@ -236,10 +292,16 @@ that directory is a symlink or belongs to someone else.
 - It defines only functions and variables prefixed `omarchy-org-agenda-`.
 - With `pushUpdates` on, it adds functions to `after-save-hook`,
   `after-revert-hook`, `org-after-todo-state-change-hook` and
-  `org-agenda-finalize-hook`, and a variable watcher on
-  `org-agenda-files`. Set `pushUpdates` to `false` and they are removed;
-  the bar then refreshes when you open the popout (if the agenda is over
-  a minute old), on right click, at midnight and after a state change.
+  `org-agenda-finalize-hook`, Org's clock hooks (`org-clock-in-hook`,
+  `org-clock-out-hook`, `org-clock-cancel-hook`) and org-pomodoro's state
+  hooks, and a variable watcher on `org-agenda-files`. Set `pushUpdates`
+  to `false` and they are removed; the bar then refreshes when you open
+  the popout (if the agenda is over a minute old), on right click, at
+  midnight and after a state change or a timer action from the popout.
+- Clocking from the popout calls Org's own `org-clock-in`,
+  `org-clock-out` and `org-clock-cancel`, and pomodoros use
+  org-pomodoro's own steps, after checking the entry is still the one
+  the bar showed.
 - A state change from the popout calls `org-todo` on the heading, after
   checking it is still the entry the bar showed.
 - While a note started from the bar is pending, a temporary advice on
@@ -294,8 +356,8 @@ Security notes:
   styled text are never used, so markup in a heading stays literal.
 - The `--eval` forms sent to Emacs are built only in `Model.js`, from
   validated paths, line numbers and IDs, and keywords from the export.
-- Only the popout's picker changes a state; there is no IPC command for
-  it.
+- Only the popout changes a state or a clock; there is no IPC command
+  for either.
 - `emacsclient` is always run with an argument vector, never through a
   shell.
 

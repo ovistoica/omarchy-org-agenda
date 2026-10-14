@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import Quickshell
 import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
@@ -24,6 +25,11 @@ import "Model.js" as Model
 // `t` (or a click on a row's keyword) opens the state picker under the
 // selected entry. While it is open every key goes to it first (forwarded
 // below), except ↑↓, which close it and move on.
+//
+// While Org's clock or an org-pomodoro phase runs, a strip under the
+// header shows it in every layout (Model.timerState), with Out, Jump and
+// ● controls. I O X J P act on it as in Org's agenda; stopping a pomodoro
+// asks first (`confirming`) when org-pomodoro would.
 PanelKeyCatcher {
   id: root
 
@@ -70,9 +76,44 @@ PanelKeyCatcher {
     normal: textColor,
     muted: mutedColor,
     urgent: urgentColor,
+    accent: Commons.Color.accent,
     late: warmer(urgentColor, 0.06, urgentColor),
     soon: warmer(urgentColor, 0.11, textColor)
   })
+
+  // ---- timers. Only with an agenda that is current (status ok): an old
+  // clock may have stopped since.
+  readonly property bool timersLive: !!view && view.status === "ok" && !!payload
+  readonly property bool clocking: timersLive && !!payload.clock
+  readonly property var pomodoroInfo: timersLive && payload.pomodoro ? payload.pomodoro : null
+  readonly property bool pomodoroAvailable: !!pomodoroInfo && pomodoroInfo.available === true
+  readonly property string pomodoroState: pomodoroInfo ? pomodoroInfo.state : "none"
+  // P's stop question is open: the footer asks, P again stops.
+  property bool confirming: false
+  readonly property string pomodoroStep: Model.pomodoroStep(view, confirming) || ""
+  readonly property var selectedItem: rows[selected] ? rows[selected].item : null
+  // Seconds only while the popout is open and a pomodoro or break counts;
+  // the view's own timer moves by the minute.
+  readonly property bool countsSeconds: shown && !!view && !!view.timer && view.timer.kind !== "clock"
+  readonly property var timer: !view || !view.timer ? null
+    : secondsClock.enabled ? Model.timerState(view, secondsClock.date, true) : view.timer
+  readonly property color stripColor: timer && tones[timer.tone] !== undefined ? tones[timer.tone] : Commons.Color.accent
+  // The clocked Org row's time, in the colour of its list-row trail.
+  readonly property color clockColor: view && view.timer && tones[view.timer.tone] !== undefined
+    ? tones[view.timer.tone] : Commons.Color.accent
+  readonly property string confirmText: Model.actionMessage("stop", { result: "confirm" }).text
+
+  onPomodoroStateChanged: confirming = false
+  onLayoutChanged: confirming = false
+  onTabChanged: confirming = false
+  onOffsetChanged: confirming = false
+
+  // A wall clock, not a poll: it reads the time and never calls Emacs.
+  SystemClock {
+    id: secondsClock
+    precision: SystemClock.Seconds
+    enabled: root.countsSeconds
+  }
 
   readonly property var payload: view ? view.payload : null
   readonly property var weekPayload: service ? service.week : null
@@ -118,6 +159,7 @@ PanelKeyCatcher {
   readonly property Component pickerComponent: pickerComponentDef
 
   implicitHeight: header.implicitHeight
+    + (strip.visible ? Style.spacing.lg + strip.implicitHeight : 0)
     + (tabBar.visible ? Style.spacing.lg + tabBar.implicitHeight : 0)
     + bodyGap + body.implicitHeight + bodyGap + footer.implicitHeight
 
@@ -139,9 +181,13 @@ PanelKeyCatcher {
     scroll.contentY = 0
     closePicker()
     clearResult()
+    confirming = false
   }
 
-  onShownChanged: if (!shown) offset = 0
+  onShownChanged: if (!shown) {
+    offset = 0
+    confirming = false
+  }
 
   onRowKeysChanged: {
     selected = Model.refocus(shownKeys, rowKeys, selected)
@@ -178,6 +224,7 @@ PanelKeyCatcher {
       return
     }
     clearResult()
+    confirming = false
     followSelection = true
     selected = sel
     pickerEntry = Model.entryKey(row.item)
@@ -231,6 +278,11 @@ PanelKeyCatcher {
   Connections {
     target: root.service
     function onStateNeedsEmacs() { root.closeRequested() }
+    // P raced a change in Emacs: it now wants the stop confirmed.
+    function onPomodoroNeedsConfirm() {
+      root.clearResult()
+      root.confirming = true
+    }
     // A push or a pull may have changed the week being browsed too.
     function onPayloadChanged() {
       if (root.shown && root.offset !== 0 && root.hasAgenda) root.service.fetchWeek(root.offset)
@@ -246,9 +298,15 @@ PanelKeyCatcher {
   onTextKey: function(t) { root.dispatch("", t) }
 
   function dispatch(key, text) {
-    var a = Model.keyAction({ layout: layout, tab: tab, pickerOpen: pickerOpen }, key, text)
+    var a = Model.keyAction({ layout: layout, tab: tab, pickerOpen: pickerOpen, clocking: clocking,
+                              pomodoro: pomodoroState, pomodoroAvailable: pomodoroAvailable,
+                              confirming: confirming }, key, text)
     if (!a) return
-    if (a.move !== undefined) moveSelection(a.move)
+    if (a.cancelConfirm) confirming = false
+    else if (a.clock) clockAction(a.clock)
+    else if (a.pomodoro === "stop") stopPomodoro()
+    else if (a.pomodoro) pomodoroPressed()
+    else if (a.move !== undefined) moveSelection(a.move)
     else if (a.open) activate()
     else if (a.state) openPicker(selected)
     else if (a.refresh) refresh()
@@ -257,6 +315,45 @@ PanelKeyCatcher {
     else if (a.week !== undefined) browse(a.week, a.tab || "")
     else if (a.tab) chooseTab(a.tab)
     else if (a.pane) movePane(a.pane)
+  }
+
+  // I on the selected entry; O, X on the running clock; J jumps to it and
+  // gets out of the way, as ↵ does.
+  function clockAction(what) {
+    if (!service) return
+    confirming = false
+    if (what === "in") {
+      if (selectedItem) service.clockIn(selectedItem)
+    } else if (what === "out") {
+      service.clockOut()
+    } else if (what === "cancel") {
+      service.clockCancel()
+    } else if (what === "goto") {
+      clearResult()
+      service.clockGoto()
+      root.closeRequested()
+    }
+  }
+
+  // P (or ●): whatever org-pomodoro's next step is (Model.pomodoroStep).
+  function pomodoroPressed() {
+    if (!service) return
+    var step = Model.pomodoroStep(view, confirming)
+    if (step === "start") {
+      if (selectedItem) service.pomodoro(selectedItem, false)
+    } else if (step === "break") {
+      service.pomodoro(null, false)
+    } else if (step === "ask") {
+      clearResult()
+      confirming = true
+    } else if (step === "stop") {
+      stopPomodoro()
+    }
+  }
+
+  function stopPomodoro() {
+    confirming = false
+    if (service) service.pomodoro(null, true)
   }
 
   function moveSelection(dy) {
@@ -574,11 +671,163 @@ PanelKeyCatcher {
     }
   }
 
+  // ---- the running timer, in every layout; nothing while none runs.
+  //   CAPTION  title ………………  0:23 / 1:00 effort   Out  Jump  ●
+  //   ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬ (progress, when there is any)
+  Rectangle {
+    id: strip
+    visible: root.timer !== null
+    anchors.top: header.bottom
+    anchors.topMargin: Style.spacing.lg
+    anchors.left: parent.left
+    anchors.right: parent.right
+    implicitHeight: stripColumn.implicitHeight + Style.spacing.md * 2
+    height: visible ? implicitHeight : 0
+    radius: Style.cornerRadius
+    color: Util.alpha(root.stripColor, 0.08)
+    border.width: 1
+    border.color: Util.alpha(root.stripColor, 0.45)
+
+    readonly property bool hasTitle: !!root.timer && root.timer.title !== ""
+    readonly property bool isBreak: !!root.timer
+      && (root.timer.kind === "short-break" || root.timer.kind === "long-break")
+
+    Column {
+      id: stripColumn
+      anchors.top: parent.top
+      anchors.topMargin: Style.spacing.md
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.leftMargin: Style.spacing.xxl
+      anchors.rightMargin: Style.spacing.md
+      spacing: Style.spacing.sm
+
+      RowLayout {
+        width: parent.width
+        height: Style.space(22)
+        spacing: Style.spacing.xl
+
+        PlainText {
+          Layout.alignment: Qt.AlignVCenter
+          text: root.timer ? root.timer.caption : ""
+          color: root.stripColor
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          font.bold: true
+          font.letterSpacing: Style.spaceReal(1.2)
+        }
+
+        // The clocked entry; a click jumps there (J). A phase without a
+        // clock says so quietly, a break says nothing.
+        PlainText {
+          Layout.fillWidth: true
+          Layout.minimumWidth: 0
+          Layout.alignment: Qt.AlignVCenter
+          text: strip.hasTitle ? root.timer.title : strip.isBreak ? "" : "not clocked"
+          color: strip.hasTitle ? root.textColor : root.mutedColor
+          font.family: root.fontFamily
+          font.pixelSize: strip.hasTitle ? Style.font.body : Style.font.bodySmall
+
+          MouseArea {
+            id: stripTitleMouse
+            anchors.fill: parent
+            enabled: root.clocking
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.clockAction("goto")
+          }
+
+          PanelToolTip {
+            visible: stripTitleMouse.enabled && stripTitleMouse.containsMouse
+            text: "Jump to the clocked entry (J)"
+            fontFamily: root.fontFamily
+          }
+        }
+
+        // 0:23 / 1:00 effort · 12:41 left · +3:05 over
+        Row {
+          Layout.alignment: Qt.AlignVCenter
+
+          PlainText {
+            id: stripTime
+            text: root.timer ? root.timer.time.text : ""
+            color: root.timer && root.timer.time.tone === "urgent" ? root.urgentColor : root.textColor
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            font.bold: true
+            font.features: { "tnum": 1 }
+          }
+
+          PlainText {
+            anchors.baseline: stripTime.baseline
+            text: root.timer ? root.timer.extra : ""
+            color: root.mutedColor
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            font.features: { "tnum": 1 }
+          }
+        }
+
+        Row {
+          Layout.alignment: Qt.AlignVCenter
+          spacing: Style.spacing.xs
+
+          StripAction {
+            visible: root.clocking
+            label: "Out"
+            tip: "Clock out (O)"
+            fontFamily: root.fontFamily
+            onClicked: root.clockAction("out")
+          }
+
+          StripAction {
+            visible: root.clocking
+            label: "Jump"
+            tip: "Jump to the clocked entry (J)"
+            fontFamily: root.fontFamily
+            onClicked: root.clockAction("goto")
+          }
+
+          // org-pomodoro's next step; starting needs an entry to start on.
+          StripAction {
+            readonly property bool needsEntry: root.pomodoroStep === "start"
+            visible: root.pomodoroAvailable
+            label: "●"
+            labelColor: root.urgentColor
+            available: !needsEntry || (!!root.selectedItem && Model.canChangeState(root.selectedItem))
+            tip: !available ? "Select an entry to start a pomodoro on"
+              : needsEntry ? "Start a pomodoro on the selected entry (P)"
+              : root.pomodoroStep === "break" ? "Start the break (P)"
+              : root.confirming ? "Stop the pomodoro (P again)"
+              : "Stop the pomodoro (P)"
+            fontFamily: root.fontFamily
+            onClicked: root.confirming ? root.stopPomodoro() : root.pomodoroPressed()
+          }
+        }
+      }
+
+      Rectangle {
+        visible: !!root.timer && root.timer.progress !== null
+        width: parent.width - Style.spacing.md
+        height: 3
+        radius: 2
+        color: Util.alpha(root.textColor, 0.12)
+
+        Rectangle {
+          width: Math.round(parent.width * (root.timer && root.timer.progress !== null ? root.timer.progress : 0))
+          height: parent.height
+          radius: 2
+          color: root.stripColor
+        }
+      }
+    }
+  }
+
   // ---- Tabs: Today · Week · Overdue, with their counts.
   Row {
     id: tabBar
     visible: root.layout === "Tabs" && root.mode === "agenda" && root.model.tabs.length > 0
-    anchors.top: header.bottom
+    anchors.top: strip.visible ? strip.bottom : header.bottom
     anchors.topMargin: Style.spacing.lg
     anchors.left: parent.left
     spacing: Style.spacing.md
@@ -647,7 +896,7 @@ PanelKeyCatcher {
   // ---- body: capped by the KeyboardPanel, scrolls beyond that.
   Flickable {
     id: scroll
-    anchors.top: tabBar.visible ? tabBar.bottom : header.bottom
+    anchors.top: tabBar.visible ? tabBar.bottom : strip.visible ? strip.bottom : header.bottom
     anchors.topMargin: root.bodyGap
     anchors.bottom: footer.top
     anchors.bottomMargin: root.bodyGap
@@ -815,7 +1064,8 @@ PanelKeyCatcher {
     anchors.right: parent.right
     spacing: Style.spacing.sm
 
-    // The last state change, until the next action or the next open.
+    // The last state change or timer action, until the next action or the
+    // next open.
     PlainText {
       visible: root.stateResult !== null
       width: parent.width
@@ -848,12 +1098,17 @@ PanelKeyCatcher {
       font.pixelSize: Style.font.caption
     }
 
+    // The keys, or the pomodoro's stop question while it is open.
     PlainText {
       width: parent.width
-      text: root.pickerOpen ? Model.pickerHint(root.stateChoices, root.enterGlyph)
-        : root.hasAgenda ? Model.layoutHints(root.layout).replace("↵", root.enterGlyph)
+      text: root.confirming ? root.confirmText
+        : root.pickerOpen ? Model.pickerHint(root.stateChoices, root.enterGlyph)
+        : root.hasAgenda ? Model.layoutHints(root.layout, { clocking: root.clocking,
+                                                            pomodoroAvailable: root.pomodoroAvailable })
+                             .replace("↵", root.enterGlyph)
         : "r refresh · esc close"
-      color: root.mutedColor
+      font.bold: root.confirming
+      color: root.confirming ? root.urgentColor : root.mutedColor
       font.family: root.fontFamily
       font.pixelSize: Style.font.caption
     }
@@ -932,6 +1187,50 @@ PanelKeyCatcher {
       visible: action.tip !== "" && actionMouse.containsMouse
       text: action.tip
       fontFamily: action.fontFamily
+    }
+  }
+
+  // A small text control in the timer strip. Not `available`: dimmed and
+  // inert, its tip saying why.
+  component StripAction: BorderSurface {
+    id: control
+    property string label: ""
+    property string tip: ""
+    property string fontFamily: Style.font.family
+    property bool available: true
+    readonly property color ink: Commons.Color.popups.text
+    property color labelColor: ink
+    readonly property bool hot: available && controlMouse.containsMouse
+    signal clicked()
+
+    implicitWidth: Math.max(implicitHeight, controlLabel.implicitWidth + Style.spacing.lg * 2)
+    implicitHeight: Style.space(20)
+    radius: Style.cornerRadius
+    color: hot ? Style.hoverFillFor(ink, Commons.Color.accent) : "transparent"
+    borderSpec: Border.controlSpec(hot ? "hover-cursor" : "normal", ink, Commons.Color.accent)
+
+    PlainText {
+      id: controlLabel
+      anchors.centerIn: parent
+      text: control.label
+      color: control.labelColor
+      opacity: control.available ? 1 : 0.4
+      font.family: control.fontFamily
+      font.pixelSize: Style.font.caption
+    }
+
+    MouseArea {
+      id: controlMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: control.available ? Qt.PointingHandCursor : Qt.ArrowCursor
+      onClicked: if (control.available) control.clicked()
+    }
+
+    PanelToolTip {
+      visible: control.tip !== "" && controlMouse.containsMouse
+      text: control.tip
+      fontFamily: control.fontFamily
     }
   }
 

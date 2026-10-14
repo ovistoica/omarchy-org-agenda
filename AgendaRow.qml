@@ -29,6 +29,9 @@ CursorSurface {
   property int leadWidth: Style.space(40)
   property bool stateEnabled: false
   property bool pending: false
+  // The entry Org's clock runs on: tinted like org-agenda-clocking; its
+  // trail is then the time ("◷ 0:23", Model's), shown bold.
+  property bool clocked: false
 
   signal pointerMoved(var area, var mouse)
   signal activated()
@@ -47,6 +50,8 @@ CursorSurface {
   }
 
   foreground: textColor
+  // The cursor's highlight wins over the clock's tint.
+  color: hasCursor ? fill : clocked ? Util.alpha(Commons.Color.accent, 0.12) : "transparent"
   implicitHeight: dense ? Style.space(23) : Style.spacing.popupRowHeight
 
   MouseArea {
@@ -145,6 +150,8 @@ CursorSurface {
       elide: root.hasCursor ? Text.ElideLeft : Text.ElideRight
       font.family: root.fontFamily
       font.pixelSize: Style.font.caption
+      font.bold: root.clocked && !root.hasCursor
+      font.features: { "tnum": 1 }
     }
   }
 }
