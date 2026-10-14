@@ -120,6 +120,12 @@ eq([parsed(payloadOf([], { error: "e".repeat(400) })).value.error.length, parsed
 eq(parsed(payloadOf([], { generatedAt: 5, reason: null, emacs: undefined, org: {} })).value,
    Object.assign(parsed(payloadOf([])).value, { generatedAt: "", reason: "", emacs: "", org: "" }), "parse: meta strings default to empty")
 eq(parsed(payloadOf("nope")).value.items, [], "parse: non-array items -> []")
+eq(parsed(payloadOf([])).value.daysAhead, 0, "parse: payload without daysAhead (pre-0.3) -> 0")
+eq([0, 4, 6, 31].map(d => parsed(payloadOf([], { daysAhead: d })).value.daysAhead), [0, 4, 6, 31],
+   "parse: daysAhead kept")
+eq([-1, 2.5, 32, 1e9, Number.MAX_SAFE_INTEGER + 2, "4", null, true].map(d =>
+     parsed(payloadOf([], { daysAhead: d })).value.daysAhead),
+   [0, 0, 31, 31, 0, 0, 0, 0], "parse: daysAhead negative/float/string -> 0, huge clamped to 31")
 
 // ---------------------------------------------------------------- bounded
 
@@ -212,9 +218,9 @@ eq(M.nextUp([sync], new Date(NaN)), null, "nextUp: invalid now -> null")
 
 eq(M.normalizeSettings(null), { label: "Next item", maxTitleChars: 28, overdueBadge: true, habitsInBadge: false,
   showDone: true, pushUpdates: true, socketName: "", serverFile: "", emacsclient: "", agendaFiles: "",
-  agendaKey: "a", emacsApp: "emacs", timeoutSeconds: 5, upcomingDays: 7 }, "normalizeSettings: defaults")
-eq([-5, 0, 3, "12", 2.6, 99, "x", null, true].map(v => M.normalizeSettings({ upcomingDays: v }).upcomingDays),
-   [0, 0, 3, 12, 3, 31, 7, 7, 7], "normalizeSettings: upcomingDays clamped to 0..31")
+  agendaKey: "a", emacsApp: "emacs", timeoutSeconds: 5 }, "normalizeSettings: defaults")
+eq(M.normalizeSettings({ upcomingDays: 3 }), M.normalizeSettings({}),
+   "normalizeSettings: an old upcomingDays setting is ignored")
 {
   const s = M.normalizeSettings({ label: "Bogus", maxTitleChars: 500, timeoutSeconds: 0, overdueBadge: "no",
     habitsInBadge: "yes", showDone: false, pushUpdates: false, socketName: "  work ", agendaKey: "  ", emacsApp: " " })
@@ -292,13 +298,14 @@ const PRE = "(unless (and (boundp 'omarchy-org-agenda--source-mtime) (equal omar
 eq(M.loadPreamble(ELISP), PRE, "loadPreamble")
 eq(throws(() => M.loadPreamble("omarchy-org-agenda")), true, "loadPreamble: relative throws")
 eq(M.pullForm(ELISP, OUT, { agendaFiles: "/home/u/org/a.org:/home/u/org/b.org" }, "save"),
-   "(progn " + PRE + " (omarchy-org-agenda-ensure \"" + OUT + "\" (list \"/home/u/org/a.org\" \"/home/u/org/b.org\") t 7)" +
+   "(progn " + PRE + " (omarchy-org-agenda-ensure \"" + OUT + "\" (list \"/home/u/org/a.org\" \"/home/u/org/b.org\") t)" +
    " (omarchy-org-agenda-export \"save\"))", "pullForm: exact")
 eq(M.pullForm(ELISP, OUT, { pushUpdates: false }, "pull").split(PRE)[1],
-   " (omarchy-org-agenda-ensure \"" + OUT + "\" nil nil 7) (omarchy-org-agenda-export \"pull\"))", "pullForm: nil files, push nil")
-eq([0, 12, "12", 99, -1, "x", "3) (shell-command \"rm\""].map(d =>
-     / t (\S+)\) \(omarchy-org-agenda-export/.exec(M.pullForm(ELISP, OUT, { upcomingDays: d }, "pull"))[1]),
-   ["0", "12", "12", "31", "0", "7", "7"], "pullForm: upcomingDays as a bare clamped integer")
+   " (omarchy-org-agenda-ensure \"" + OUT + "\" nil nil) (omarchy-org-agenda-export \"pull\"))", "pullForm: nil files, push nil")
+eq([7, "3) (shell-command \"rm\""].map(d => M.pullForm(ELISP, OUT, { upcomingDays: d }, "pull").split(PRE)[1]),
+   [" (omarchy-org-agenda-ensure \"" + OUT + "\" nil t) (omarchy-org-agenda-export \"pull\"))",
+    " (omarchy-org-agenda-ensure \"" + OUT + "\" nil t) (omarchy-org-agenda-export \"pull\"))"],
+   "pullForm: ensure takes 3 args, an old upcomingDays setting is ignored")
 eq(["Save", "a\"b", "x".repeat(21), undefined, "new-day"].map(r => /export "([^"]*)"/.exec(M.pullForm(ELISP, OUT, {}, r))[1]),
    ["pull", "pull", "pull", "pull", "new-day"], "pullForm: reason sanitised")
 eq([throws(() => M.pullForm("x.el", OUT, {}, "pull")), throws(() => M.pullForm(ELISP, "out.json", {}, "pull")),

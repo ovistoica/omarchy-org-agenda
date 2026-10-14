@@ -147,6 +147,8 @@ function normalizePayload(raw) {
       org: text(raw.org, 40),
       keywords: normalizeKeywords(raw.keywords),
       items: items,
+      // Later days of the Org week the export covers; older payloads have none.
+      daysAhead: nonNegInt(raw.daysAhead) ? Math.min(raw.daysAhead, 31) : 0,
       error: isStr(raw.error) ? text(raw.error, 300) : null,
       missing: Array.isArray(raw.missing)
         ? raw.missing.slice(0, 50).filter(isStr).map(s => text(s, 1024))
@@ -264,8 +266,7 @@ function normalizeSettings(raw) {
     agendaFiles: settingStr(r.agendaFiles, ""),
     agendaKey: settingStr(r.agendaKey, "a"),
     emacsApp: settingStr(r.emacsApp, "emacs"),
-    timeoutSeconds: settingInt(r.timeoutSeconds, 5, 1, 30),
-    upcomingDays: settingInt(r.upcomingDays, 7, 0, 31)
+    timeoutSeconds: settingInt(r.timeoutSeconds, 5, 1, 30)
   }
 }
 
@@ -403,7 +404,7 @@ function pullForm(elispFile, outputFile, settings, reason) {
   const why = isStr(reason) && REASON_RE.test(reason) ? reason : "pull"
   return "(progn " + loadPreamble(elispFile) +
     " (omarchy-org-agenda-ensure " + out + " " + filesForm(agendaFilesList(s)) + " " +
-    (s.pushUpdates ? "t" : "nil") + " " + s.upcomingDays + ")" +
+    (s.pushUpdates ? "t" : "nil") + ")" +
     " (omarchy-org-agenda-export " + elispString(why) + "))"
 }
 

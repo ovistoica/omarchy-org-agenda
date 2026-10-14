@@ -126,7 +126,8 @@ cleaned up afterwards."
            (org-agenda-files nil)
            (omarchy-org-agenda-files nil)
            (omarchy-org-agenda-files-override nil)
-           (omarchy-org-agenda-upcoming-days 7)
+           ;; A week starting today: 6 later days, whatever today is.
+           (org-agenda-start-on-weekday nil)
            (omarchy-org-agenda-output nil))
        (unwind-protect (progn ,@body)
          (omarchy-org-agenda-teardown)
@@ -1177,22 +1178,71 @@ Deadline warnings count days ahead too, but come from today's agenda."
       (should (string-search "Timed task tomorrow" (plist-get (car later) :title)))
       (should (= 4 (- (length items) (length later)))))))
 
-(ert-deftest omarchy-org-agenda-test-upcoming-days-zero ()
+(defun omarchy-org-agenda-test--week-start (ahead)
+  "The `org-agenda-start-on-weekday' whose week ends AHEAD days after today."
+  (mod (+ (calendar-day-of-week (calendar-current-date)) 1 ahead) 7))
+
+(ert-deftest omarchy-org-agenda-test-days-ahead ()
+  ;; START → days ahead on Sunday (0) through Saturday (6).
+  (pcase-dolist (`(,start . ,want)
+                 '((0 6 5 4 3 2 1 0)
+                   (1 0 6 5 4 3 2 1)
+                   (6 5 4 3 2 1 0 6)
+                   (nil 6 6 6 6 6 6 6)
+                   (7 6 6 6 6 6 6 6)
+                   (-1 6 6 6 6 6 6 6)
+                   (monday 6 6 6 6 6 6 6)))
+    (should (equal (cons start want)
+                   (cons start (mapcar (lambda (dow)
+                                         (omarchy-org-agenda--days-ahead dow start))
+                                       (number-sequence 0 6)))))))
+
+(ert-deftest omarchy-org-agenda-test-upcoming-week-ends-today ()
+  ;; Org's Sunday with a Monday week: nothing ahead but deadline warnings.
   (omarchy-org-agenda-test--with-dir (dir)
     (let* ((org-habit-show-habits-only-for-today t)
+           (org-agenda-start-on-weekday (omarchy-org-agenda-test--week-start 0))
            (file (omarchy-org-agenda-test--write
                   (expand-file-name "upcoming.org" dir)
                   (omarchy-org-agenda-test--upcoming-text)))
-           (out (expand-file-name "agenda.json" dir)))
-      (omarchy-org-agenda-ensure out (list file) nil 0)
-      (omarchy-org-agenda-export)
-      (let ((payload (omarchy-org-agenda-test--read out)))
-        (should-not (seq-filter #'omarchy-org-agenda-test--later-p
-                                (omarchy-org-agenda-test--items payload)))
-        ;; Org's own deadline warning still counts its days.
-        (should (equal 5 (plist-get (omarchy-org-agenda-test--item
-                                     payload "Deadline in five days")
-                                    :inDays)))))))
+           (payload (omarchy-org-agenda-test--export dir (list file))))
+      (should (equal 0 (plist-get payload :daysAhead)))
+      (should-not (seq-filter (lambda (item) (> (plist-get item :inDays) 0))
+                              (seq-remove (lambda (item)
+                                            (equal (plist-get item :type)
+                                                   "upcoming-deadline"))
+                                          (omarchy-org-agenda-test--items payload))))
+      ;; Org's own deadline warning still counts its days.
+      (should (equal 5 (plist-get (omarchy-org-agenda-test--item
+                                   payload "Deadline in five days")
+                                  :inDays))))))
+
+(ert-deftest omarchy-org-agenda-test-upcoming-week-ends-in-two-days ()
+  (omarchy-org-agenda-test--with-dir (dir)
+    (let* ((org-habit-show-habits-only-for-today t)
+           (org-agenda-start-on-weekday (omarchy-org-agenda-test--week-start 2))
+           (file (omarchy-org-agenda-test--write
+                  (expand-file-name "upcoming.org" dir)
+                  (omarchy-org-agenda-test--upcoming-text)))
+           (payload (omarchy-org-agenda-test--export dir (list file))))
+      (should (equal 2 (plist-get payload :daysAhead)))
+      (should (equal 1 (plist-get (omarchy-org-agenda-test--item
+                                   payload "Timed task tomorrow")
+                                  :inDays)))
+      (should (equal 2 (plist-get (omarchy-org-agenda-test--item
+                                   payload "Event in two days")
+                                  :inDays)))
+      (should-not (omarchy-org-agenda-test--matching payload "Task in three days"))
+      (should (equal '(1 1 2)
+                     (mapcar (lambda (item) (plist-get item :inDays))
+                             (seq-filter #'omarchy-org-agenda-test--later-p
+                                         (omarchy-org-agenda-test--items payload)))))
+      ;; Past the week's end, within `org-deadline-warning-days': today's
+      ;; agenda warns about it.
+      (let ((deadline (omarchy-org-agenda-test--item payload "Deadline in five days")))
+        (should (< 5 org-deadline-warning-days))
+        (should (equal "upcoming-deadline" (plist-get deadline :type)))
+        (should (equal 5 (plist-get deadline :inDays)))))))
 
 (ert-deftest omarchy-org-agenda-test-upcoming-cap ()
   (omarchy-org-agenda-test--with-upcoming (file payload)
@@ -1213,19 +1263,26 @@ Deadline warnings count days ahead too, but come from today's agenda."
         (should (= 2 (length items)))
         (should-not (seq-some #'omarchy-org-agenda-test--later-p items))))))
 
-(ert-deftest omarchy-org-agenda-test-upcoming-ensure ()
+(ert-deftest omarchy-org-agenda-test-upcoming-ensure-ignores-4th-arg ()
+  ;; A shell from before 0.3 still sends the old days-ahead setting.
   (omarchy-org-agenda-test--with-dir (dir)
-    (let ((out (expand-file-name "agenda.json" dir)))
-      (omarchy-org-agenda-ensure out nil nil 5)
-      (should (= 5 omarchy-org-agenda-upcoming-days))
-      (omarchy-org-agenda-ensure out nil nil)
-      (should (= 5 omarchy-org-agenda-upcoming-days))
-      (omarchy-org-agenda-ensure out nil nil "9")
-      (should (= 5 omarchy-org-agenda-upcoming-days))
-      (omarchy-org-agenda-ensure out nil nil 40)
-      (should (= 31 omarchy-org-agenda-upcoming-days))
-      (omarchy-org-agenda-ensure out nil nil -3)
-      (should (= 0 omarchy-org-agenda-upcoming-days)))))
+    (let* ((org-habit-show-habits-only-for-today t)
+           (file (omarchy-org-agenda-test--write
+                  (expand-file-name "upcoming.org" dir)
+                  (omarchy-org-agenda-test--upcoming-text)))
+           (out (expand-file-name "agenda.json" dir))
+           (export (lambda (&rest upcoming)
+                     (should (eq t (apply #'omarchy-org-agenda-ensure
+                                          out (list file) nil upcoming)))
+                     (omarchy-org-agenda-export)
+                     (let ((payload (omarchy-org-agenda-test--read out)))
+                       (list (plist-get payload :daysAhead)
+                             (plist-get payload :items)))))
+           (want (funcall export)))
+      (should (equal 6 (car want)))
+      (dolist (upcoming '(0 2 31 nil))
+        (should (equal want (funcall export upcoming))))
+      (should-not (boundp 'omarchy-org-agenda-upcoming-days)))))
 
 (ert-deftest omarchy-org-agenda-test-upcoming-set-state ()
   (omarchy-org-agenda-test--with-upcoming (file payload)
@@ -1324,10 +1381,11 @@ Deadline warnings count days ahead too, but come from today's agenda."
     (dolist (item (omarchy-org-agenda-test--items payload))
       (should (gethash (omarchy-org-agenda--key item) omarchy-org-agenda--index)))))
 
-(ert-deftest omarchy-org-agenda-test-calendar-days-zero ()
+(ert-deftest omarchy-org-agenda-test-calendar-week-ends-today ()
   (omarchy-org-agenda-test--with-calendar (file payload)
-    (let ((out (expand-file-name "agenda.json" (file-name-directory file))))
-      (omarchy-org-agenda-ensure out (list file) nil 0)
+    (let ((out (expand-file-name "agenda.json" (file-name-directory file)))
+          (org-agenda-start-on-weekday (omarchy-org-agenda-test--week-start 0)))
+      (omarchy-org-agenda-ensure out (list file) nil)
       (omarchy-org-agenda-export)
       (let ((items (omarchy-org-agenda-test--items (omarchy-org-agenda-test--read out))))
         (should-not (seq-filter #'omarchy-org-agenda-test--later-p items))

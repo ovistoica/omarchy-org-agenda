@@ -53,7 +53,7 @@ the fallback `~/.cache/omarchy-org-agenda/`, delete it yourself).
   ([`elisp/omarchy-org-agenda.el`](elisp/omarchy-org-agenda.el)) into your
   running Emacs through `emacsclient`.
 - Emacs writes today's agenda, plus the scheduled tasks and timestamped
-  entries of the next few days, as JSON to `$XDG_RUNTIME_DIR/omarchy-org-agenda/`, and the bar
+  entries of the rest of the week, as JSON to `$XDG_RUNTIME_DIR/omarchy-org-agenda/`, and the bar
   watches that file. The directory is private (`0700`) and the file is
   readable only by you (`0600`). Without `XDG_RUNTIME_DIR` it goes to
   `$XDG_CACHE_HOME/omarchy-org-agenda/` (or `~/.cache/omarchy-org-agenda/`),
@@ -85,14 +85,15 @@ the Emacs window.
 
 After today's entries and habits, Coming up looks ahead. It lists Org's
 warnings for upcoming deadlines, and the scheduled tasks and timestamped
-entries (like calendar events, including multi-day ones) of the next
-`upcomingDays` days (a week by default), soonest first. Each row starts
-with the day: `Thu` within the week, `27 Oct` further out. Each heading
-shows once, at its next date: a repeating entry at its next occurrence,
-a multi-day event on its first day, and an entry that is already on
-today's agenda (such as an event under way) isn't listed again. Diary
-entries on later days aren't included. Set `upcomingDays` to `0` to list
-deadline warnings only.
+entries (like calendar events, including multi-day ones) of the rest of
+the week, soonest first, like your Org week agenda: the week starts on
+`org-agenda-start-on-weekday` (Monday by default), so on Sundays only
+deadline warnings look ahead. Each row starts with the day: `Thu` within
+the week, `27 Oct` further out. Each heading shows once, at its next
+date: a repeating entry at its next occurrence, a multi-day event on its
+first day, and an entry that is already on today's agenda (such as an
+event under way) isn't listed again. Diary entries on later days aren't
+included.
 
 **Changing a state**
 
@@ -157,7 +158,6 @@ omarchy bar set ovistoica.org-agenda label Count
 | `overdueBadge`   | boolean | `true`        | Show the overdue count badge                                                                              |
 | `habitsInBadge`  | boolean | `false`       | Count missed habits as overdue                                                                            |
 | `showDone`       | boolean | `true`        | Keep done entries in the popout, struck through                                                           |
-| `upcomingDays`   | integer | `7`           | Days after today whose scheduled tasks and timestamped entries (like calendar events, including multi-day ones) Coming up lists, one row per heading at its next date (0–31); `0` lists deadline warnings only |
 | `pushUpdates`    | boolean | `true`        | Let Emacs push changes (installs the hooks listed below)                                                  |
 | `socketName`     | string  | `""`          | Emacs server socket name or path; blank is the default socket                                            |
 | `serverFile`     | path    | `""`          | Server file of a TCP Emacs server; blank uses the socket                                                  |

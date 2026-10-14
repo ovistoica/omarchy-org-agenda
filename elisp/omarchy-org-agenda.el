@@ -9,8 +9,8 @@
 
 ;; Writes today's agenda as JSON to `omarchy-org-agenda-output', followed
 ;; by the scheduled tasks and timestamped entries (such as calendar
-;; events) of the next `omarchy-org-agenda-upcoming-days' days.  The
-;; bar's file list is `omarchy-org-agenda-files-override', else
+;; events) of the rest of the Org week (see `org-agenda-start-on-weekday').
+;; The bar's file list is `omarchy-org-agenda-files-override', else
 ;; `omarchy-org-agenda-files', else `org-agenda-files'.
 ;;
 ;; `omarchy-org-agenda-set-state' changes an exported entry's TODO state
@@ -37,7 +37,10 @@
   (dolist (elt (cdr (assoc (feature-file 'omarchy-org-agenda) load-history)))
     (when (eq (car-safe elt) 'defun)
       (put (cdr elt) 'function-history nil)
-      (fmakunbound (cdr elt)))))
+      (fmakunbound (cdr elt))))
+  ;; Removed in 0.3.0; a daemon that ran 0.2.x would keep it forever.
+  (when (boundp 'omarchy-org-agenda-upcoming-days)
+    (makunbound 'omarchy-org-agenda-upcoming-days)))
 
 (defconst omarchy-org-agenda-version "0.2.1")
 (defconst omarchy-org-agenda-protocol 1)
@@ -67,14 +70,6 @@ The plugin's own file setting, when given, takes precedence over this."
   "When non-nil, files/directories used instead of `org-agenda-files'.
 Set by the plugin on every `omarchy-org-agenda-ensure'; it takes
 precedence over `omarchy-org-agenda-files'.")
-
-(defvar omarchy-org-agenda-upcoming-days 7
-  "How many days after today the export looks ahead.
-The scheduled tasks and timestamped entries (such as calendar events,
-date ranges included) of those days follow today's agenda in the
-export, once per heading at its first date, for the bar's \"Coming up\"
-section; 0 exports today only.
-Set by the plugin on `omarchy-org-agenda-ensure', within 0..31.")
 
 (defvar omarchy-org-agenda-max-items 200
   "Bound on the exported items, today's first.")
@@ -188,6 +183,18 @@ Precedence: `omarchy-org-agenda-files-override', then
     ;; Expansion only: unlike `org-agenda-prepare-buffers', this never
     ;; asks about missing files.
     (org-agenda-files nil 'ifmode)))
+
+(defun omarchy-org-agenda--days-ahead (dow start)
+  "How many days after today the Org week still has, 0..6.
+DOW is today's weekday, 0 for Sunday, as `calendar-day-of-week' gives.
+START is the value of `org-agenda-start-on-weekday': a weekday 0..6
+starts the week on it, so the day before it ends the week; anything
+else, nil included, is Org's week starting today, which ends 6 days on.
+The plugin follows `org-agenda-start-on-weekday' and ignores
+`org-agenda-span': the bar always shows this week."
+  (if (and (integerp start) (<= 0 start 6))
+      (- 6 (mod (- dow start) 7))
+    6))
 
 (defun omarchy-org-agenda--day-entries (files date types)
   "Agenda entries of TYPES on DATE in FILES, sorted like a day agenda.
@@ -352,12 +359,13 @@ output follows a symlink planted in their place."
 (defun omarchy-org-agenda-export (&optional reason)
   "Write today's agenda to `omarchy-org-agenda-output'.
 The scheduled tasks and timestamped entries (such as calendar events)
-of the next `omarchy-org-agenda-upcoming-days' days follow it, with
-their :inDays.  REASON (default \"pull\") is echoed in
-the payload.  Agenda files that don't exist are skipped and listed
-under :missing.  Errors are written into the file too, so the bar can
-show them; only a failure to write it, such as an output directory
-that isn't private (see `omarchy-org-agenda--private-dir'), signals."
+of the rest of the Org week (see `org-agenda-start-on-weekday') follow
+it, with their :inDays; :daysAhead says how many later days that is.
+REASON (default \"pull\") is echoed in the payload.  Agenda files that
+don't exist are skipped and listed under :missing.  Errors are written
+into the file too, so the bar can show them; only a failure to write
+it, such as an output directory that isn't private (see
+`omarchy-org-agenda--private-dir'), signals."
   (let* ((omarchy-org-agenda--exporting t)
          ;; Collected afresh from this export's files, without disturbing
          ;; the user's agenda buffer, which reads them too.
@@ -375,14 +383,17 @@ that isn't private (see `omarchy-org-agenda--private-dir'), signals."
          (let* ((files (omarchy-org-agenda--files))
                 (missing (seq-remove #'file-exists-p files))
                 (present (seq-difference files missing))
+                (ahead (omarchy-org-agenda--days-ahead
+                        (calendar-day-of-week (calendar-current-date))
+                        org-agenda-start-on-weekday))
                 (items (omarchy-org-agenda--items
-                        (omarchy-org-agenda--entries
-                         present omarchy-org-agenda-upcoming-days)
+                        (omarchy-org-agenda--entries present ahead)
                         today)))
            (setq omarchy-org-agenda--index (omarchy-org-agenda--build-index items))
            (append base
                    (list :keywords (omarchy-org-agenda--keywords present)
                          :items (vconcat items)
+                         :daysAhead ahead
                          :missing (vconcat missing)
                          :error :null)))
        (error (setq omarchy-org-agenda--index (omarchy-org-agenda--build-index nil))
@@ -438,18 +449,15 @@ list doesn't follow `org-agenda-files', so its changes don't matter."
                       omarchy-org-agenda-files)))
     (omarchy-org-agenda--schedule "files")))
 
-(defun omarchy-org-agenda-ensure (output &optional files push upcoming)
+(defun omarchy-org-agenda-ensure (output &optional files push _upcoming)
   "Point the exporter at OUTPUT; idempotent, called by the plugin on every pull.
 FILES overrides `org-agenda-files'.  PUSH installs the change hooks.
-UPCOMING, an integer clamped to 0..31, sets
-`omarchy-org-agenda-upcoming-days', the days of scheduled tasks and
-timestamped entries (such as calendar events) exported after today;
-nil, as older plugins send, keeps it.
-Exports the hooks trigger use these settings too."
+Exports the hooks trigger use these settings too.
+_UPCOMING is accepted and ignored: a shell not yet restarted after an
+update may still send it, while Emacs already runs this file.  The
+export follows the Org week instead (see `org-agenda-start-on-weekday')."
   (setq omarchy-org-agenda-output (expand-file-name output)
         omarchy-org-agenda-files-override files)
-  (when (integerp upcoming)
-    (setq omarchy-org-agenda-upcoming-days (min 31 (max 0 upcoming))))
   (unless (eq (and push t) omarchy-org-agenda--push)
     (omarchy-org-agenda--remove-push-hooks)
     (when push
