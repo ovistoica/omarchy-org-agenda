@@ -1879,21 +1879,23 @@ clock timer leaks into other tests."
   "A stand-in for org-pomodoro: its variables and hooks, nothing else.
 The CI images don't have the real one.")
 
-(defun omarchy-org-agenda-test--write-stub (dir)
-  "Write the org-pomodoro stub into DIR/stub/; return that directory."
+(defun omarchy-org-agenda-test--write-stub (dir &optional text)
+  "Write an org-pomodoro stub into DIR/stub/; return that directory.
+TEXT is the stub's source, by default `--pomodoro-stub'."
   (let ((stub (expand-file-name "stub/" dir)))
     (make-directory stub t)
     (omarchy-org-agenda-test--write (expand-file-name "org-pomodoro.el" stub)
-                                    omarchy-org-agenda-test--pomodoro-stub)
+                                    (or text omarchy-org-agenda-test--pomodoro-stub))
     stub))
 
 (defmacro omarchy-org-agenda-test--with-stub (spec &rest body)
-  "Run BODY with (STUB) of SPEC, the stub's directory, on `load-path'.
-The stub isn't loaded; whatever BODY loads is unloaded afterwards, so
-neither the feature nor its variables leak into other tests."
-  (declare (indent 1) (debug ((symbolp) body)))
+  "Run BODY with (STUB TEXT) of SPEC: STUB, the stub's directory, on `load-path'.
+TEXT, when given, is the stub's source.  The stub isn't loaded;
+whatever BODY loads is unloaded afterwards, so neither the feature nor
+its variables leak into other tests."
+  (declare (indent 1) (debug ((symbolp &optional form) body)))
   `(omarchy-org-agenda-test--with-dir (dir)
-     (let* ((,(car spec) (omarchy-org-agenda-test--write-stub dir))
+     (let* ((,(car spec) (omarchy-org-agenda-test--write-stub dir ,(cadr spec)))
             (load-path (cons ,(car spec) load-path))
             (omarchy-org-agenda--pomodoro-located nil))
        (unwind-protect (progn ,@body)
@@ -1979,7 +1981,708 @@ neither the feature nor its variables leak into other tests."
   (should-not (featurep 'org-pomodoro))
   (should-not (boundp 'org-pomodoro-state))
   (should-not (boundp 'org-pomodoro-count))
+  (should-not (boundp 'org-pomodoro-last-clock-in))
+  (should-not (fboundp 'org-pomodoro-start))
+  (should-not (fboundp 'org-pomodoro-kill))
   (should-not (locate-library "org-pomodoro")))
+
+;;;; Timers: acting
+
+(defun omarchy-org-agenda-test--actions-text (&optional extra)
+  "The clock actions fixture: two tasks today, one next week, then EXTRA."
+  (let ((today (concat "SCHEDULED: " (omarchy-org-agenda-test--ts 0) "\n")))
+    (concat
+     "#+TODO: TODO NEXT | DONE\n\n"
+     "* TODO Alpha clock\n" today
+     "* TODO Beta clock\n" today
+     ":PROPERTIES:\n:ID: clock-beta\n:END:\n"
+     "* TODO Delta later\n"
+     "SCHEDULED: " (omarchy-org-agenda-test--ts 8) "\n"
+     extra)))
+
+(defconst omarchy-org-agenda-test--dangling
+  (concat "* Old work\n:LOGBOOK:\nCLOCK: "
+          (omarchy-org-agenda-test--inactive -1 "09:00") "\n:END:\n")
+  "An entry whose clock was left running by an Emacs that is gone.")
+
+(defun omarchy-org-agenda-test--stop-clock ()
+  "Cancel any running clock and its timers, leaving no clock state behind."
+  (when (org-clocking-p) (ignore-errors (org-clock-cancel)))
+  (dolist (timer '(org-clock-mode-line-timer org-clock-idle-timer))
+    (when (timerp (symbol-value timer)) (cancel-timer (symbol-value timer)))
+    (set timer nil))
+  (setq org-clock-current-task nil))
+
+(defun omarchy-org-agenda-test--in-actions (dir fn &optional extra)
+  "Call FN with the actions fixture in DIR: (FILE OTHER PAYLOAD).
+FILE has the fixture with EXTRA, OTHER one task of its own; PAYLOAD is
+their export.  Org's clock settings are the defaults that never ask,
+and no clock, note or clock timer is left behind."
+  (let ((org-clock-auto-clock-resolution nil)
+        (org-clock-in-switch-to-state nil)
+        (org-clock-out-switch-to-state nil)
+        (org-clock-out-remove-zero-time-clocks nil)
+        (org-clock-in-resume nil)
+        (org-clock-continuously nil)
+        (org-clock-leftover-time nil)
+        (org-clock-persist nil)
+        (org-log-note-clock-out nil)
+        (org-log-into-drawer nil))
+    (let* ((file (omarchy-org-agenda-test--write
+                  (expand-file-name "actions.org" dir)
+                  (omarchy-org-agenda-test--actions-text extra)))
+           (other (omarchy-org-agenda-test--write
+                   (expand-file-name "other.org" dir)
+                   (concat "* TODO Gamma elsewhere\nSCHEDULED: "
+                           (omarchy-org-agenda-test--ts 0) "\n")))
+           (payload (omarchy-org-agenda-test--export dir (list file other))))
+      (unwind-protect (funcall fn file other payload)
+        (omarchy-org-agenda-test--stop-clock)
+        (omarchy-org-agenda-test--clear-notes)))))
+
+(defmacro omarchy-org-agenda-test--with-actions (spec &rest body)
+  "Run BODY with (FILE OTHER PAYLOAD) of SPEC bound to the actions fixture.
+See `omarchy-org-agenda-test--in-actions'."
+  (declare (indent 1) (debug ((symbolp symbolp symbolp) body)))
+  `(omarchy-org-agenda-test--with-dir (dir)
+     (omarchy-org-agenda-test--in-actions
+      dir (lambda ,spec (ignore ,@spec) ,@body))))
+
+(defun omarchy-org-agenda-test--act (fn &rest args)
+  "The JSON result of the action FN on ARGS, as a plist; nulls are nil."
+  (let ((json (apply fn args)))
+    (should (stringp json))
+    (json-parse-string json :object-type 'plist
+                       :null-object nil :false-object nil)))
+
+(defun omarchy-org-agenda-test--clock-into (file payload title &optional from)
+  "`omarchy-org-agenda-clock-in' on the item of PAYLOAD with TITLE in FILE.
+FROM is the keyword the bar showed, TODO by default."
+  (omarchy-org-agenda-test--act
+   #'omarchy-org-agenda-clock-in
+   file (omarchy-org-agenda-test--line payload title) nil (or from "TODO")))
+
+(defun omarchy-org-agenda-test--clocked ()
+  "The title of the running clock's heading, or nil."
+  (when (org-clocking-p)
+    (org-with-point-at org-clock-hd-marker (org-get-heading t t t t))))
+
+(defun omarchy-org-agenda-test--text (file)
+  "The text of FILE's buffer, all of it."
+  (with-current-buffer (find-buffer-visiting file)
+    (org-with-wide-buffer (buffer-substring-no-properties (point-min) (point-max)))))
+
+(defconst omarchy-org-agenda-test--open-clock "^CLOCK: \\[[^]\n]+\\]$"
+  "A running clock line.")
+
+(defconst omarchy-org-agenda-test--closed-clock
+  "^CLOCK: \\[[^]\n]+\\]--\\[[^]\n]+\\] => "
+  "A closed clock line.")
+
+(defun omarchy-org-agenda-test--count (regexp text)
+  "How many lines of TEXT match REGEXP."
+  (with-temp-buffer
+    (insert text)
+    (count-matches regexp (point-min) (point-max))))
+
+(ert-deftest omarchy-org-agenda-test-act-clock-in ()
+  (omarchy-org-agenda-test--with-actions (file other payload)
+    (let ((r (omarchy-org-agenda-test--clock-into file payload "Alpha")))
+      (should (equal '("done" nil t nil)
+                     (mapcar (lambda (k) (plist-get r k))
+                             '(:result :state :saved :detail))))
+      (should (equal "Alpha clock" (omarchy-org-agenda-test--clocked)))
+      (should-not (buffer-modified-p (find-buffer-visiting file)))
+      (let ((disk (omarchy-org-agenda-test--disk file)))
+        (should (= 1 (omarchy-org-agenda-test--count
+                      omarchy-org-agenda-test--open-clock disk)))
+        (should (string-match-p "Alpha clock\nSCHEDULED: [^\n]+\n:LOGBOOK:\nCLOCK: "
+                                disk))))
+    ;; Again: Org's "Clock continues", nothing changes.
+    (let ((before (omarchy-org-agenda-test--text file))
+          (r (omarchy-org-agenda-test--clock-into file payload "Alpha")))
+      (should (equal '("done" nil t) (list (plist-get r :result) (plist-get r :state)
+                                           (plist-get r :saved))))
+      (should (equal before (omarchy-org-agenda-test--text file)))
+      (should (equal "Alpha clock" (omarchy-org-agenda-test--clocked))))))
+
+(ert-deftest omarchy-org-agenda-test-act-clock-in-unsaved ()
+  (omarchy-org-agenda-test--with-actions (file other payload)
+    (omarchy-org-agenda-test--edit file (lambda () (goto-char (point-max))
+                                          (insert "Unsaved text\n")))
+    (let ((r (omarchy-org-agenda-test--clock-into file payload "Alpha")))
+      (should (equal "done" (plist-get r :result)))
+      (should-not (plist-get r :saved)))
+    (should (equal "Alpha clock" (omarchy-org-agenda-test--clocked)))
+    (should (buffer-modified-p (find-buffer-visiting file)))
+    (should-not (string-search "CLOCK:" (omarchy-org-agenda-test--disk file)))))
+
+(ert-deftest omarchy-org-agenda-test-act-clock-in-switch ()
+  (omarchy-org-agenda-test--with-actions (file other payload)
+    (omarchy-org-agenda-test--clock-into file payload "Alpha")
+    ;; Another file: both are saved.
+    (let ((r (omarchy-org-agenda-test--clock-into other payload "Gamma")))
+      (should (equal '("done" t) (list (plist-get r :result) (plist-get r :saved)))))
+    (should (equal "Gamma elsewhere" (omarchy-org-agenda-test--clocked)))
+    (let ((disk (omarchy-org-agenda-test--disk file)))
+      (should (= 1 (omarchy-org-agenda-test--count
+                    omarchy-org-agenda-test--closed-clock disk)))
+      (should (= 0 (omarchy-org-agenda-test--count
+                    omarchy-org-agenda-test--open-clock disk))))
+    (should (= 1 (omarchy-org-agenda-test--count
+                  omarchy-org-agenda-test--open-clock
+                  (omarchy-org-agenda-test--disk other))))
+    (should-not (buffer-modified-p (find-buffer-visiting file)))
+    (should-not (buffer-modified-p (find-buffer-visiting other)))
+    ;; Back, in the same file, by ID after a line shift; OTHER had unsaved
+    ;; edits, so it keeps them, its clock closed in the buffer only.
+    (omarchy-org-agenda-test--edit other (lambda () (goto-char (point-max))
+                                           (insert "Unsaved\n")))
+    (let ((r (omarchy-org-agenda-test--act
+              #'omarchy-org-agenda-clock-in
+              file (omarchy-org-agenda-test--line payload "Beta") "clock-beta" "TODO")))
+      (should (equal '("done" t) (list (plist-get r :result) (plist-get r :saved)))))
+    (should (equal "Beta clock" (omarchy-org-agenda-test--clocked)))
+    (should (buffer-modified-p (find-buffer-visiting other)))
+    (should (string-match-p omarchy-org-agenda-test--open-clock
+                            (omarchy-org-agenda-test--disk other)))
+    (should (string-match-p omarchy-org-agenda-test--closed-clock
+                            (omarchy-org-agenda-test--text other)))))
+
+(ert-deftest omarchy-org-agenda-test-act-clock-in-switch-note ()
+  (omarchy-org-agenda-test--with-actions (file other payload)
+    (omarchy-org-agenda-test--clock-into file payload "Alpha")
+    (let* ((org-log-note-clock-out t)
+           (r (omarchy-org-agenda-test--clock-into other payload "Gamma")))
+      ;; The clocked-in file is saved now, the clocked-out one with its note.
+      (should (equal '("note-frame" t) (list (plist-get r :result) (plist-get r :saved))))
+      (should (equal "Gamma elsewhere" (omarchy-org-agenda-test--clocked)))
+      (should-not (buffer-modified-p (find-buffer-visiting other)))
+      (should (buffer-modified-p (find-buffer-visiting file)))
+      (should (string-match-p omarchy-org-agenda-test--open-clock
+                              (omarchy-org-agenda-test--disk file)))
+      (should (omarchy-org-agenda-take-note))
+      (omarchy-org-agenda-test--store-note "Switching to Gamma")
+      (let ((disk (omarchy-org-agenda-test--disk file)))
+        (should (string-search "Switching to Gamma" disk))
+        (should (string-match-p omarchy-org-agenda-test--closed-clock disk)))
+      (should-not (buffer-modified-p (find-buffer-visiting file))))))
+
+(ert-deftest omarchy-org-agenda-test-act-clock-in-switch-state ()
+  (omarchy-org-agenda-test--with-actions (file other payload)
+    (let* ((org-clock-in-switch-to-state "NEXT")
+           (r (omarchy-org-agenda-test--clock-into file payload "Alpha")))
+      (should (equal '("done" "NEXT" t)
+                     (list (plist-get r :result) (plist-get r :state)
+                           (plist-get r :saved))))
+      (should (string-search "* NEXT Alpha clock" (omarchy-org-agenda-test--disk file)))
+      (should (equal "Alpha clock" (omarchy-org-agenda-test--clocked))))))
+
+(ert-deftest omarchy-org-agenda-test-act-clock-in-refusals ()
+  (omarchy-org-agenda-test--with-actions (file other payload)
+    (let ((alpha (omarchy-org-agenda-test--line payload "Alpha"))
+          (result (lambda (&rest args)
+                    (plist-get (apply #'omarchy-org-agenda-test--act
+                                      #'omarchy-org-agenda-clock-in args)
+                               :result))))
+      (should (equal "invalid" (funcall result file "3" nil "TODO")))
+      (should (equal "invalid" (funcall result "actions.org" alpha nil "TODO")))
+      (should (equal "invalid" (funcall result file alpha nil 'todo)))
+      (should (equal "changed" (funcall result file 9999 nil "TODO")))
+      (should (equal "changed" (funcall result file alpha nil "NEXT")))
+      (should (equal "changed" (funcall result file alpha "other-id" "TODO")))
+      (omarchy-org-agenda-test--edit
+       file (lambda () (re-search-forward "^\\* TODO Alpha clock")
+              (replace-match "* TODO Alpha renamed")))
+      (should (equal "changed" (funcall result file alpha nil "TODO")))
+      (omarchy-org-agenda-test--edit
+       file (lambda () (re-search-forward "^\\* TODO Alpha renamed")
+              (replace-match "* NEXT Alpha clock")))
+      (should (equal "changed" (funcall result file alpha nil "TODO")))
+      (should-not (org-clocking-p))
+      ;; Unsaved edits and a newer file.
+      (omarchy-org-agenda-test--rewrite file "Delta later" "Delta moved")
+      (should (equal "conflict" (funcall result file alpha nil "NEXT")))
+      ;; A note queued elsewhere.
+      (add-hook 'post-command-hook #'org-add-log-note 'append)
+      (should (equal "busy" (funcall result other
+                                     (omarchy-org-agenda-test--line payload "Gamma")
+                                     nil "TODO")))
+      (should-not (org-clocking-p))
+      (should-not (string-search "CLOCK:" (omarchy-org-agenda-test--text other))))))
+
+(ert-deftest omarchy-org-agenda-test-act-clock-in-revert ()
+  (omarchy-org-agenda-test--with-actions (file other payload)
+    (find-file-noselect file)
+    (omarchy-org-agenda-test--rewrite file "Delta later" "Delta moved")
+    (should (equal "done" (plist-get (omarchy-org-agenda-test--clock-into
+                                      file payload "Alpha")
+                                     :result)))
+    (let ((disk (omarchy-org-agenda-test--disk file)))
+      (should (string-search "Delta moved" disk))
+      (should (string-match-p omarchy-org-agenda-test--open-clock disk)))))
+
+(ert-deftest omarchy-org-agenda-test-act-clock-in-week ()
+  (omarchy-org-agenda-test--with-actions (file other payload)
+    (let ((line (omarchy-org-agenda-test--file-line file "Delta later")))
+      (should (equal "changed" (plist-get (omarchy-org-agenda-test--act
+                                           #'omarchy-org-agenda-clock-in
+                                           file line nil "TODO")
+                                          :result)))
+      (omarchy-org-agenda-week 1)
+      (should (equal "done" (plist-get (omarchy-org-agenda-test--act
+                                        #'omarchy-org-agenda-clock-in
+                                        file line nil "TODO")
+                                       :result)))
+      (should (equal "Delta later" (omarchy-org-agenda-test--clocked))))))
+
+(ert-deftest omarchy-org-agenda-test-act-dangling ()
+  (omarchy-org-agenda-test--with-dir (dir)
+    (omarchy-org-agenda-test--in-actions
+     dir
+     (lambda (file _other payload)
+       (let* ((org-clock-auto-clock-resolution t)
+              (before (omarchy-org-agenda-test--text file))
+              (r (omarchy-org-agenda-test--clock-into file payload "Alpha")))
+         (should (equal "needs-emacs" (plist-get r :result)))
+         (should (string-match-p "\\`Dangling clock started [0-9]+ mins ago\\'"
+                                 (plist-get r :detail)))
+         (should-not (plist-get r :saved))
+         (should (equal before (omarchy-org-agenda-test--text file)))
+         (should-not (buffer-modified-p (find-buffer-visiting file)))
+         (should-not (org-clocking-p))
+         (should-not org-clock-current-task)
+         (should-not (get-buffer "*Org Clock*"))))
+     omarchy-org-agenda-test--dangling)))
+
+(ert-deftest omarchy-org-agenda-test-act-leftover ()
+  (omarchy-org-agenda-test--with-actions (file other payload)
+    (let* ((org-clock-leftover-time (time-subtract nil 600))
+           (before (omarchy-org-agenda-test--text file))
+           (r (omarchy-org-agenda-test--clock-into file payload "Alpha")))
+      (should (equal '("needs-emacs" "You stopped another clock 10 mins ago; start this one from then?")
+                     (list (plist-get r :result) (plist-get r :detail))))
+      (should (equal before (omarchy-org-agenda-test--text file)))
+      (should-not (buffer-modified-p (find-buffer-visiting file)))
+      (should-not (org-clocking-p)))))
+
+(ert-deftest omarchy-org-agenda-test-act-rollback ()
+  (omarchy-org-agenda-test--with-actions (file other payload)
+    (let* ((buf (find-file-noselect file))
+           (marker (omarchy-org-agenda--locate
+                    file (omarchy-org-agenda-test--line payload "Alpha")))
+           (before (omarchy-org-agenda-test--text file))
+           ;; Past the pre-check: Org asks after inserting "CLOCK: ".
+           (r (let ((org-clock-leftover-time (time-subtract nil 600)))
+                (omarchy-org-agenda--clock-in-at buf marker))))
+      (should (equal "needs-emacs" (plist-get r :result)))
+      (should (string-match-p "\\`You stopped another clock 10 mins ago"
+                              (plist-get r :detail)))
+      (should (equal before (omarchy-org-agenda-test--text file)))
+      (should-not (buffer-modified-p buf))
+      (should-not (org-clocking-p))
+      (should-not org-clock-current-task)
+      (should-not (omarchy-org-agenda--note-queued-p))
+      ;; Switching within the file: the old clock stays closed, the new
+      ;; one is rolled back.
+      (omarchy-org-agenda-test--clock-into file payload "Beta")
+      (let ((r (let ((org-clock-leftover-time (time-subtract nil 600)))
+                 (omarchy-org-agenda--clock-in-at buf marker)))
+            (text (omarchy-org-agenda-test--text file)))
+        (should (equal "needs-emacs" (plist-get r :result)))
+        (should-not (org-clocking-p))
+        (should (= 1 (omarchy-org-agenda-test--count
+                      omarchy-org-agenda-test--closed-clock text)))
+        (should (= 0 (omarchy-org-agenda-test--count
+                      omarchy-org-agenda-test--open-clock text)))
+        (should (= 1 (omarchy-org-agenda-test--count "^CLOCK:" text)))))))
+
+(ert-deftest omarchy-org-agenda-test-act-clock-out ()
+  (omarchy-org-agenda-test--with-actions (file other payload)
+    (should (equal '(:result "not-clocking" :state nil :saved nil :detail nil)
+                   (omarchy-org-agenda-test--act #'omarchy-org-agenda-clock-out)))
+    (omarchy-org-agenda-test--clock-into file payload "Alpha")
+    (let ((r (omarchy-org-agenda-test--act #'omarchy-org-agenda-clock-out)))
+      (should (equal '("done" nil t) (list (plist-get r :result) (plist-get r :state)
+                                           (plist-get r :saved)))))
+    (should-not (org-clocking-p))
+    (should-not (buffer-modified-p (find-buffer-visiting file)))
+    (should (string-match-p omarchy-org-agenda-test--closed-clock
+                            (omarchy-org-agenda-test--disk file)))
+    ;; With a state to switch to.
+    (omarchy-org-agenda-test--clock-into file payload "Alpha")
+    (let* ((org-clock-out-switch-to-state "NEXT")
+           (r (omarchy-org-agenda-test--act #'omarchy-org-agenda-clock-out)))
+      (should (equal '("done" "NEXT" t) (list (plist-get r :result) (plist-get r :state)
+                                              (plist-get r :saved)))))
+    (should (string-search "* NEXT Alpha clock" (omarchy-org-agenda-test--disk file)))))
+
+(ert-deftest omarchy-org-agenda-test-act-clock-out-note ()
+  (omarchy-org-agenda-test--with-actions (file other payload)
+    (omarchy-org-agenda-test--clock-into file payload "Alpha")
+    (let* ((org-log-note-clock-out t)
+           (r (omarchy-org-agenda-test--act #'omarchy-org-agenda-clock-out)))
+      (should (equal '("note-frame" nil) (list (plist-get r :result) (plist-get r :saved))))
+      (should-not (org-clocking-p))
+      (should (omarchy-org-agenda--note-queued-p))
+      (should (equal "busy" (plist-get (omarchy-org-agenda-test--clock-into
+                                        file payload "Beta")
+                                       :result)))
+      (should (string-match-p omarchy-org-agenda-test--open-clock
+                              (omarchy-org-agenda-test--disk file)))
+      (should (eq t (omarchy-org-agenda-take-note)))
+      (omarchy-org-agenda-test--store-note "Clocked out for lunch")
+      (let ((disk (omarchy-org-agenda-test--disk file)))
+        (should (string-search "Clocked out for lunch" disk))
+        (should (string-match-p omarchy-org-agenda-test--closed-clock disk)))
+      (should-not (buffer-modified-p (find-buffer-visiting file)))
+      (should-not (omarchy-org-agenda-test--advised-p)))))
+
+(ert-deftest omarchy-org-agenda-test-act-clock-cancel ()
+  (omarchy-org-agenda-test--with-actions (file other payload)
+    (should (equal "not-clocking" (plist-get (omarchy-org-agenda-test--act
+                                              #'omarchy-org-agenda-clock-cancel)
+                                             :result)))
+    (let ((before (omarchy-org-agenda-test--disk file)))
+      (omarchy-org-agenda-test--clock-into file payload "Alpha")
+      (should (string-search "CLOCK:" (omarchy-org-agenda-test--disk file)))
+      (let ((r (omarchy-org-agenda-test--act #'omarchy-org-agenda-clock-cancel)))
+        (should (equal '("done" t) (list (plist-get r :result) (plist-get r :saved)))))
+      (should-not (org-clocking-p))
+      ;; The clock line and its drawer are gone.
+      (should (equal before (omarchy-org-agenda-test--disk file)))
+      (should-not (buffer-modified-p (find-buffer-visiting file))))))
+
+(ert-deftest omarchy-org-agenda-test-act-clock-goto ()
+  (omarchy-org-agenda-test--with-actions (file other payload)
+    (should-error (omarchy-org-agenda-clock-goto) :type 'user-error)
+    (omarchy-org-agenda-test--clock-into file payload "Beta")
+    (save-window-excursion
+      (should (eq t (omarchy-org-agenda-clock-goto)))
+      (should (eq (find-buffer-visiting file) (window-buffer)))
+      (should (eq (current-buffer) (window-buffer)))
+      (should (looking-at "^\\* TODO Beta clock")))))
+
+(ert-deftest omarchy-org-agenda-test-act-never-load ()
+  ;; A fresh Emacs, as the user's: nothing clocking, org-clock not loaded.
+  ;; Clocking in loads it, under the guard: its load talks to D-Bus.
+  (omarchy-org-agenda-test--with-dir (dir)
+    (let* ((a (omarchy-org-agenda-test--small dir "A"))
+           (out (expand-file-name "agenda.json" dir))
+           (form (format "(progn
+  (omarchy-org-agenda-ensure %S (list %S) nil)
+  (omarchy-org-agenda-export)
+  (prin1 (list (omarchy-org-agenda-clock-out)
+               (omarchy-org-agenda-clock-cancel)
+               (condition-case err (omarchy-org-agenda-clock-goto)
+                 (user-error (car err)))
+               (featurep 'org-clock)
+               (omarchy-org-agenda-clock-in %S 1 nil \"TODO\")
+               (featurep 'org-clock)
+               (org-clocking-p)
+               (featurep 'org-pomodoro))))"
+                         out a a))
+           (result
+            (with-temp-buffer
+              (should (eql 0 (call-process
+                              (expand-file-name invocation-name invocation-directory)
+                              nil '(t nil) nil
+                              "--batch" "-Q"
+                              "-l" omarchy-org-agenda-test--source
+                              "--eval" form)))
+              (car (read-from-string (buffer-string)))))
+           (none "{\"result\":\"not-clocking\",\"state\":null,\"saved\":false,\"detail\":null}")
+           (done "{\"result\":\"done\",\"state\":null,\"saved\":true,\"detail\":null}"))
+      (should (equal (list none none 'user-error nil done t t nil) result))
+      (should (string-match-p omarchy-org-agenda-test--open-clock
+                              (omarchy-org-agenda-test--disk a))))))
+
+;;;; Timers: acting on org-pomodoro, through a richer stub
+
+(defconst omarchy-org-agenda-test--pomodoro-steps
+  '("(defun org-pomodoro-active-p () (not (eq org-pomodoro-state :none)))"
+    "(defun org-pomodoro-expires-p ()
+  (> (/ (float-time (time-subtract nil org-pomodoro-last-clock-in)) 60)
+     org-pomodoro-expiry-time))"
+    "(defun org-pomodoro-set (state)
+  (setq org-pomodoro-state state
+        org-pomodoro-end-time
+        (pcase state
+          (:pomodoro (time-add nil (* 60 org-pomodoro-length)))
+          (:overtime (current-time))
+          (:short-break (time-add nil (* 60 org-pomodoro-short-break-length)))
+          (:long-break (time-add nil (* 60 org-pomodoro-long-break-length))))))"
+    "(defun org-pomodoro-start (&optional state)
+  (org-pomodoro-set (or state :pomodoro))
+  (when (eq org-pomodoro-state :pomodoro)
+    (run-hooks 'org-pomodoro-started-hook)))"
+    "(defun org-pomodoro-reset ()
+  (setq org-pomodoro-state :none org-pomodoro-end-time nil))"
+    "(defun org-pomodoro-overtime ()
+  (org-pomodoro-start :overtime)
+  (run-hooks 'org-pomodoro-overtime-hook))"
+    "(defun org-pomodoro-finished ()
+  (unless org-pomodoro-clock-break (org-clock-out nil t))
+  (setq org-pomodoro-count (1+ org-pomodoro-count))
+  (org-pomodoro-start (if (zerop (mod org-pomodoro-count
+                                      org-pomodoro-long-break-frequency))
+                          :long-break
+                        :short-break))
+  (run-hooks 'org-pomodoro-finished-hook))"
+    "(defun org-pomodoro-killed ()
+  (org-pomodoro-reset)
+  (when (org-clocking-p)
+    (if org-pomodoro-keep-killed-pomodoro-time
+        (org-clock-out nil t)
+      (org-clock-cancel)))
+  (run-hooks 'org-pomodoro-killed-hook))"
+    "(defun org-pomodoro-kill () (org-pomodoro-killed))"
+    "(defun org-pomodoro (&optional _arg) (error \"Never call the command\"))")
+  "The stub's functions, with the effects of org-pomodoro's that matter:
+states, end time, count, clocking out or cancelling, and the hooks.
+No timer runs: tests move between states themselves.")
+
+(defun omarchy-org-agenda-test--pomodoro-full-stub (&optional without)
+  "A stub with org-pomodoro's variables and steps, but WITHOUT that function."
+  (concat
+   ";;; org-pomodoro.el --- Richer test stub  -*- lexical-binding: t; -*-\n"
+   "(require 'org-clock)\n"
+   (mapconcat
+    (pcase-lambda (`(,var ,value)) (format "(defvar %s %S)\n" var value))
+    '((org-pomodoro-state :none) (org-pomodoro-end-time nil)
+      (org-pomodoro-length 25) (org-pomodoro-short-break-length 5)
+      (org-pomodoro-long-break-length 20) (org-pomodoro-long-break-frequency 4)
+      (org-pomodoro-count 0) (org-pomodoro-last-clock-in nil)
+      (org-pomodoro-expiry-time 120) (org-pomodoro-ask-upon-killing t)
+      (org-pomodoro-keep-killed-pomodoro-time nil) (org-pomodoro-clock-break nil))
+    "")
+   (mapconcat (lambda (hook) (format "(defvar %s nil)\n" hook))
+              omarchy-org-agenda-test--pomodoro-hooks
+              "")
+   (mapconcat (lambda (step) (concat step "\n"))
+              (seq-remove (lambda (step)
+                            (and without
+                                 (string-prefix-p (format "(defun %s " without) step)))
+                          omarchy-org-agenda-test--pomodoro-steps)
+              "")
+   "(provide 'org-pomodoro)\n"))
+
+(defmacro omarchy-org-agenda-test--with-pomodoro (spec &rest body)
+  "Run BODY with (FILE OTHER PAYLOAD) of SPEC, the actions fixture.
+The richer org-pomodoro stub is on `load-path', not loaded yet; the
+actions load it, and it is unloaded afterwards."
+  (declare (indent 1) (debug ((symbolp symbolp symbolp) body)))
+  `(omarchy-org-agenda-test--with-stub
+       (_stub (omarchy-org-agenda-test--pomodoro-full-stub))
+     (omarchy-org-agenda-test--in-actions
+      dir (lambda ,spec (ignore ,@spec) ,@body))))
+
+(defun omarchy-org-agenda-test--pomodoro (&rest args)
+  "`omarchy-org-agenda-pomodoro' on ARGS, its JSON parsed to a plist."
+  (apply #'omarchy-org-agenda-test--act #'omarchy-org-agenda-pomodoro args))
+
+(defun omarchy-org-agenda-test--start-pomodoro (file payload title)
+  "Start a pomodoro on the item of PAYLOAD with TITLE in FILE; return the result."
+  (omarchy-org-agenda-test--pomodoro
+   file (omarchy-org-agenda-test--line payload title) nil "TODO" nil))
+
+(defun omarchy-org-agenda-test--stopping (&optional confirm)
+  "`omarchy-org-agenda-pomodoro' for a running pomodoro, with CONFIRM."
+  (omarchy-org-agenda-test--pomodoro nil nil nil nil confirm))
+
+(ert-deftest omarchy-org-agenda-test-act-pomodoro-start ()
+  (omarchy-org-agenda-test--with-pomodoro (file other payload)
+    (should-not (featurep 'org-pomodoro))
+    (let ((r (omarchy-org-agenda-test--start-pomodoro file payload "Alpha")))
+      (should (equal '("done" nil t) (list (plist-get r :result) (plist-get r :state)
+                                           (plist-get r :saved)))))
+    (should (featurep 'org-pomodoro))
+    (should (eq :pomodoro org-pomodoro-state))
+    (should (equal "Alpha clock" (omarchy-org-agenda-test--clocked)))
+    (should (< (float-time (time-since org-pomodoro-last-clock-in)) 60))
+    (should (= 0 org-pomodoro-count))
+    (should (string-match-p omarchy-org-agenda-test--open-clock
+                            (omarchy-org-agenda-test--disk file)))
+    (should (equal "pomodoro" (plist-get (plist-get (omarchy-org-agenda--timers)
+                                                    :pomodoro)
+                                         :state)))))
+
+(ert-deftest omarchy-org-agenda-test-act-pomodoro-count ()
+  (omarchy-org-agenda-test--with-pomodoro (file other payload)
+    (require 'org-pomodoro)
+    ;; Expired: reset silently.
+    (setq org-pomodoro-count 3
+          org-pomodoro-last-clock-in (time-subtract nil (* 3 3600)))
+    (should (equal "done" (plist-get (omarchy-org-agenda-test--start-pomodoro
+                                      file payload "Alpha")
+                                     :result)))
+    (should (= 0 org-pomodoro-count))
+    (should (equal "done" (plist-get (omarchy-org-agenda-test--stopping t) :result)))
+    ;; Recent: kept.
+    (setq org-pomodoro-count 3
+          org-pomodoro-last-clock-in (time-subtract nil 600))
+    (should (equal "done" (plist-get (omarchy-org-agenda-test--start-pomodoro
+                                      file payload "Beta")
+                                     :result)))
+    (should (= 3 org-pomodoro-count))
+    (should (eq :pomodoro org-pomodoro-state))))
+
+(ert-deftest omarchy-org-agenda-test-act-pomodoro-not-started ()
+  (omarchy-org-agenda-test--with-pomodoro (file other payload)
+    (require 'org-pomodoro)
+    (let ((last (time-subtract nil (* 3 3600))))
+      (setq org-pomodoro-count 3
+            org-pomodoro-last-clock-in last)
+      (omarchy-org-agenda-test--edit
+       file (lambda () (re-search-forward "^\\* TODO Alpha clock")
+              (replace-match "* TODO Alpha renamed")))
+      (should (equal "changed" (plist-get (omarchy-org-agenda-test--start-pomodoro
+                                           file payload "Alpha")
+                                          :result)))
+      (should (equal "invalid" (plist-get (omarchy-org-agenda-test--pomodoro
+                                           nil nil nil nil nil)
+                                          :result)))
+      ;; Org wanted to ask: no clock, so no pomodoro.
+      (let ((org-clock-leftover-time (time-subtract nil 600)))
+        (should (equal "needs-emacs" (plist-get (omarchy-org-agenda-test--start-pomodoro
+                                                 file payload "Beta")
+                                                :result))))
+      (should-not (org-clocking-p))
+      (should (eq :none org-pomodoro-state))
+      (should (eq last org-pomodoro-last-clock-in))
+      (should (= 3 org-pomodoro-count)))))
+
+(ert-deftest omarchy-org-agenda-test-act-pomodoro-already-clocked ()
+  ;; As `org-pomodoro': Org says "Clock continues", the pomodoro starts.
+  (omarchy-org-agenda-test--with-pomodoro (file other payload)
+    (omarchy-org-agenda-test--clock-into file payload "Alpha")
+    (let ((before (omarchy-org-agenda-test--text file))
+          (r (omarchy-org-agenda-test--start-pomodoro file payload "Alpha")))
+      (should (equal '("done" nil t nil)
+                     (mapcar (lambda (k) (plist-get r k))
+                             '(:result :state :saved :detail))))
+      (should (equal before (omarchy-org-agenda-test--text file))))
+    (should (eq :pomodoro org-pomodoro-state))
+    (should (< (float-time (time-since org-pomodoro-last-clock-in)) 60))
+    (should (equal "Alpha clock" (omarchy-org-agenda-test--clocked)))
+    (let ((text (omarchy-org-agenda-test--text file)))
+      (should (= 1 (omarchy-org-agenda-test--count "^CLOCK:" text)))
+      (should (= 1 (omarchy-org-agenda-test--count
+                    omarchy-org-agenda-test--open-clock text))))))
+
+(ert-deftest omarchy-org-agenda-test-act-pomodoro-start-note ()
+  ;; Switching from a clocked entry queues its clock-out note: the new
+  ;; clock runs, so does the pomodoro, and the note is still to take.
+  (omarchy-org-agenda-test--with-pomodoro (file other payload)
+    (omarchy-org-agenda-test--clock-into file payload "Alpha")
+    (let* ((org-log-note-clock-out t)
+           (r (omarchy-org-agenda-test--start-pomodoro other payload "Gamma")))
+      (should (equal '("note-frame" t nil)
+                     (mapcar (lambda (k) (plist-get r k)) '(:result :saved :detail))))
+      (should (eq :pomodoro org-pomodoro-state))
+      (should (equal "Gamma elsewhere" (omarchy-org-agenda-test--clocked)))
+      (should (omarchy-org-agenda--note-queued-p))
+      (should (eq t (omarchy-org-agenda-take-note)))
+      (omarchy-org-agenda-test--store-note "Pomodoro on Gamma")
+      (let ((disk (omarchy-org-agenda-test--disk file)))
+        (should (string-search "Pomodoro on Gamma" disk))
+        (should (string-match-p omarchy-org-agenda-test--closed-clock disk)))
+      (should-not (buffer-modified-p (find-buffer-visiting file)))
+      (should (eq :pomodoro org-pomodoro-state))
+      (should (equal "Gamma elsewhere" (omarchy-org-agenda-test--clocked))))))
+
+(ert-deftest omarchy-org-agenda-test-act-pomodoro-start-fails ()
+  ;; The clock-in is done, the pomodoro step isn't: its result wins.
+  (omarchy-org-agenda-test--with-pomodoro (file other payload)
+    (require 'org-pomodoro)
+    (cl-letf (((symbol-function 'org-pomodoro-start)
+               (lambda (&optional _state) (y-or-n-p "Start the pomodoro? "))))
+      (let ((r (omarchy-org-agenda-test--start-pomodoro file payload "Alpha")))
+        (should (equal '("needs-emacs" t)
+                       (list (plist-get r :result) (plist-get r :saved))))
+        (should (string-match-p
+                 "\\`Start the pomodoro\\?.*no pomodoro started; the clock is still running\\'"
+                 (plist-get r :detail)))))
+    (should (eq :none org-pomodoro-state))
+    (should (equal "Alpha clock" (omarchy-org-agenda-test--clocked)))
+    (cl-letf (((symbol-function 'org-pomodoro-start)
+               (lambda (&optional _state) (error "Boom"))))
+      (let ((r (omarchy-org-agenda-test--start-pomodoro other payload "Gamma")))
+        (should (equal '("error" "Boom; no pomodoro started; the clock is still running")
+                       (list (plist-get r :result) (plist-get r :detail))))))
+    (should (eq :none org-pomodoro-state))
+    (should (equal "Gamma elsewhere" (omarchy-org-agenda-test--clocked)))))
+
+(ert-deftest omarchy-org-agenda-test-act-pomodoro-stop ()
+  (omarchy-org-agenda-test--with-pomodoro (file other payload)
+    (let ((before (omarchy-org-agenda-test--disk file)))
+      (omarchy-org-agenda-test--start-pomodoro file payload "Alpha")
+      ;; Asking first is org-pomodoro's default.
+      (should (equal '(:result "confirm" :state nil :saved nil :detail nil)
+                     (omarchy-org-agenda-test--stopping)))
+      (should (eq :pomodoro org-pomodoro-state))
+      (should (org-clocking-p))
+      (let ((r (omarchy-org-agenda-test--stopping t)))
+        (should (equal '("done" t) (list (plist-get r :result) (plist-get r :saved)))))
+      (should (eq :none org-pomodoro-state))
+      (should-not (org-clocking-p))
+      ;; Killed: the clock was cancelled, its line removed.
+      (should (equal before (omarchy-org-agenda-test--disk file))))
+    ;; Not asking: stops without the flag; keeping the time clocks out.
+    (setq org-pomodoro-ask-upon-killing nil
+          org-pomodoro-keep-killed-pomodoro-time t)
+    (omarchy-org-agenda-test--start-pomodoro file payload "Alpha")
+    (should (equal "done" (plist-get (omarchy-org-agenda-test--stopping) :result)))
+    (should (eq :none org-pomodoro-state))
+    (should-not (org-clocking-p))
+    (should (string-match-p omarchy-org-agenda-test--closed-clock
+                            (omarchy-org-agenda-test--disk file)))
+    ;; A break stops the same way, with no clock to stop.
+    (setq org-pomodoro-ask-upon-killing t)
+    (org-pomodoro-start :short-break)
+    (should (equal "confirm" (plist-get (omarchy-org-agenda-test--stopping) :result)))
+    (should (equal '("done" nil) (let ((r (omarchy-org-agenda-test--stopping t)))
+                                   (list (plist-get r :result) (plist-get r :saved)))))
+    (should (eq :none org-pomodoro-state))))
+
+(ert-deftest omarchy-org-agenda-test-act-pomodoro-overtime ()
+  (omarchy-org-agenda-test--with-pomodoro (file other payload)
+    (omarchy-org-agenda-test--start-pomodoro file payload "Alpha")
+    (org-pomodoro-overtime)
+    (should (eq :overtime org-pomodoro-state))
+    ;; Busy while a note is queued.
+    (add-hook 'post-command-hook #'org-add-log-note 'append)
+    (should (equal "busy" (plist-get (omarchy-org-agenda-test--stopping) :result)))
+    (omarchy-org-agenda-test--clear-notes)
+    (let ((r (omarchy-org-agenda-test--stopping)))
+      (should (equal '("done" t) (list (plist-get r :result) (plist-get r :saved)))))
+    (should (eq :short-break org-pomodoro-state))
+    (should (= 1 org-pomodoro-count))
+    (should-not (org-clocking-p))
+    (should (string-match-p omarchy-org-agenda-test--closed-clock
+                            (omarchy-org-agenda-test--disk file)))))
+
+(ert-deftest omarchy-org-agenda-test-act-pomodoro-unavailable ()
+  (omarchy-org-agenda-test--with-dir (dir)
+    (omarchy-org-agenda-test--in-actions
+     dir
+     (lambda (file _other payload)
+       (should-not (locate-library "org-pomodoro"))
+       (should (equal '("unavailable" "org-pomodoro can't be loaded")
+                      (let ((r (omarchy-org-agenda-test--start-pomodoro
+                                file payload "Alpha")))
+                        (list (plist-get r :result) (plist-get r :detail)))))
+       (should-not (org-clocking-p)))))
+  (omarchy-org-agenda-test--with-stub
+      (_stub (omarchy-org-agenda-test--pomodoro-full-stub 'org-pomodoro-start))
+    (omarchy-org-agenda-test--in-actions
+     dir
+     (lambda (file _other payload)
+       (should (equal '("unavailable" "org-pomodoro has no org-pomodoro-start")
+                      (let ((r (omarchy-org-agenda-test--start-pomodoro
+                                file payload "Alpha")))
+                        (list (plist-get r :result) (plist-get r :detail)))))
+       (should-not (org-clocking-p))))))
 
 ;;;; Timers: hooks and loading
 

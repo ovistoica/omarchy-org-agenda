@@ -23,6 +23,10 @@
 ;; `omarchy-org-agenda-set-state' changes an exported or browsed entry's
 ;; TODO state for the bar, after checking the entry still is what the bar
 ;; showed.
+;;
+;; `omarchy-org-agenda-clock-in', `-clock-out', `-clock-cancel',
+;; `-clock-goto' and `-pomodoro' drive Org's clock and org-pomodoro for
+;; the popout, without ever prompting.
 
 ;;; Code:
 
@@ -807,15 +811,19 @@ when LOCAL is non-nil, else wherever Org's ID index says."
   "Show PATH at LINE in the selected frame, like `emacsclient +LINE PATH'.
 Unfolds the entry so the heading is visible.  ID, when given, finds
 the entry if LINE is stale; see `omarchy-org-agenda--locate'."
-  (let ((marker (omarchy-org-agenda--locate path line id)))
-    (pop-to-buffer-same-window (marker-buffer marker))
-    (unless (<= (point-min) marker (point-max)) (widen))
-    (goto-char marker)
-    (when (derived-mode-p 'org-mode)
-      (org-fold-show-context 'agenda)
-      (org-fold-show-entry))
-    (recenter 2)
-    t))
+  (omarchy-org-agenda--show (omarchy-org-agenda--locate path line id)))
+
+(defun omarchy-org-agenda--show (marker)
+  "Show MARKER in the selected window, widening and unfolding as needed.
+Returns t."
+  (pop-to-buffer-same-window (marker-buffer marker))
+  (unless (<= (point-min) marker (point-max)) (widen))
+  (goto-char marker)
+  (when (derived-mode-p 'org-mode)
+    (org-fold-show-context 'agenda)
+    (org-fold-show-entry))
+  (recenter 2)
+  t)
 
 (defun omarchy-org-agenda-open-agenda (&optional key)
   "Open the user's agenda dispatcher entry KEY (default \"a\")."
@@ -969,12 +977,16 @@ Removes itself first: any store ends the note it was waiting for."
     (omarchy-org-agenda--schedule "changed"))
   (list :result "changed"))
 
-(defun omarchy-org-agenda--valid-args-p (path line id from to)
-  "Non-nil when PATH, LINE, ID, FROM and TO have the expected types."
+(defun omarchy-org-agenda--valid-entry-args-p (path line id from)
+  "Non-nil when PATH, LINE, ID and FROM name an entry as the bar does."
   (and (stringp path) (file-name-absolute-p path)
        (natnump line) (> line 0)
        (or (null id) (stringp id))
-       (or (null from) (stringp from))
+       (or (null from) (stringp from))))
+
+(defun omarchy-org-agenda--valid-args-p (path line id from to)
+  "Non-nil when PATH, LINE, ID, FROM and TO have the expected types."
+  (and (omarchy-org-agenda--valid-entry-args-p path line id from)
        (stringp to)))
 
 (defun omarchy-org-agenda--entry-matches-p (marker buf entry id from)
@@ -1115,6 +1127,501 @@ Returns t, or nil when there is no such note any more."
       (setq org-log-note-recursion-depth (recursion-depth))
       (org-add-log-note))
     t))
+
+;;;; Timers: acting
+;;
+;; The popout's clock and pomodoro keys.  Like a state change, every
+;; action comes through `emacsclient --eval' and must never prompt:
+;; `omarchy-org-agenda--without-prompts' refuses whatever Org would ask,
+;; and the action answers needs-emacs instead.  Org's clock-in can ask in
+;; the middle of an edit, so it runs as a change group a refusal rolls
+;; back.  The interactive `org-pomodoro' asks twice, so its steps are
+;; driven here instead, and the plugin decides both questions: the count
+;; is reset silently once it has expired, and stopping takes a
+;; confirmation flag when `org-pomodoro-ask-upon-killing' is set.
+;;
+;; The save policy is set-state's, over every buffer an action changes:
+;; one with no unsaved edits before is saved, and one a pending note will
+;; still change is saved once the note is stored.  Switching tasks
+;; changes two entries, the one clocked out and the one clocked in.
+
+(declare-function org-clock-in "org-clock" (&optional select start-time))
+(declare-function org-clock-out "org-clock"
+                  (&optional switch-to-state fail-quietly at-time))
+(declare-function org-clock-cancel "org-clock" ())
+(declare-function org-pomodoro-start "org-pomodoro" (&optional state))
+(declare-function org-pomodoro-kill "org-pomodoro" ())
+(declare-function org-pomodoro-finished "org-pomodoro" ())
+(declare-function org-pomodoro-active-p "org-pomodoro" ())
+(declare-function org-pomodoro-expires-p "org-pomodoro" ())
+(defvar org-clock-leftover-time)
+(defvar org-clock-current-task)
+(defvar org-pomodoro-state)
+(defvar org-pomodoro-count)
+(defvar org-pomodoro-last-clock-in)
+(defvar org-pomodoro-expiry-time)
+(defvar org-pomodoro-ask-upon-killing)
+
+(defconst omarchy-org-agenda--pomodoro-steps
+  '(org-pomodoro-start org-pomodoro-kill org-pomodoro-finished
+    org-pomodoro-active-p org-pomodoro-expires-p)
+  "org-pomodoro's functions the plugin calls instead of its command.")
+
+(defconst omarchy-org-agenda--pomodoro-vars
+  '(org-pomodoro-state org-pomodoro-count org-pomodoro-last-clock-in
+    org-pomodoro-expiry-time org-pomodoro-ask-upon-killing)
+  "org-pomodoro's variables the plugin reads or sets.")
+
+(defvar omarchy-org-agenda--question nil
+  "What Org tried to ask under `omarchy-org-agenda--without-prompts', or nil.")
+
+(defconst omarchy-org-agenda--any-question
+  "Org wants to ask something; do it in Emacs"
+  "The needs-emacs detail when the question itself isn't known.")
+
+(defun omarchy-org-agenda--refuse-question (prompt &rest _)
+  "Stand-in for `y-or-n-p' under the guard: remember PROMPT, then refuse."
+  (setq omarchy-org-agenda--question prompt)
+  (signal 'inhibited-interaction nil))
+
+(defun omarchy-org-agenda--refuse-resolve (clock &optional prompt-fn &rest _)
+  "Stand-in for `org-clock-resolve': remember the question, then refuse.
+PROMPT-FN is what `org-resolve-clocks' words its question about CLOCK
+with.  Nothing has changed yet when Org gets here."
+  (setq omarchy-org-agenda--question
+        (or (and (functionp prompt-fn)
+                 (ignore-errors (funcall prompt-fn clock)))
+            "Org found a dangling clock to resolve"))
+  (signal 'inhibited-interaction nil))
+
+(defconst omarchy-org-agenda--waits '(dbus-call-method sit-for)
+  "Functions that read events only to wait, which the guard lets through.
+`inhibit-interaction' refuses their `read-event' too, so a D-Bus call
+would fail: loading org-clock asks logind for the session, and `alert'
+may notify over D-Bus.  Both push back any input they read.")
+
+(defun omarchy-org-agenda--let-wait (fn &rest args)
+  "Call FN with ARGS, free to read events: it only waits."
+  (let ((inhibit-interaction nil))
+    (apply fn args)))
+
+(defun omarchy-org-agenda--without-prompts (fn)
+  "Call FN with every prompt refused; return its value, or needs-emacs.
+FN runs with `inhibit-interaction' and `inhibit-message' on, and with
+Emacs's lock and supersession questions refused; only the waits of
+`omarchy-org-agenda--waits' may read events.  When anything tries to
+read from the user, the result is (:result \"needs-emacs\" :detail
+QUESTION).  QUESTION is the prompt when it went through `y-or-n-p', or
+the dangling clock `omarchy-org-agenda--clock-in-at' refused to resolve;
+readers built in C refuse before their prompt is known, so for them it
+is a generic sentence.  Guards nest: the innermost one answers."
+  ;; Advice, unlike `cl-letf', also holds for a function FN's loads
+  ;; define, and leaves it defined afterwards.  The outermost guard owns it.
+  (let ((omarchy-org-agenda--question nil)
+        (waits (seq-remove (lambda (wait)
+                             (advice-member-p #'omarchy-org-agenda--let-wait wait))
+                           omarchy-org-agenda--waits)))
+    (dolist (wait waits)
+      (advice-add wait :around #'omarchy-org-agenda--let-wait))
+    (unwind-protect
+        (condition-case nil
+            (let ((inhibit-interaction t)
+                  (inhibit-message t))
+              (cl-letf (((symbol-function 'ask-user-about-lock)
+                         #'omarchy-org-agenda--refuse-prompt)
+                        ((symbol-function 'ask-user-about-supersession-threat)
+                         #'omarchy-org-agenda--refuse-prompt)
+                        ((symbol-function 'y-or-n-p)
+                         #'omarchy-org-agenda--refuse-question))
+                (funcall fn)))
+          (inhibited-interaction
+           (list :result "needs-emacs"
+                 :detail (or (omarchy-org-agenda--detail omarchy-org-agenda--question)
+                             omarchy-org-agenda--any-question))))
+      (dolist (wait waits)
+        (advice-remove wait #'omarchy-org-agenda--let-wait)))))
+
+(defun omarchy-org-agenda--act (steps)
+  "Run STEPS for a public timer action; return its JSON result.
+STEPS is a function returning a result plist; it runs under
+`omarchy-org-agenda--without-prompts', and an error becomes an error
+result."
+  (omarchy-org-agenda--json-result
+   (condition-case err
+       (omarchy-org-agenda--without-prompts steps)
+     (error (list :result "error" :detail (error-message-string err))))))
+
+(defun omarchy-org-agenda--clocking-buffer ()
+  "The base buffer of the running Org clock, or nil.  Never loads org-clock."
+  (when (and (featurep 'org-clock) (org-clocking-p))
+    (let ((buf (marker-buffer org-clock-marker)))
+      (or (buffer-base-buffer buf) buf))))
+
+(defun omarchy-org-agenda--snapshot (&rest buffers)
+  "Each live buffer of BUFFERS once, with whether it has unsaved edits.
+An alist of (BUFFER . MODIFIED), taken before an action for
+`omarchy-org-agenda--settle'."
+  (mapcar (lambda (buf) (cons buf (buffer-modified-p buf)))
+          (seq-uniq (seq-filter #'buffer-live-p buffers))))
+
+(defun omarchy-org-agenda--settle (result before target)
+  "RESULT of an action, completed with its note and its saves.
+BEFORE is the `omarchy-org-agenda--snapshot' taken before the action;
+TARGET is the buffer whose save :saved and :detail report.  When
+RESULT is done and Org queued a note, the note goes through
+`omarchy-org-agenda--finish-log', whose result replaces done.  Then
+each buffer of BEFORE that had no unsaved edits and has some now is
+saved, except the one a pending note will still change: that one is
+saved once the note is stored."
+  (let* ((note-buf (and (equal (plist-get result :result) "done")
+                        (omarchy-org-agenda--note-queued-p)
+                        (marker-buffer org-log-note-marker)))
+         (note-base (and note-buf (or (buffer-base-buffer note-buf) note-buf)))
+         ;; A buffer the snapshot doesn't know counts as having edits.
+         (result (if note-base
+                     (append (omarchy-org-agenda--finish-log
+                              (alist-get note-base before t))
+                             result)
+                   result))
+         (pending (and (member (plist-get result :result) '("note" "note-frame"))
+                       note-base))
+         (saves (mapcar (pcase-lambda (`(,buf . ,was-modified))
+                          (cons buf (and (not was-modified)
+                                         (not (eq buf pending))
+                                         (buffer-live-p buf)
+                                         (buffer-modified-p buf)
+                                         (omarchy-org-agenda--save buf))))
+                        before))
+         (save (alist-get target saves)))
+    (append (list :saved (car save))
+            (and (cdr save) (list :detail (cdr save)))
+            result)))
+
+(defun omarchy-org-agenda--heading-state (buf pos)
+  "The TODO keyword of the heading at POS in BUF, or nil."
+  (with-current-buffer buf
+    (org-with-wide-buffer (goto-char pos) (org-get-todo-state))))
+
+(defun omarchy-org-agenda--on-running-clock (fn)
+  "Call FN, guarded, on the running clock; return its completed result.
+FN stops or changes the running clock (clocking out, cancelling, a
+pomodoro step) and returns a result plist.  The clock's buffer is the
+target of `omarchy-org-agenda--settle', and :state is its entry's
+keyword afterwards when FN changed it.  With no clock running, FN still
+runs, with no target."
+  (let* ((buf (omarchy-org-agenda--clocking-buffer))
+         (heading (and buf (copy-marker org-clock-hd-marker)))
+         (from (and heading (omarchy-org-agenda--heading-state buf heading)))
+         (before (omarchy-org-agenda--snapshot buf))
+         (result (omarchy-org-agenda--settle
+                  (omarchy-org-agenda--without-prompts fn) before buf))
+         (state (and heading (buffer-live-p buf)
+                     (omarchy-org-agenda--heading-state buf heading))))
+    (when heading (set-marker heading nil))
+    (append (list :state (and (not (equal state from)) state)) result)))
+
+(defun omarchy-org-agenda--clock-target (path line id from)
+  "The entry to clock in, checked as `omarchy-org-agenda-set-state' checks.
+Returns (:buffer BUF :marker MARKER), or a result plist refusing: the
+same results, in the same order, as a state change's."
+  (let ((entry (omarchy-org-agenda--indexed path line))
+        (buf (and (stringp path) (find-buffer-visiting path))))
+    (cond
+     ((not (omarchy-org-agenda--valid-entry-args-p path line id from))
+      (list :result "invalid" :detail "bad arguments"))
+     ((omarchy-org-agenda--busy-p) (list :result "busy"))
+     ((not (and entry (file-exists-p path))) (omarchy-org-agenda--changed))
+     ((and buf (not (verify-visited-file-modtime buf)) (buffer-modified-p buf))
+      (list :result "conflict"))
+     (t
+      (when (and buf (not (verify-visited-file-modtime buf)))
+        (with-current-buffer buf (revert-buffer t t t)))
+      (let* ((buf (or buf
+                      (let ((large-file-warning-threshold nil))
+                        (find-file-noselect path t))))
+             (marker (omarchy-org-agenda--locate path line id t)))
+        (if (omarchy-org-agenda--entry-matches-p marker buf entry id from)
+            (list :buffer buf :marker marker)
+          (omarchy-org-agenda--changed)))))))
+
+(defun omarchy-org-agenda--clocked-at-p (buf marker)
+  "Non-nil when the running clock is on the heading at MARKER in BUF."
+  (and (eq buf (omarchy-org-agenda--clocking-buffer))
+       (eq buf (marker-buffer org-clock-hd-marker))
+       (= org-clock-hd-marker marker)))
+
+(defun omarchy-org-agenda--leftover-question ()
+  "What Org's clock-in would ask about leftover time, or nil.
+Org asks it after it has started editing; see `org-clock-leftover-time'."
+  (when (and (boundp 'org-clock-leftover-time) org-clock-leftover-time)
+    (condition-case nil
+        (format "You stopped another clock %d mins ago; start this one from then?"
+                (/ (truncate (float-time (time-since org-clock-leftover-time))) 60))
+      (error "You stopped another clock; start this one from then?"))))
+
+(defun omarchy-org-agenda--abandon-clock-in ()
+  "Clear what a failed clock-in left: the notes it queued, its task name."
+  (when (omarchy-org-agenda--note-queued-p)
+    (remove-hook 'post-command-hook #'org-add-log-note)
+    (setq org-log-setup nil))
+  (unless (org-clocking-p)
+    (setq org-clock-current-task nil)))
+
+(defun omarchy-org-agenda--clock-in-at (buf marker)
+  "Clock in the heading at MARKER in BUF, all or nothing; return a result.
+Runs `org-clock-in' guarded by `omarchy-org-agenda--without-prompts',
+in a widened view, and returns done or needs-emacs.  org-clock must be
+loaded.  BUF's edits form one change group, which a refusal or an
+error rolls back, a half-made clock line included; the group restarts
+once Org has clocked out a clock running in BUF, so that clock stays
+closed.  A clock running in another buffer is closed by Org there, and
+stays closed too.  After a failure no clock is half-started and no note
+the attempt queued stays queued.  Org's question about a dangling clock
+is refused before anything changes."
+  (omarchy-org-agenda--without-prompts
+   (lambda ()
+     (with-current-buffer buf
+       (org-with-wide-buffer
+        (goto-char marker)
+        ;; As `atomic-change-group': the group must survive undo's limits.
+        (let* ((undo-outer-limit nil)
+               (undo-limit most-positive-fixnum)
+               (undo-strong-limit most-positive-fixnum)
+               (group (prepare-change-group))
+               (restart (lambda ()
+                          (when (eq buf (or (buffer-base-buffer) (current-buffer)))
+                            (accept-change-group group)
+                            (setq group (prepare-change-group buf))
+                            (activate-change-group group))))
+               (done nil))
+          (activate-change-group group)
+          (add-hook 'org-clock-out-hook restart)
+          (unwind-protect
+              (cl-letf (((symbol-function 'org-clock-resolve)
+                         #'omarchy-org-agenda--refuse-resolve))
+                (save-window-excursion (org-clock-in))
+                (setq done t)
+                (list :result "done"))
+            (remove-hook 'org-clock-out-hook restart)
+            (if done
+                (accept-change-group group)
+              (cancel-change-group group)
+              (omarchy-org-agenda--abandon-clock-in)))))))))
+
+(defun omarchy-org-agenda--clock-in (path line id from)
+  "The steps of `omarchy-org-agenda-clock-in'; return a result plist.
+A done result that changed nothing carries :unchanged t."
+  (let ((target (omarchy-org-agenda--clock-target path line id from)))
+    (if (plist-get target :result)
+        target
+      (let ((buf (plist-get target :buffer))
+            (marker (plist-get target :marker))
+            (leftover (omarchy-org-agenda--leftover-question)))
+        (cond
+         ;; Org would only say "Clock continues".
+         ((omarchy-org-agenda--clocked-at-p buf marker)
+          (list :result "done" :unchanged t
+                :saved (not (buffer-modified-p buf))))
+         (leftover (list :result "needs-emacs" :detail leftover))
+         (t
+          (require 'org-clock)
+          (let* ((before (omarchy-org-agenda--snapshot
+                          buf (omarchy-org-agenda--clocking-buffer)))
+                 (result (omarchy-org-agenda--settle
+                          (omarchy-org-agenda--clock-in-at buf marker)
+                          before buf))
+                 (state (omarchy-org-agenda--heading-state buf marker)))
+            (append (list :state (and (not (equal state from)) state))
+                    result))))))))
+
+(defun omarchy-org-agenda-clock-in (path line id from)
+  "Clock in the exported entry at LINE of PATH, like I in Org's agenda.
+The entry may also be one the last `omarchy-org-agenda-week' returned.
+ID, when non-nil, finds the entry if lines moved.  FROM is the keyword
+the bar showed (nil for none).  The entry is checked as
+`omarchy-org-agenda-set-state' checks it.  A clock running on another
+entry is clocked out first, as Org does.  Called by the plugin through
+`emacsclient --eval'; never prompts.  Loads org-clock.
+
+Returns a JSON string {result, state, saved, detail}.  result is one of
+done (also when this entry already had the clock: nothing changes),
+note or note-frame (a note Org queued: see
+`omarchy-org-agenda-set-state'), needs-emacs (Org wanted to ask
+something, such as how to resolve a dangling clock; detail says what;
+nothing changed in this entry), changed, conflict, busy, invalid or
+error.  state is the entry's keyword when clocking in changed it (see
+`org-clock-in-switch-to-state'), else null.  saved says this entry's
+file was saved, which happens when it had no unsaved edits before; the
+file of the entry clocked out is saved by the same rule."
+  (omarchy-org-agenda--act
+   (lambda () (omarchy-org-agenda--clock-in path line id from))))
+
+(defun omarchy-org-agenda--clock-stop (stop)
+  "Call STOP, a function stopping the running clock; return a result plist.
+The result is not-clocking without a clock, busy while a note is
+pending, else done with its note and saves."
+  (cond
+   ((not (omarchy-org-agenda--clocking-buffer)) (list :result "not-clocking"))
+   ((omarchy-org-agenda--busy-p) (list :result "busy"))
+   (t (omarchy-org-agenda--on-running-clock
+       (lambda () (funcall stop) (list :result "done"))))))
+
+(defun omarchy-org-agenda-clock-out ()
+  "Clock out the running Org clock, like O in Org's agenda.
+Called by the plugin through `emacsclient --eval'; never prompts, and
+never loads org-clock.
+
+Returns a JSON string {result, state, saved, detail}.  result is one of
+done, note or note-frame (the clock-out note of `org-log-note-clock-out':
+see `omarchy-org-agenda-set-state'), not-clocking, busy, needs-emacs
+or error.  state is the entry's keyword when clocking out changed it
+\(see `org-clock-out-switch-to-state'), else null.  saved says the
+entry's file was saved, which happens when it had no unsaved edits
+before."
+  (omarchy-org-agenda--act
+   (lambda () (omarchy-org-agenda--clock-stop (lambda () (org-clock-out))))))
+
+(defun omarchy-org-agenda-clock-cancel ()
+  "Cancel the running Org clock, like X in Org's agenda: no question asked.
+The clock line is removed.  Called by the plugin through `emacsclient
+--eval'; never prompts, and never loads org-clock.
+
+Returns a JSON string {result, state, saved, detail}, as
+`omarchy-org-agenda-clock-out' does; result is one of done,
+not-clocking, busy, needs-emacs or error."
+  (omarchy-org-agenda--act
+   (lambda () (omarchy-org-agenda--clock-stop #'org-clock-cancel))))
+
+(defun omarchy-org-agenda-clock-goto ()
+  "Show the running clock's entry in the selected frame, like J in the agenda.
+Shown as `omarchy-org-agenda-goto' shows an entry: widened as needed,
+unfolded, near the top.  Only a running clock counts, not Org's clock
+history: without one, signal a `user-error'.  Never loads org-clock.
+Returns t."
+  (unless (omarchy-org-agenda--clocking-buffer)
+    (user-error "No running clock"))
+  (omarchy-org-agenda--show org-clock-hd-marker))
+
+(defun omarchy-org-agenda--pomodoro-missing ()
+  "Why org-pomodoro can't be driven, or nil when it can.
+Loads org-pomodoro, as its command's autoload would, when it isn't
+loaded yet."
+  (if (not (or (featurep 'org-pomodoro)
+               (ignore-errors (require 'org-pomodoro nil t))))
+      "org-pomodoro can't be loaded"
+    (when-let* ((missing (or (seq-remove #'fboundp omarchy-org-agenda--pomodoro-steps)
+                             (seq-remove #'boundp omarchy-org-agenda--pomodoro-vars))))
+      (format "org-pomodoro has no %s" (car missing)))))
+
+(defun omarchy-org-agenda--pomodoro-session ()
+  "Do what the `org-pomodoro' command does first, answering its question.
+Once `org-pomodoro-expiry-time' has passed since the last pomodoro the
+count is reset, silently; then the last clock-in is now."
+  (when (and org-pomodoro-last-clock-in
+             org-pomodoro-expiry-time
+             (org-pomodoro-expires-p))
+    (setq org-pomodoro-count 0))
+  (setq org-pomodoro-last-clock-in (current-time)))
+
+(defconst omarchy-org-agenda--clocked-in-results '("done" "note" "note-frame")
+  "The clock-in results after which the entry holds the running clock.
+Done also when it already had the clock.  A note is about the state
+change or the previous clock's clock-out; the clock runs regardless.")
+
+(defun omarchy-org-agenda--pomodoro-started (clock-in start)
+  "The result of starting a pomodoro: CLOCK-IN's, completed with START's.
+CLOCK-IN is the clock-in's result, START the pomodoro step's.  When
+START is done, CLOCK-IN's result stands, a note included.  Otherwise no
+pomodoro runs but the clock does: START's result replaces a done (a
+note stays, for the popout to take), and the detail says so."
+  (if (equal (plist-get start :result) "done")
+      clock-in
+    (append (and (equal (plist-get clock-in :result) "done")
+                 (list :result (plist-get start :result)))
+            (list :detail (mapconcat
+                           #'identity
+                           (delq nil (list (plist-get start :detail)
+                                           "no pomodoro started; the clock is still running"
+                                           (plist-get clock-in :detail)))
+                           "; "))
+            clock-in)))
+
+(defun omarchy-org-agenda--pomodoro-start (path line id from)
+  "Clock in the entry, as `omarchy-org-agenda-clock-in' does, then start.
+The pomodoro starts, as with the `org-pomodoro' command, whenever the
+entry holds the running clock afterwards: the clock-in is done, also
+when the entry already had the clock, or queued a note.  Otherwise the
+clock-in's result comes back, and org-pomodoro is untouched.  See
+`omarchy-org-agenda--pomodoro-started' for the result."
+  (let ((clock-in (omarchy-org-agenda--clock-in path line id from)))
+    (if (member (plist-get clock-in :result) omarchy-org-agenda--clocked-in-results)
+        (omarchy-org-agenda--pomodoro-started
+         clock-in
+         ;; Outside the guard: its refusal is an error too.
+         (condition-case err
+             (omarchy-org-agenda--without-prompts
+              (lambda ()
+                (omarchy-org-agenda--pomodoro-session)
+                (org-pomodoro-start :pomodoro)
+                (list :result "done")))
+           (error (list :result "error" :detail (error-message-string err)))))
+      clock-in)))
+
+(defun omarchy-org-agenda--pomodoro-act (path line id from confirm)
+  "The steps of `omarchy-org-agenda-pomodoro'; return a result plist."
+  (let ((missing (omarchy-org-agenda--pomodoro-missing)))
+    (cond
+     (missing (list :result "unavailable" :detail missing))
+     ((eq org-pomodoro-state :overtime)
+      (if (omarchy-org-agenda--busy-p)
+          (list :result "busy")
+        (omarchy-org-agenda--on-running-clock
+         (lambda ()
+           (omarchy-org-agenda--pomodoro-session)
+           (org-pomodoro-finished)
+           (list :result "done")))))
+     ((org-pomodoro-active-p)
+      (cond
+       ((and org-pomodoro-ask-upon-killing (not confirm))
+        (list :result "confirm"))
+       ((omarchy-org-agenda--busy-p) (list :result "busy"))
+       (t (omarchy-org-agenda--on-running-clock
+           (lambda ()
+             (omarchy-org-agenda--pomodoro-session)
+             (org-pomodoro-kill)
+             (list :result "done"))))))
+     (t (omarchy-org-agenda--pomodoro-start path line id from)))))
+
+(defun omarchy-org-agenda-pomodoro (path line id from confirm)
+  "Start, finish or stop an org-pomodoro, like `org-pomodoro' but silent.
+Loads org-pomodoro when it isn't loaded.  Called by the plugin through
+`emacsclient --eval'; never prompts.  The `org-pomodoro' command's two
+questions are answered here: the count is reset silently once
+`org-pomodoro-expiry-time' has passed, and stopping needs CONFIRM.
+
+With no pomodoro running, clock in the entry at LINE of PATH, with ID
+and FROM, exactly as `omarchy-org-agenda-clock-in' does, then start a
+pomodoro.  It starts whenever the entry holds the running clock after
+the clock-in, as with the `org-pomodoro' command: also when the entry
+already had the clock, and when the clock-in queued a note.  In
+overtime, finish the pomodoro: clock out and start the break.  During a
+pomodoro or a break, stop it, which cancels the clock or clocks out
+\(see `org-pomodoro-keep-killed-pomodoro-time'); when
+`org-pomodoro-ask-upon-killing' is set, only with CONFIRM non-nil.
+PATH, LINE, ID and FROM are only used to start.
+
+Returns a JSON string {result, state, saved, detail}.  result is one of
+done, confirm (stopping needs CONFIRM; nothing changed), unavailable
+\(org-pomodoro can't be loaded, or lacks a step the plugin drives;
+detail says which), busy, any result of `omarchy-org-agenda-clock-in'
+when starting, or, when stopping, note or note-frame (a clock-out note),
+needs-emacs or error.  When starting, a note is the clock-in's, with the
+pomodoro running; needs-emacs or error after a done clock-in means the
+pomodoro didn't start but the clock runs, which detail says.  state and
+saved are as for clock-in when starting, and for the clocked entry
+otherwise."
+  (omarchy-org-agenda--act
+   (lambda () (omarchy-org-agenda--pomodoro-act path line id from confirm))))
 
 ;; Updated on every load, not just the first, so the plugin's mtime check
 ;; sees the version that is actually loaded.
