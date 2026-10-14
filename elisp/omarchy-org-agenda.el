@@ -39,7 +39,7 @@
       (put (cdr elt) 'function-history nil)
       (fmakunbound (cdr elt)))))
 
-(defconst omarchy-org-agenda-version "0.2.0")
+(defconst omarchy-org-agenda-version "0.2.1")
 (defconst omarchy-org-agenda-protocol 1)
 
 (defgroup omarchy-org-agenda nil
