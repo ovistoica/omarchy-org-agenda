@@ -12,7 +12,9 @@
 ;; by the scheduled tasks and timestamped entries (such as calendar
 ;; events) of the rest of the Org week (see `org-agenda-start-on-weekday').
 ;; The bar's file list is `omarchy-org-agenda-files-override', else
-;; `omarchy-org-agenda-files', else `org-agenda-files'.
+;; `omarchy-org-agenda-files', else `org-agenda-files'.  The running Org
+;; clock and org-pomodoro's state come with it, when those are loaded;
+;; reporting never loads them.
 ;;
 ;; `omarchy-org-agenda-week' returns another Org week (next week, last
 ;; week, ...) as a JSON string, for the popout to browse; it writes no
@@ -383,6 +385,127 @@ See `omarchy-org-agenda--index'."
                    index))))
     index))
 
+;;;; Timers: Org's clock and org-pomodoro
+;;
+;; Reporting never loads org-clock or org-pomodoro: their state is read
+;; only when the feature is already loaded, so a user who never clocks
+;; never pays for either.  org-pomodoro's variables belong to someone
+;; else's package, so each one is checked before it is used.
+
+(declare-function org-clocking-p "org-clock" ())
+(declare-function org-duration-to-minutes "org-duration" (duration &optional canonical))
+(defvar org-clock-start-time)
+(defvar org-clock-total-time)
+(defvar org-clock-effort)
+
+(defconst omarchy-org-agenda--clock-hooks
+  '(org-clock-in-hook org-clock-out-hook org-clock-cancel-hook)
+  "org-clock's hooks that run when the clock starts, stops or is cancelled.")
+
+(defconst omarchy-org-agenda--pomodoro-hooks
+  '(org-pomodoro-started-hook org-pomodoro-finished-hook
+    org-pomodoro-overtime-hook org-pomodoro-killed-hook
+    org-pomodoro-break-finished-hook)
+  "org-pomodoro's hooks that run when its state changes.
+The short and long break-finished hooks run together with
+break-finished, and the tick hook every second: neither is used.")
+
+(defconst omarchy-org-agenda--pomodoro-phases
+  '((:pomodoro . org-pomodoro-length)
+    (:overtime)
+    (:short-break . org-pomodoro-short-break-length)
+    (:long-break . org-pomodoro-long-break-length))
+  "org-pomodoro's running states, each with the variable holding its length.")
+
+(defvar omarchy-org-agenda--pomodoro-located nil
+  "Non-nil when the last `omarchy-org-agenda-ensure' found org-pomodoro.
+`locate-library' searches the whole load path: fine on a pull, too slow
+for every push.")
+
+(defun omarchy-org-agenda--epoch (time)
+  "TIME, a Lisp time value, in whole epoch seconds; nil if it isn't one."
+  (and (or (numberp time) (consp time))
+       (ignore-errors (truncate (float-time time)))))
+
+(defun omarchy-org-agenda--effort-minutes (effort)
+  "EFFORT, an Org duration string, in whole minutes; nil if it doesn't parse."
+  (when (org-string-nw-p effort)
+    (condition-case nil
+        (round (org-duration-to-minutes effort))
+      (error nil))))
+
+(defun omarchy-org-agenda--clock ()
+  "The running Org clock as a JSON plist, or nil when none runs.
+Its entry is described like an item: the same title, category, path
+and line, so the bar can match it to a row.  Read only when org-clock
+is loaded; never loads it."
+  (when (and (featurep 'org-clock) (org-clocking-p))
+    (let ((buf (marker-buffer org-clock-marker)))
+      (when (buffer-live-p buf)
+        (with-current-buffer buf
+          (org-with-wide-buffer
+           (goto-char org-clock-marker)
+           (org-back-to-heading t)
+           (let ((path (buffer-file-name (buffer-base-buffer)))
+                 (category (org-get-category)))
+             (list :title (omarchy-org-agenda--title)
+                   :category (or (and (stringp category)
+                                      (omarchy-org-agenda--clean category))
+                                 :null)
+                   :path (or path :null)
+                   :line (if path (line-number-at-pos) :null)
+                   :startedAt (or (omarchy-org-agenda--epoch org-clock-start-time)
+                                  :null)
+                   ;; What `org-clock-mode-line-total' counts from before.
+                   :baseMin (if (numberp org-clock-total-time)
+                                (round org-clock-total-time)
+                              0)
+                   :effortMin (or (omarchy-org-agenda--effort-minutes
+                                   org-clock-effort)
+                                  :null)))))))))
+
+(defun omarchy-org-agenda--pomodoro-value (var pred)
+  "The value of org-pomodoro's VAR when it is bound and satisfies PRED."
+  (and (boundp var)
+       (funcall pred (symbol-value var))
+       (symbol-value var)))
+
+(defun omarchy-org-agenda--pomodoro ()
+  "org-pomodoro's state as a JSON plist; see `omarchy-org-agenda-export'.
+Read only when org-pomodoro is loaded; never loads it.  An unknown
+state counts as none, a value of the wrong type as unset."
+  (let* ((loaded (featurep 'org-pomodoro))
+         (state (and loaded (omarchy-org-agenda--pomodoro-value
+                             'org-pomodoro-state #'keywordp)))
+         (phase (assq state omarchy-org-agenda--pomodoro-phases)))
+    (list :available (if (or loaded omarchy-org-agenda--pomodoro-located) t :false)
+          :state (if phase (substring (symbol-name state) 1) "none")
+          :endsAt (or (and phase
+                           (omarchy-org-agenda--epoch
+                            (omarchy-org-agenda--pomodoro-value
+                             'org-pomodoro-end-time #'always)))
+                      :null)
+          :phaseMin (or (and (cdr phase)
+                             (omarchy-org-agenda--pomodoro-value
+                              (cdr phase) #'numberp))
+                        :null)
+          :count (or (and loaded (omarchy-org-agenda--pomodoro-value
+                                  'org-pomodoro-count #'natnump))
+                     0)
+          ;; org-pomodoro's default is to ask.
+          :askKill (if (and loaded
+                            (boundp 'org-pomodoro-ask-upon-killing)
+                            (not (symbol-value 'org-pomodoro-ask-upon-killing)))
+                       :false
+                     t))))
+
+(defun omarchy-org-agenda--timers ()
+  "The :clock and :pomodoro fields of the bar's export."
+  ;; A clock that can't be read is reported as none: the agenda still
+  ;; goes out.
+  (list :clock (or (ignore-errors (omarchy-org-agenda--clock)) :null)
+        :pomodoro (omarchy-org-agenda--pomodoro)))
+
 ;;;; Output
 
 (defun omarchy-org-agenda--private-dir (dir)
@@ -435,19 +558,34 @@ REASON (default \"pull\") is echoed in the payload.  Agenda files that
 don't exist are skipped and listed under :missing.  Errors are written
 into the file too, so the bar can show them; only a failure to write
 it, such as an output directory that isn't private (see
-`omarchy-org-agenda--private-dir'), signals."
+`omarchy-org-agenda--private-dir'), signals.
+
+The timers follow, error or not, read only from features already
+loaded (see `omarchy-org-agenda--clock' and `--pomodoro'):
+:clock is null, or the running clock's entry {title, category, path,
+line} as its item has them, with startedAt (epoch seconds), baseMin
+\(the minutes `org-clock-mode-line-total' counts from before) and
+effortMin (null without a valid Effort): Org's mode line shows
+baseMin + the minutes since startedAt.
+:pomodoro is {available, state, endsAt, phaseMin, count, askKill}:
+available when org-pomodoro is loaded or on the load path; state is
+none, pomodoro, overtime, short-break or long-break; endsAt (epoch
+seconds; in overtime, when it began) and phaseMin (the phase's length)
+are null without a phase; askKill is `org-pomodoro-ask-upon-killing'."
   (let* ((today (calendar-absolute-from-gregorian (calendar-current-date)))
          (payload
-          (omarchy-org-agenda--payload
-           (or reason "pull")
-           (lambda (files)
-             (let ((ahead (omarchy-org-agenda--days-ahead
-                           (calendar-day-of-week (calendar-current-date))
-                           org-agenda-start-on-weekday)))
-               (list :items (vconcat (omarchy-org-agenda--items
-                                      (omarchy-org-agenda--entries files ahead)
-                                      today))
-                     :daysAhead ahead))))))
+          (append
+           (omarchy-org-agenda--payload
+            (or reason "pull")
+            (lambda (files)
+              (let ((ahead (omarchy-org-agenda--days-ahead
+                            (calendar-day-of-week (calendar-current-date))
+                            org-agenda-start-on-weekday)))
+                (list :items (vconcat (omarchy-org-agenda--items
+                                       (omarchy-org-agenda--entries files ahead)
+                                       today))
+                      :daysAhead ahead))))
+           (omarchy-org-agenda--timers))))
     (setq omarchy-org-agenda--index
           (omarchy-org-agenda--build-index (append (plist-get payload :items) nil)))
     (omarchy-org-agenda--write payload)
@@ -566,6 +704,14 @@ pull reports it."
   "Re-export after an agenda buffer is built."
   (omarchy-org-agenda--schedule "agenda"))
 
+(defun omarchy-org-agenda--on-clock ()
+  "Re-export after Org's clock starts, stops or is cancelled."
+  (omarchy-org-agenda--schedule "clock"))
+
+(defun omarchy-org-agenda--on-pomodoro ()
+  "Re-export after org-pomodoro changes state."
+  (omarchy-org-agenda--schedule "pomodoro"))
+
 (defun omarchy-org-agenda--on-files (_symbol _newval operation _where)
   "Re-export when `org-agenda-files' is set and the bar follows it.
 OPERATION is the watcher's operation; only `set' counts, so the
@@ -581,11 +727,15 @@ list doesn't follow `org-agenda-files', so its changes don't matter."
   "Point the exporter at OUTPUT; idempotent, called by the plugin on every pull.
 FILES overrides `org-agenda-files'.  PUSH installs the change hooks.
 Exports the hooks trigger use these settings too.
+Also looks for org-pomodoro on the load path, without loading it, so
+one installed later counts from the next pull.
 _UPCOMING is accepted and ignored: a shell not yet restarted after an
 update may still send it, while Emacs already runs this file.  The
 export follows the Org week instead (see `org-agenda-start-on-weekday')."
   (setq omarchy-org-agenda-output (expand-file-name output)
-        omarchy-org-agenda-files-override files)
+        omarchy-org-agenda-files-override files
+        omarchy-org-agenda--pomodoro-located
+        (and (locate-library "org-pomodoro") t))
   (unless (eq (and push t) omarchy-org-agenda--push)
     (omarchy-org-agenda--remove-push-hooks)
     (when push
@@ -593,6 +743,12 @@ export follows the Org week instead (see `org-agenda-start-on-weekday')."
       (add-hook 'after-revert-hook #'omarchy-org-agenda--on-revert)
       (add-hook 'org-after-todo-state-change-hook #'omarchy-org-agenda--on-todo)
       (add-hook 'org-agenda-finalize-hook #'omarchy-org-agenda--on-agenda)
+      ;; org-clock and org-pomodoro may not be loaded yet: `add-hook'
+      ;; binds their hook variables, and their `defvar's keep the value.
+      (dolist (hook omarchy-org-agenda--clock-hooks)
+        (add-hook hook #'omarchy-org-agenda--on-clock))
+      (dolist (hook omarchy-org-agenda--pomodoro-hooks)
+        (add-hook hook #'omarchy-org-agenda--on-pomodoro))
       (add-variable-watcher 'org-agenda-files #'omarchy-org-agenda--on-files)
       (setq omarchy-org-agenda--push t)))
   t)
@@ -603,6 +759,10 @@ export follows the Org week instead (see `org-agenda-start-on-weekday')."
   (remove-hook 'after-revert-hook #'omarchy-org-agenda--on-revert)
   (remove-hook 'org-after-todo-state-change-hook #'omarchy-org-agenda--on-todo)
   (remove-hook 'org-agenda-finalize-hook #'omarchy-org-agenda--on-agenda)
+  (dolist (hook omarchy-org-agenda--clock-hooks)
+    (remove-hook hook #'omarchy-org-agenda--on-clock))
+  (dolist (hook omarchy-org-agenda--pomodoro-hooks)
+    (remove-hook hook #'omarchy-org-agenda--on-pomodoro))
   (remove-variable-watcher 'org-agenda-files #'omarchy-org-agenda--on-files)
   (when (timerp omarchy-org-agenda--timer)
     (cancel-timer omarchy-org-agenda--timer))

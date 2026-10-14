@@ -9,6 +9,7 @@
 (require 'cl-lib)
 (require 'org)
 (require 'org-agenda)
+(require 'org-clock)
 (require 'org-habit)
 (require 'org-id)
 (require 'omarchy-org-agenda)
@@ -176,8 +177,27 @@ cleaned up afterwards."
                (omarchy-org-agenda-test--fixture-text))))
     (cons file (omarchy-org-agenda-test--export dir (list file) "test"))))
 
+(defconst omarchy-org-agenda-test--clock-hooks
+  '(org-clock-in-hook org-clock-out-hook org-clock-cancel-hook)
+  "org-clock's hooks the package must use.")
+
+(defconst omarchy-org-agenda-test--pomodoro-hooks
+  '(org-pomodoro-started-hook org-pomodoro-finished-hook
+    org-pomodoro-overtime-hook org-pomodoro-killed-hook
+    org-pomodoro-break-finished-hook)
+  "org-pomodoro's hooks the package must use.")
+
+(defun omarchy-org-agenda-test--count-in-hooks (fn hooks)
+  "How many times FN is on the global value of HOOKS, unbound ones included."
+  (apply #'+ (mapcar (lambda (hook)
+                       (if (default-boundp hook)
+                           (cl-count fn (default-value hook))
+                         0))
+                     hooks)))
+
 (defun omarchy-org-agenda-test--hooks-installed ()
-  "How many of the package's hooks and watchers are installed, as a plist."
+  "How many of the package's hooks and watchers are installed, as a plist.
+:clock and :pomodoro add up over all of their hooks."
   (list :save (cl-count #'omarchy-org-agenda--on-save after-save-hook)
         :revert (cl-count #'omarchy-org-agenda--on-revert after-revert-hook)
         :todo (cl-count #'omarchy-org-agenda--on-todo
@@ -185,7 +205,21 @@ cleaned up afterwards."
         :agenda (cl-count #'omarchy-org-agenda--on-agenda
                           org-agenda-finalize-hook)
         :watcher (cl-count #'omarchy-org-agenda--on-files
-                           (get-variable-watchers 'org-agenda-files))))
+                           (get-variable-watchers 'org-agenda-files))
+        :clock (omarchy-org-agenda-test--count-in-hooks
+                #'omarchy-org-agenda--on-clock
+                omarchy-org-agenda-test--clock-hooks)
+        :pomodoro (omarchy-org-agenda-test--count-in-hooks
+                   #'omarchy-org-agenda--on-pomodoro
+                   omarchy-org-agenda-test--pomodoro-hooks)))
+
+(defconst omarchy-org-agenda-test--no-hooks
+  '(:save 0 :revert 0 :todo 0 :agenda 0 :watcher 0 :clock 0 :pomodoro 0)
+  "`omarchy-org-agenda-test--hooks-installed' without push.")
+
+(defconst omarchy-org-agenda-test--all-hooks
+  '(:save 1 :revert 1 :todo 1 :agenda 1 :watcher 1 :clock 3 :pomodoro 5)
+  "`omarchy-org-agenda-test--hooks-installed' with push: each hook once.")
 
 ;;;; Tests
 
@@ -200,7 +234,18 @@ cleaned up afterwards."
       (should (equal ["NEXT" "TODO" "WAIT"]
                      (plist-get (plist-get payload :keywords) :todo)))
       (should (equal ["DONE" "CANCELED"]
-                     (plist-get (plist-get payload :keywords) :done))))))
+                     (plist-get (plist-get payload :keywords) :done)))
+      ;; The timers come last; nothing runs, org-pomodoro isn't around.
+      (should (equal '(version date generatedAt reason emacs org keywords items
+                               daysAhead missing error clock pomodoro)
+                     (mapcar #'car (json-parse-string
+                                    (omarchy-org-agenda-test--slurp
+                                     (expand-file-name "agenda.json" dir))
+                                    :object-type 'alist))))
+      (should (eq :null (plist-get payload :clock)))
+      (should (equal '(:available :false :state "none" :endsAt :null
+                                  :phaseMin :null :count 0 :askKill t)
+                     (plist-get payload :pomodoro))))))
 
 (ert-deftest omarchy-org-agenda-test-item-fields ()
   (omarchy-org-agenda-test--with-dir (dir)
@@ -525,8 +570,8 @@ planted links."
 (ert-deftest omarchy-org-agenda-test-push-hooks ()
   (omarchy-org-agenda-test--with-dir (dir)
     (let ((out (expand-file-name "agenda.json" dir))
-          (none '(:save 0 :revert 0 :todo 0 :agenda 0 :watcher 0))
-          (once '(:save 1 :revert 1 :todo 1 :agenda 1 :watcher 1)))
+          (none omarchy-org-agenda-test--no-hooks)
+          (once omarchy-org-agenda-test--all-hooks))
       (should (equal none (omarchy-org-agenda-test--hooks-installed)))
       (omarchy-org-agenda-ensure out nil t)
       (should (equal once (omarchy-org-agenda-test--hooks-installed)))
@@ -1639,6 +1684,382 @@ The Org week started `omarchy-org-agenda-test--week-back' days ago."
       (omarchy-org-agenda-teardown)
       (should-not omarchy-org-agenda--week-index))))
 
+;;;; Timers: Org's clock
+
+(defun omarchy-org-agenda-test--inactive (offset hh:mm)
+  "Inactive Org timestamp at HH:MM, OFFSET days from today."
+  (let ((system-time-locale "C"))
+    (format-time-string (concat "[%F %a " hh:mm "]")
+                        (encode-time (omarchy-org-agenda-test--day offset)))))
+
+(defun omarchy-org-agenda-test--clock-text ()
+  "The clock fixture: an entry with an Effort and 45 minutes clocked earlier."
+  (let ((today (concat "SCHEDULED: " (omarchy-org-agenda-test--ts 0) "\n")))
+    (concat
+     "* TODO Other task\n" today
+     "* TODO Clock target \1 weird\n" today
+     ":PROPERTIES:\n:Effort:   1:30\n:END:\n"
+     ":LOGBOOK:\n"
+     "CLOCK: " (omarchy-org-agenda-test--inactive -1 "10:00")
+     "--" (omarchy-org-agenda-test--inactive -1 "10:45") " =>  0:45\n"
+     ":END:\n")))
+
+(defun omarchy-org-agenda-test--sloppy (dir)
+  "Write an entry with an Effort that doesn't parse into DIR; return its file.
+Org's own agenda signals on such an Effort, so it is kept out of the
+exported files: a clock can run in any file."
+  (omarchy-org-agenda-test--write
+   (expand-file-name "sloppy.org" dir)
+   "* TODO Sloppy effort\n:PROPERTIES:\n:Effort:   soonish\n:END:\n"))
+
+(defun omarchy-org-agenda-test--goto-heading (title)
+  "Move to the heading whose title contains TITLE, in a widened buffer."
+  (widen)
+  (goto-char (point-min))
+  (re-search-forward (concat "^\\*.*" (regexp-quote title)))
+  (org-back-to-heading t))
+
+(defun omarchy-org-agenda-test--file-line (file title)
+  "The line of the heading of FILE whose title contains TITLE, on disk."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (re-search-forward (concat "^\\*.*" (regexp-quote title)))
+    (line-number-at-pos)))
+
+(defmacro omarchy-org-agenda-test--with-clock (spec &rest body)
+  "Run BODY with (FILE) of SPEC bound to the clock fixture in DIR.
+Org's clock is cancelled afterwards, whatever happens, so no clock or
+clock timer leaks into other tests."
+  (declare (indent 1) (debug ((symbolp) body)))
+  `(omarchy-org-agenda-test--with-dir (dir)
+     (let ((org-clock-auto-clock-resolution nil)
+           ;; Counts every earlier CLOCK line: baseMin is 45.
+           (org-clock-mode-line-total 'all)
+           (org-clock-in-switch-to-state nil)
+           (,(car spec) (omarchy-org-agenda-test--write
+                         (expand-file-name "clock.org" dir)
+                         (omarchy-org-agenda-test--clock-text))))
+       (unwind-protect (progn ,@body)
+         (when (org-clocking-p) (org-clock-cancel))))))
+
+(defun omarchy-org-agenda-test--clock-in (file title)
+  "Clock into the heading of FILE whose title contains TITLE."
+  (with-current-buffer (find-file-noselect file)
+    (save-restriction
+      (omarchy-org-agenda-test--goto-heading title)
+      (org-clock-in))))
+
+(ert-deftest omarchy-org-agenda-test-clock-fields ()
+  (omarchy-org-agenda-test--with-clock (file)
+    (omarchy-org-agenda-test--clock-in file "Clock target")
+    (should (org-clocking-p))
+    (let* ((payload (omarchy-org-agenda-test--export dir (list file) "test"))
+           (clock (plist-get payload :clock))
+           (item (omarchy-org-agenda-test--item payload "Clock target")))
+      (should (equal (plist-get item :title) (plist-get clock :title)))
+      (should (string-prefix-p "Clock target" (plist-get clock :title)))
+      (should (equal (plist-get item :category) (plist-get clock :category)))
+      (should (equal "clock" (plist-get clock :category)))
+      (should (equal (plist-get item :path) (plist-get clock :path)))
+      (should (file-equal-p file (plist-get clock :path)))
+      (should (equal (plist-get item :line) (plist-get clock :line)))
+      (should (equal (omarchy-org-agenda-test--file-line file "Clock target")
+                     (plist-get clock :line)))
+      (should (integerp (plist-get clock :startedAt)))
+      (should (equal (truncate (float-time org-clock-start-time))
+                     (plist-get clock :startedAt)))
+      (should (equal 45 (plist-get clock :baseMin)))
+      (should (equal 90 (plist-get clock :effortMin)))
+      (should (equal '(:title :category :path :line :startedAt :baseMin :effortMin)
+                     (seq-filter #'keywordp clock)))
+      ;; The browsed week never carries the timers.
+      (let ((week (cdr (omarchy-org-agenda-test--week dir (list file) 0))))
+        (should (omarchy-org-agenda-test--item week "Clock target"))
+        (should-not (plist-member week :clock))
+        (should-not (plist-member week :pomodoro))))))
+
+(ert-deftest omarchy-org-agenda-test-clock-none ()
+  (omarchy-org-agenda-test--with-clock (file)
+    (should (featurep 'org-clock))
+    (should-not (org-clocking-p))
+    (should (eq :null (plist-get (omarchy-org-agenda-test--export dir (list file))
+                                 :clock)))
+    ;; Clocked out: none again.
+    (omarchy-org-agenda-test--clock-in file "Clock target")
+    (org-clock-out)
+    (should (eq :null (plist-get (omarchy-org-agenda-test--export dir (list file))
+                                 :clock)))))
+
+(ert-deftest omarchy-org-agenda-test-clock-effort ()
+  (omarchy-org-agenda-test--with-clock (file)
+    (let ((sloppy (omarchy-org-agenda-test--sloppy dir)))
+      ;; Org 9.6 and 9.7 parse the Effort on clock-in; it is the export
+      ;; that must survive it, so set it as Org would have.
+      (ignore-errors (omarchy-org-agenda-test--clock-in sloppy "Sloppy effort"))
+      (should (org-clocking-p))
+      (setq org-clock-effort "soonish")
+      (let* ((payload (omarchy-org-agenda-test--export dir (list file)))
+             (clock (plist-get payload :clock)))
+        (should (eq :null (plist-get payload :error)))
+        (should (equal "Sloppy effort" (plist-get clock :title)))
+        (should (equal (omarchy-org-agenda-test--file-line sloppy "Sloppy")
+                       (plist-get clock :line)))
+        (should (eq :null (plist-get clock :effortMin)))
+        (should (equal 0 (plist-get clock :baseMin)))))
+    (org-clock-cancel)
+    (omarchy-org-agenda-test--clock-in file "Other task")
+    (let ((clock (plist-get (omarchy-org-agenda-test--export dir (list file)) :clock)))
+      (should (equal "Other task" (plist-get clock :title)))
+      (should (eq :null (plist-get clock :effortMin))))
+    ;; Whatever ends up in someone else's variables.
+    (dolist (effort '(nil "" "  " 90 "1:30x"))
+      (let ((org-clock-effort effort)
+            (org-clock-total-time "45"))
+        (let ((clock (plist-get (omarchy-org-agenda--timers) :clock)))
+          (should (eq :null (plist-get clock :effortMin)))
+          (should (equal 0 (plist-get clock :baseMin))))))
+    (let ((org-clock-start-time ""))
+      (should (eq :null (plist-get (plist-get (omarchy-org-agenda--timers) :clock)
+                                   :startedAt))))))
+
+(ert-deftest omarchy-org-agenda-test-clock-narrowed ()
+  (omarchy-org-agenda-test--with-clock (file)
+    (omarchy-org-agenda-test--clock-in file "Clock target")
+    (let ((line (omarchy-org-agenda-test--file-line file "Clock target")))
+      (with-current-buffer (find-file-noselect file)
+        ;; Narrowed away from the clock, then down to its own subtree.
+        (omarchy-org-agenda-test--goto-heading "Other task")
+        (org-narrow-to-subtree)
+        (let ((clock (plist-get (omarchy-org-agenda--timers) :clock)))
+          (should (equal line (plist-get clock :line)))
+          (should (string-prefix-p "Clock target" (plist-get clock :title))))
+        (omarchy-org-agenda-test--goto-heading "Clock target")
+        (org-narrow-to-subtree)
+        (should (equal line (plist-get (plist-get (omarchy-org-agenda--timers) :clock)
+                                       :line)))
+        (should (buffer-narrowed-p))))))
+
+(ert-deftest omarchy-org-agenda-test-clock-dead-buffer ()
+  ;; A clock whose buffer is gone, as `org-clocking-p' can't see it.
+  (let ((org-clock-marker (with-temp-buffer (insert "* Gone\n") (point-marker))))
+    (cl-letf (((symbol-function 'org-clocking-p) #'always))
+      (should (eq :null (plist-get (omarchy-org-agenda--timers) :clock))))))
+
+(ert-deftest omarchy-org-agenda-test-clock-non-file ()
+  (with-temp-buffer
+    (org-mode)
+    (insert "* TODO Scratch entry\n")
+    (let ((org-clock-marker (copy-marker (point-min)))
+          (org-clock-start-time (time-convert 1700000000 'list))
+          (org-clock-total-time 5)
+          (org-clock-effort "0:20"))
+      (cl-letf (((symbol-function 'org-clocking-p) #'always))
+        ;; Org's category for a buffer without a file is "???".
+        (should (equal '(:title "Scratch entry" :category "???" :path :null
+                                :line :null :startedAt 1700000000
+                                :baseMin 5 :effortMin 20)
+                       (plist-get (omarchy-org-agenda--timers) :clock)))))))
+
+;;;; Timers: org-pomodoro, through a stub
+
+(defconst omarchy-org-agenda-test--pomodoro-stub
+  (concat
+   ";;; org-pomodoro.el --- Test stub  -*- lexical-binding: t; -*-\n"
+   "(defvar org-pomodoro-state :none)\n"
+   "(defvar org-pomodoro-end-time nil)\n"
+   "(defvar org-pomodoro-length 25)\n"
+   "(defvar org-pomodoro-short-break-length 5)\n"
+   "(defvar org-pomodoro-long-break-length 20)\n"
+   "(defvar org-pomodoro-count 0)\n"
+   "(defvar org-pomodoro-ask-upon-killing t)\n"
+   (mapconcat (lambda (hook) (format "(defvar %s nil)\n" hook))
+              omarchy-org-agenda-test--pomodoro-hooks
+              "")
+   "(provide 'org-pomodoro)\n")
+  "A stand-in for org-pomodoro: its variables and hooks, nothing else.
+The CI images don't have the real one.")
+
+(defun omarchy-org-agenda-test--write-stub (dir)
+  "Write the org-pomodoro stub into DIR/stub/; return that directory."
+  (let ((stub (expand-file-name "stub/" dir)))
+    (make-directory stub t)
+    (omarchy-org-agenda-test--write (expand-file-name "org-pomodoro.el" stub)
+                                    omarchy-org-agenda-test--pomodoro-stub)
+    stub))
+
+(defmacro omarchy-org-agenda-test--with-stub (spec &rest body)
+  "Run BODY with (STUB) of SPEC, the stub's directory, on `load-path'.
+The stub isn't loaded; whatever BODY loads is unloaded afterwards, so
+neither the feature nor its variables leak into other tests."
+  (declare (indent 1) (debug ((symbolp) body)))
+  `(omarchy-org-agenda-test--with-dir (dir)
+     (let* ((,(car spec) (omarchy-org-agenda-test--write-stub dir))
+            (load-path (cons ,(car spec) load-path))
+            (omarchy-org-agenda--pomodoro-located nil))
+       (unwind-protect (progn ,@body)
+         (when (featurep 'org-pomodoro)
+           (unload-feature 'org-pomodoro t))))))
+
+(ert-deftest omarchy-org-agenda-test-pomodoro-available ()
+  (omarchy-org-agenda-test--with-dir (dir)
+    (let ((a (omarchy-org-agenda-test--small dir "A")))
+      (should-not (locate-library "org-pomodoro"))
+      (should (eq :false (plist-get (plist-get (omarchy-org-agenda-test--export
+                                                dir (list a))
+                                               :pomodoro)
+                                    :available)))))
+  (omarchy-org-agenda-test--with-stub (stub)
+    (let ((a (omarchy-org-agenda-test--small dir "A")))
+      ;; Found on the load path, never loaded to check.
+      (should (equal '(:available t :state "none" :endsAt :null
+                                  :phaseMin :null :count 0 :askKill t)
+                     (plist-get (omarchy-org-agenda-test--export dir (list a))
+                                :pomodoro)))
+      (should-not (featurep 'org-pomodoro))
+      (should-not (boundp 'org-pomodoro-state))
+      ;; Uninstalled: gone from the next pull on.
+      (let ((load-path (remove stub load-path)))
+        (should (eq :false (plist-get (plist-get (omarchy-org-agenda-test--export
+                                                  dir (list a))
+                                                 :pomodoro)
+                                      :available)))))))
+
+(ert-deftest omarchy-org-agenda-test-pomodoro-states ()
+  (omarchy-org-agenda-test--with-stub (_stub)
+    (require 'org-pomodoro)
+    (let ((end (time-add nil 600))
+          (pomodoro (lambda () (plist-get (omarchy-org-agenda--timers) :pomodoro))))
+      (setq org-pomodoro-end-time end
+            org-pomodoro-count 2)
+      (pcase-dolist (`(,state ,name ,phase)
+                     '((:pomodoro "pomodoro" 25)
+                       (:overtime "overtime" :null)
+                       (:short-break "short-break" 5)
+                       (:long-break "long-break" 20)))
+        (setq org-pomodoro-state state)
+        (should (equal (list :available t :state name
+                             :endsAt (truncate (float-time end))
+                             :phaseMin phase :count 2 :askKill t)
+                       (funcall pomodoro))))
+      ;; No phase: no end, no length, whatever the variables still say.
+      (dolist (state '(:none :weird pomodoro "pomodoro" nil 3))
+        (setq org-pomodoro-state state)
+        (should (equal (list :available t :state "none" :endsAt :null
+                             :phaseMin :null :count 2 :askKill t)
+                       (funcall pomodoro))))
+      ;; Garbage in someone else's variables.
+      (setq org-pomodoro-state :pomodoro
+            org-pomodoro-end-time "soon"
+            org-pomodoro-length "25"
+            org-pomodoro-count -1
+            org-pomodoro-ask-upon-killing nil)
+      (should (equal '(:available t :state "pomodoro" :endsAt :null
+                                  :phaseMin :null :count 0 :askKill :false)
+                     (funcall pomodoro)))
+      (setq org-pomodoro-end-time 1700000000.7
+            org-pomodoro-length 0.5
+            org-pomodoro-count 'many)
+      (should (equal '(:available t :state "pomodoro" :endsAt 1700000000
+                                  :phaseMin 0.5 :count 0 :askKill :false)
+                     (funcall pomodoro)))
+      ;; And through the JSON, into the file.
+      (setq org-pomodoro-state :short-break
+            org-pomodoro-end-time end
+            org-pomodoro-count 4
+            org-pomodoro-ask-upon-killing t)
+      (should (equal (list :available t :state "short-break"
+                           :endsAt (truncate (float-time end))
+                           :phaseMin 5 :count 4 :askKill t)
+                     (plist-get (omarchy-org-agenda-test--export
+                                 dir (list (omarchy-org-agenda-test--small dir "A")))
+                                :pomodoro))))))
+
+;; Named to run after every test that loads the stub: none leaves it behind.
+(ert-deftest omarchy-org-agenda-test-zz-pomodoro-stub-gone ()
+  (should-not (featurep 'org-pomodoro))
+  (should-not (boundp 'org-pomodoro-state))
+  (should-not (boundp 'org-pomodoro-count))
+  (should-not (locate-library "org-pomodoro")))
+
+;;;; Timers: hooks and loading
+
+(defun omarchy-org-agenda-test--scheduled-reason ()
+  "The reason of the pending push export, or nil."
+  (and (timerp omarchy-org-agenda--timer)
+       (car (timer--args omarchy-org-agenda--timer))))
+
+(ert-deftest omarchy-org-agenda-test-timers-hooks ()
+  (omarchy-org-agenda-test--with-stub (_stub)
+    (let ((out (expand-file-name "agenda.json" dir)))
+      (omarchy-org-agenda-ensure out nil nil)
+      (should (equal omarchy-org-agenda-test--no-hooks
+                     (omarchy-org-agenda-test--hooks-installed)))
+      ;; Before org-pomodoro loads: its `defvar's keep our functions.
+      (omarchy-org-agenda-ensure out nil t)
+      (should (equal omarchy-org-agenda-test--all-hooks
+                     (omarchy-org-agenda-test--hooks-installed)))
+      (should-not (featurep 'org-pomodoro))
+      (require 'org-pomodoro)
+      (should (equal omarchy-org-agenda-test--all-hooks
+                     (omarchy-org-agenda-test--hooks-installed)))
+      (dolist (case (append
+                     (mapcar (lambda (hook) (cons hook "clock"))
+                             omarchy-org-agenda-test--clock-hooks)
+                     (mapcar (lambda (hook) (cons hook "pomodoro"))
+                             omarchy-org-agenda-test--pomodoro-hooks)))
+        (omarchy-org-agenda--schedule "other")
+        (run-hooks (car case))
+        (should (equal (cdr case) (omarchy-org-agenda-test--scheduled-reason))))
+      (omarchy-org-agenda--remove-push-hooks)
+      (should (equal omarchy-org-agenda-test--no-hooks
+                     (omarchy-org-agenda-test--hooks-installed)))
+      (should-not omarchy-org-agenda--timer)
+      (omarchy-org-agenda-ensure out nil t)
+      (omarchy-org-agenda-teardown)
+      (should (equal omarchy-org-agenda-test--no-hooks
+                     (omarchy-org-agenda-test--hooks-installed))))))
+
+(ert-deftest omarchy-org-agenda-test-timers-clock-in-pushes ()
+  (omarchy-org-agenda-test--with-clock (file)
+    (omarchy-org-agenda-ensure (expand-file-name "agenda.json" dir) (list file) t)
+    (omarchy-org-agenda-test--clock-in file "Clock target")
+    (should (equal "clock" (omarchy-org-agenda-test--scheduled-reason)))
+    (omarchy-org-agenda--schedule "other")
+    (org-clock-cancel)
+    (should (equal "clock" (omarchy-org-agenda-test--scheduled-reason)))
+    ;; The scheduled export itself: the clock is gone.
+    (omarchy-org-agenda--push-export "clock")
+    (let ((payload (omarchy-org-agenda-test--read omarchy-org-agenda-output)))
+      (should (equal "clock" (plist-get payload :reason)))
+      (should (eq :null (plist-get payload :clock))))))
+
+(ert-deftest omarchy-org-agenda-test-timers-never-load ()
+  ;; A fresh Emacs, as the user's: org-clock and org-pomodoro not loaded.
+  (omarchy-org-agenda-test--with-dir (dir)
+    (let* ((stub (omarchy-org-agenda-test--write-stub dir))
+           (a (omarchy-org-agenda-test--small dir "A"))
+           (out (expand-file-name "agenda.json" dir))
+           (form (format "(progn
+  (omarchy-org-agenda-ensure %S (list %S) t)
+  (omarchy-org-agenda-export \"pull\")
+  (prin1 (list (featurep 'org-clock) (featurep 'org-pomodoro))))"
+                         out a))
+           (result
+            (with-temp-buffer
+              (should (eql 0 (call-process
+                              (expand-file-name invocation-name invocation-directory)
+                              nil '(t nil) nil
+                              "--batch" "-Q" "-L" stub
+                              "-l" omarchy-org-agenda-test--source
+                              "--eval" form)))
+              (car (read-from-string (buffer-string)))))
+           (payload (omarchy-org-agenda-test--read out)))
+      (should (equal '(nil nil) result))
+      (should (equal '("Item in A") (omarchy-org-agenda-test--titles payload)))
+      (should (eq :null (plist-get payload :clock)))
+      (should (eq t (plist-get (plist-get payload :pomodoro) :available)))
+      (should (equal "none" (plist-get (plist-get payload :pomodoro) :state))))))
+
 (defun omarchy-org-agenda-test--queue-note (dir)
   "Leave a state-change note queued for a fixture in DIR; return its timer."
   (let* ((file (omarchy-org-agenda-test--write
@@ -1669,18 +2090,21 @@ The Org week started `omarchy-org-agenda-test--week-back' days ago."
     (unwind-protect
         (let ((timer (omarchy-org-agenda-test--queue-note dir)))
           (omarchy-org-agenda-ensure out nil t)
-          (should (equal '(:save 1 :revert 1 :todo 1 :agenda 1 :watcher 1)
+          (should (equal omarchy-org-agenda-test--all-hooks
                          (omarchy-org-agenda-test--hooks-installed)))
           (unload-feature 'omarchy-org-agenda t)
           (should-not (featurep 'omarchy-org-agenda))
-          (dolist (hook '(after-save-hook after-revert-hook post-command-hook
-                          org-after-todo-state-change-hook org-agenda-finalize-hook))
+          (dolist (hook (append '(after-save-hook after-revert-hook post-command-hook
+                                  org-after-todo-state-change-hook
+                                  org-agenda-finalize-hook)
+                                omarchy-org-agenda-test--clock-hooks
+                                omarchy-org-agenda-test--pomodoro-hooks))
             (should-not (seq-filter
                          (lambda (fn)
                            (and (symbolp fn)
                                 (string-prefix-p "omarchy-org-agenda-"
                                                  (symbol-name fn))))
-                         (default-value hook))))
+                         (and (default-boundp hook) (default-value hook)))))
           (should-not (get-variable-watchers 'org-agenda-files))
           (omarchy-org-agenda-test--note-gone timer)
           (should-not (boundp 'omarchy-org-agenda--index))
@@ -1712,10 +2136,10 @@ The Org week started `omarchy-org-agenda-test--week-back' days ago."
           (should-not (get 'omarchy-org-agenda-export 'function-history))
           (should-not (get 'omarchy-org-agenda-set-state 'function-history))
           ;; The reload tore the hooks down; the plugin's ensure brings them back.
-          (should (equal '(:save 0 :revert 0 :todo 0 :agenda 0 :watcher 0)
+          (should (equal omarchy-org-agenda-test--no-hooks
                          (omarchy-org-agenda-test--hooks-installed)))
           (omarchy-org-agenda-ensure out nil t)
-          (should (equal '(:save 1 :revert 1 :todo 1 :agenda 1 :watcher 1)
+          (should (equal omarchy-org-agenda-test--all-hooks
                          (omarchy-org-agenda-test--hooks-installed)))
           (unload-feature 'omarchy-org-agenda t)
           (should-not (fboundp 'omarchy-org-agenda-export))
