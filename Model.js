@@ -30,6 +30,25 @@ const FAST_KEY_RE = /^[A-Za-z0-9]$/
 const KEYWORD_RE = /^[^\s"'`()\[\]\\\u0000-\u001f\u007f]{1,32}$/
 const STATE_RESULTS = ["done", "note", "note-frame", "blocked", "changed", "conflict",
                        "busy", "invalid", "error"]
+// What the clock and pomodoro actions answer.
+const ACTION_RESULTS = ["done", "note", "note-frame", "changed", "conflict", "busy", "invalid",
+                        "error", "not-clocking", "needs-emacs", "unavailable", "confirm"]
+// Epoch seconds before year 5000: a value in ms is refused, not shown as
+// a clock running for millennia.
+const MAX_EPOCH = 1e11
+// org-pomodoro's running phases, as the strip and the bar show them.
+const PHASES = {
+  pomodoro: { caption: "POMODORO", glyph: "●", tone: "urgent" },
+  overtime: { caption: "OVERTIME", glyph: "●", tone: "urgent" },
+  "short-break": { caption: "SHORT BREAK", glyph: "◌", tone: "accent" },
+  "long-break": { caption: "LONG BREAK", glyph: "◌", tone: "accent" }
+}
+const POMODORO_STATES = ["none", "pomodoro", "overtime", "short-break", "long-break"]
+const CLOCK_GLYPH = "◷"
+// Footer hints whose buttons' tooltips name the key, dropped in this
+// order when the timer hints need the room.
+const HINT_DROPS = ["r refresh", "v layout", "f b week"]
+const MAX_HINT = 80
 const MAX_DETAIL = 200
 const ITEM_TYPES = ["scheduled", "past-scheduled", "deadline", "upcoming-deadline",
                     "timestamp", "sexp", "block"]
@@ -144,6 +163,37 @@ function normalizeKeywords(raw) {
            colors: normalizeColors(kw.colors), keys: normalizeKeys(kw.keys) }
 }
 
+function isEpoch(v) { return Number.isSafeInteger(v) && v > 0 && v < MAX_EPOCH }
+
+// The running Org clock, or null. Its path and line are its row's.
+function normalizeClock(raw) {
+  if (!isObj(raw) || !isEpoch(raw.startedAt)) return null
+  const path = isAbsPath(raw.path) ? raw.path : null
+  return {
+    title: text(raw.title, MAX_TITLE),
+    category: cleanStr(raw.category, 60),
+    path: path,
+    line: path !== null && Number.isSafeInteger(raw.line) && raw.line >= 1 ? raw.line : null,
+    startedAt: raw.startedAt,
+    baseMin: nonNegInt(raw.baseMin) ? raw.baseMin : 0,
+    effortMin: Number.isSafeInteger(raw.effortMin) && raw.effortMin > 0 ? raw.effortMin : null
+  }
+}
+
+// org-pomodoro's state; payloads before v0.4 have none: unavailable.
+function normalizePomodoro(raw) {
+  const r = isObj(raw) ? raw : {}
+  const state = POMODORO_STATES.indexOf(r.state) >= 0 ? r.state : "none"
+  return {
+    available: r.available === true,
+    state: state,
+    endsAt: state !== "none" && isEpoch(r.endsAt) ? r.endsAt : null,
+    phaseMin: typeof r.phaseMin === "number" && isFinite(r.phaseMin) && r.phaseMin > 0 ? r.phaseMin : null,
+    count: nonNegInt(r.count) ? r.count : 0,
+    askKill: r.askKill !== false
+  }
+}
+
 function normalizePayload(raw) {
   if (!isObj(raw)) return { ok: false, reason: "not an object" }
   if (raw.version !== PROTOCOL) return { ok: false, reason: "unsupported version" }
@@ -172,7 +222,10 @@ function normalizePayload(raw) {
       // bar's file.
       weekOffset: intIn(raw.weekOffset, -MAX_WEEK_OFFSET, MAX_WEEK_OFFSET) ? raw.weekOffset : null,
       weekStart: isStr(raw.weekStart) && DATE_RE.test(raw.weekStart) ? raw.weekStart : null,
-      startInDays: intIn(raw.startInDays, -MAX_START_DAYS, MAX_START_DAYS) ? raw.startInDays : null
+      startInDays: intIn(raw.startInDays, -MAX_START_DAYS, MAX_START_DAYS) ? raw.startInDays : null,
+      // The timers: only the bar's file has them (parseWeekResult drops them).
+      clock: normalizeClock(raw.clock),
+      pomodoro: normalizePomodoro(raw.pomodoro)
     }
   }
 }
@@ -292,21 +345,118 @@ function normalizeSettings(raw) {
   }
 }
 
+// ---------------------------------------------------------------- timers
+
+// 83 → "1:23", as Org's mode line shows a clock.
+function hMm(min) { return Math.floor(min / 60) + ":" + pad2(min % 60) }
+
+// 761 → "12:41"; the minutes may pass 59.
+function mSs(sec) { return Math.floor(sec / 60) + ":" + pad2(sec % 60) }
+
+function nowMsOf(now) {
+  return now instanceof Date ? now.getTime() : typeof now === "number" ? now : NaN
+}
+
+// One timerState value, its fields in a fixed order.
+function timerOf(kind, caption, title, time, extra, progress, look, clockKey, barTime) {
+  return { kind: kind, caption: caption, title: title, time: time, extra: extra, progress: progress,
+           tone: look.tone, glyph: look.glyph, clockKey: clockKey, barTime: barTime }
+}
+
+function clockKeyOf(clock) {
+  return clock && clock.path !== null && clock.line !== null ? clock.path + ":" + clock.line : ""
+}
+
+// Org's clocked time: the earlier minutes plus whole minutes since start.
+// Past the effort the time turns urgent, as Org's overrun face does.
+function clockTimer(clock, nowMs) {
+  const minutes = clock.baseMin + Math.max(0, Math.floor((nowMs - clock.startedAt * 1000) / 60000))
+  const effort = clock.effortMin
+  const time = hMm(minutes)
+  return timerOf("clock", "CLOCKED IN", clock.title,
+                 { text: time, tone: effort !== null && minutes > effort ? "urgent" : "normal" },
+                 effort !== null ? " / " + hMm(effort) + " effort" : "",
+                 effort !== null ? Math.min(1, minutes / effort) : null,
+                 { tone: "accent", glyph: CLOCK_GLYPH }, clockKeyOf(clock), time)
+}
+
+// A pomodoro or a break counts down to endsAt; overtime counts up from it.
+function phaseTimer(pom, clock, nowMs, seconds) {
+  const ph = PHASES[pom.state]
+  const nowSec = nowMs / 1000
+  const title = clock ? clock.title : ""
+  const caption = pom.state === "pomodoro"
+    ? ph.caption + " " + ((nonNegInt(pom.count) ? pom.count : 0) + 1) : ph.caption
+  if (pom.state === "overtime") {
+    const over = Math.max(0, nowSec - pom.endsAt)
+    const short = "+" + Math.ceil(over / 60) + "m"
+    return timerOf(pom.state, caption, title,
+                   { text: seconds ? "+" + mSs(Math.floor(over)) : short, tone: "urgent" },
+                   " over", 1, ph, clockKeyOf(clock), short)
+  }
+  const left = Math.max(0, pom.endsAt - nowSec)
+  const short = Math.ceil(left / 60) + "m"
+  const phaseSec = pom.phaseMin === null ? 0 : pom.phaseMin * 60
+  return timerOf(pom.state, caption, title, { text: seconds ? mSs(Math.ceil(left)) : short, tone: "normal" },
+                 " left", phaseSec > 0 ? clamp((phaseSec - left) / phaseSec, 0, 1) : null,
+                 ph, clockKeyOf(clock), short)
+}
+
+// What runs, display-ready, or null: nothing runs, or Emacs isn't
+// reachable (`status' not ok) so the clock may be stale. A pomodoro
+// phase wins over the clock and takes its title. `now' is a Date or ms;
+// `seconds' gives a running phase M:SS instead of whole minutes.
+//   {kind, caption, title, time: {text, tone}, extra, progress, tone,
+//    glyph, clockKey, barTime}
+function timerState(view, now, seconds) {
+  const v = isObj(view) ? view : {}
+  const nowMs = nowMsOf(now)
+  if (v.status !== "ok" || !isObj(v.payload) || !isFinite(nowMs)) return null
+  const clock = isObj(v.payload.clock) && isEpoch(v.payload.clock.startedAt) ? v.payload.clock : null
+  const pom = v.payload.pomodoro
+  // A phase without its end time can't be shown; the clock still can.
+  const running = isObj(pom) && hasOwn(PHASES, pom.state) && isEpoch(pom.endsAt)
+  return running ? phaseTimer(pom, clock, nowMs, seconds === true)
+    : clock ? clockTimer(clock, nowMs)
+    : null
+}
+
+function isBreak(timer) { return timer.kind === "short-break" || timer.kind === "long-break" }
+
+// "Clocked in: Title · 0:23 / 1:00", "Pomodoro 3: Title · 13m left",
+// "Overtime · +4m". `withTitle': the label mode lets titles show.
+function timerLine(view, withTitle) {
+  const t = view.timer
+  const name = t.caption.charAt(0) + t.caption.slice(1).toLowerCase()
+  const clock = view.payload && view.payload.clock
+  const effort = t.kind === "clock" && isObj(clock) && clock.effortMin ? " / " + hMm(clock.effortMin) : ""
+  const tail = t.kind === "clock" ? effort : t.kind === "overtime" ? "" : t.extra
+  return name + (withTitle && t.title ? ": " + t.title : "") + " · " + t.time.text + tail
+}
+
 // ---------------------------------------------------------------- bar text
 
 function hasError(view) { return view.status === "error" || (!!view.payload && view.payload.error !== null && view.payload.error !== undefined) }
 
+// {mode, text, badge, alert, timer}. While a timer runs, `timer' is
+// {glyph, time, tone}: Next item shows it before the clock's title
+// (mode "timer"); Count shows it instead of the count, and Count and Icon
+// keep titles off the bar.
 function barLabel(view) {
-  const blank = mode => ({ mode: mode, text: "", badge: 0, alert: false })
+  const blank = mode => ({ mode: mode, text: "", badge: 0, alert: false, timer: null })
   if (view.status === "offline") return blank("offline")
   if (hasError(view)) return blank("error")
   if (!view.payload) return blank("loading")
   const s = view.settings
   const alert = view.overdue > 0
   const badge = s.overdueBadge ? view.overdue : 0
-  const label = (mode, txt) => ({ mode: mode, text: txt, badge: badge, alert: alert })
-  if (s.label === "Icon") return { mode: "icon", text: "", badge: 0, alert: alert }
-  if (s.label === "Count") return label("count", String(view.openToday))
+  const t = isObj(view.timer) ? view.timer : null
+  // An overrun clock is urgent on the bar too.
+  const timer = t ? { glyph: t.glyph, time: t.barTime, tone: t.time.tone === "urgent" ? "urgent" : t.tone } : null
+  const label = (mode, txt) => ({ mode: mode, text: txt, badge: badge, alert: alert, timer: timer })
+  if (s.label === "Icon") return { mode: "icon", text: "", badge: 0, alert: alert, timer: timer }
+  if (s.label === "Count") return label("count", t ? "" : String(view.openToday))
+  if (t) return label("timer", t.title ? bounded(t.title, s.maxTitleChars) : isBreak(t) ? "break" : "")
   const next = view.next
   if (next && next.state === "now") return label("now", "now " + bounded(next.item.title, s.maxTitleChars))
   if (next) return label("next", next.item.time + " " + bounded(next.item.title, s.maxTitleChars))
@@ -352,7 +502,9 @@ function tooltipLines(view) {
   const updated = view.updated
     ? ["Updated " + view.updated + " from Emacs" + (view.stale ? " · stale" : "")]
     : (view.stale ? ["Stale"] : [])
-  return (view.next ? [nextLine(view.next, view.nowMin, view.settings.label !== "Icon")] : [])
+  const withTitles = view.settings.label !== "Icon"
+  return (isObj(view.timer) ? [timerLine(view, withTitles)] : [])
+    .concat(view.next ? [nextLine(view.next, view.nowMin, withTitles)] : [])
     .concat(["Today " + view.openToday + " · Habits " + habitCount(view.items)
              + " · Overdue " + view.overdue])
     .concat(updated)
@@ -528,6 +680,33 @@ function takeNoteForm(elispFile) {
   return "(progn " + loadPreamble(elispFile) + " (omarchy-org-agenda-take-note))"
 }
 
+// PATH LINE ID FROM for an entry's clock-in, checked as stateForm checks
+// it: Emacs reported it, it has a heading, and its keyword is known.
+function entryArgs(item, payload) {
+  const it = knownItem(item, payload)
+  if (!canChangeState(it)) throw new Error("this entry has no heading to clock")
+  const from = it.todo === null || it.todo === undefined ? "nil"
+    : keywordForm(it.todo, stateChoices(payload).map(c => c.keyword))
+  const id = isStr(it.id) && ID_RE.test(it.id) ? elispString(it.id) : "nil"
+  return elispString(it.path) + " " + it.line + " " + id + " " + from
+}
+
+function actionForm(name, args, elispFile) {
+  return "(progn " + loadPreamble(elispFile) + " (omarchy-org-agenda-" + name + (args ? " " + args : "") + "))"
+}
+
+function clockInForm(item, payload, elispFile) { return actionForm("clock-in", entryArgs(item, payload), elispFile) }
+function clockOutForm(elispFile) { return actionForm("clock-out", "", elispFile) }
+function clockCancelForm(elispFile) { return actionForm("clock-cancel", "", elispFile) }
+function clockGotoForm(elispFile) { return actionForm("clock-goto", "", elispFile) }
+
+// P: start on `item', or (item null) finish overtime / stop; `confirm'
+// answers org-pomodoro's "stop it?" question.
+function pomodoroForm(item, payload, confirm, elispFile) {
+  const entry = item === null || item === undefined ? "nil nil nil nil" : entryArgs(item, payload)
+  return actionForm("pomodoro", entry + " " + (confirm === true ? "t" : "nil"), elispFile)
+}
+
 // The contents of a string as `emacsclient --eval' prints it (prin1:
 // quoted, with \" and \\ escaped), or null.  The helper's JSON is ASCII,
 // but raw non-ASCII passes through too.
@@ -549,13 +728,15 @@ function elispStringValue(s) {
   return out
 }
 
-function parseStateResult(stdout) {
+// {result, state, saved, detail} as an action printed it, `result' one of
+// `results'.
+function parseResult(stdout, results) {
   const s = String(stdout == null ? "" : stdout).trim()
   const json = s.charAt(0) === "{" ? s : elispStringValue(s)
   if (json === null) return { ok: false, reason: "not an elisp string" }
   let raw
   try { raw = JSON.parse(json) } catch (e) { return { ok: false, reason: "invalid JSON" } }
-  if (!isObj(raw) || STATE_RESULTS.indexOf(raw.result) < 0)
+  if (!isObj(raw) || results.indexOf(raw.result) < 0)
     return { ok: false, reason: "unknown result" }
   const detail = isStr(raw.detail) ? text(raw.detail, MAX_DETAIL) : ""
   return { ok: true, value: {
@@ -566,7 +747,13 @@ function parseStateResult(stdout) {
   } }
 }
 
+function parseStateResult(stdout) { return parseResult(stdout, STATE_RESULTS) }
+
+// What a clock or pomodoro action printed.
+function parseActionResult(stdout) { return parseResult(stdout, ACTION_RESULTS) }
+
 // What `omarchy-org-agenda-week' printed: a payload that says its week.
+// Timers are the bar's alone, so a week's are dropped.
 function parseWeekResult(stdout) {
   const s = String(stdout == null ? "" : stdout).trim()
   const json = s.charAt(0) === "{" ? s : elispStringValue(s)
@@ -576,7 +763,56 @@ function parseWeekResult(stdout) {
   const v = res.value
   return v.weekOffset === null || v.weekStart === null || v.startInDays === null
     ? { ok: false, reason: "not a week" }
-    : res
+    : { ok: true, value: Object.assign({}, v, { clock: null, pomodoro: normalizePomodoro(null) }) }
+}
+
+// Shared by stateMessage and actionMessage.
+const RETRY_TEXT = {
+  changed: ["This entry changed in Emacs. The agenda is refreshing; try again.", "warn"],
+  conflict: ["The file changed on disk and has unsaved edits in Emacs. Resolve it there first.", "error"],
+  busy: ["Emacs is waiting for another note. Finish it first.", "warn"]
+}
+const NOT_SAVED = "the file had unsaved edits in Emacs"
+const NOTE_TEXT = { note: " · add your note in Emacs", "note-frame": " · opening Emacs for your note" }
+// The needs-emacs detail when Emacs didn't know the question.
+const ANY_QUESTION = "Org wants to ask something; do it in Emacs"
+
+function message(t, tn) { return { text: plain(bounded(t, 300)), tone: tn } }
+
+// What each timer action did, and what it failed to do.
+const ACTIONS = {
+  in: ["Clocked in", "clock in"],
+  out: ["Clocked out", "clock out"],
+  cancel: ["Clock cancelled", "cancel the clock"],
+  start: ["Pomodoro started", "start the pomodoro"],
+  "break": ["Break started", "start the break"],
+  stop: ["Pomodoro stopped", "stop the pomodoro"]
+}
+
+// One line for the popout after a timer action: {text, tone}. `action'
+// is in, out, cancel, start, break or stop; `value' parseActionResult's.
+function actionMessage(action, value) {
+  const v = isObj(value) ? value : {}
+  const a = isStr(action) && hasOwn(ACTIONS, action) ? ACTIONS[action] : ["Done", "do that"]
+  const detail = isStr(v.detail) ? text(v.detail, 160).trim() : ""
+  const did = a[0] + (isKeyword(v.state) ? " · now " + v.state : "")
+  const failed = "Couldn't " + a[1]
+  if (hasOwn(RETRY_TEXT, v.result)) return message(RETRY_TEXT[v.result][0], RETRY_TEXT[v.result][1])
+  if (hasOwn(NOTE_TEXT, v.result)) return message(did + NOTE_TEXT[v.result], "ok")
+  switch (v.result) {
+  case "done":
+    return v.saved ? message(did + " · saved", "ok")
+      : message(did + " · not saved: " + (detail || NOT_SAVED), "warn")
+  case "needs-emacs":
+    return message(detail && detail !== ANY_QUESTION ? "Org wants to ask: " + detail + " — do it in Emacs"
+                                                     : "Org wants to ask something — do it in Emacs", "warn")
+  case "not-clocking": return message("No clock running", "warn")
+  case "unavailable": return message("org-pomodoro isn't available" + (detail ? ": " + detail : ""), "error")
+  case "confirm": return message("Stop the pomodoro? P again", "warn")
+  case "invalid": return message("Emacs refused this entry" + (detail ? ": " + detail : ""), "error")
+  case "error": return message(failed + (detail ? ": " + detail : ""), "error")
+  default: return message(failed + ": unexpected answer from Emacs", "error")
+  }
 }
 
 // One line for the popout after a state change: {text, tone}.
@@ -586,20 +822,16 @@ function stateMessage(value, toKeyword) {
   const detail = isStr(v.detail) ? text(v.detail, 120) : ""
   const marked = "Marked " + kw
     + (v.result === "done" && isKeyword(v.state) && v.state !== kw ? " · repeats as " + v.state : "")
-  const msg = (t, tone) => ({ text: plain(bounded(t, 300)), tone: tone })
+  const msg = message
+  if (hasOwn(RETRY_TEXT, v.result)) return msg(RETRY_TEXT[v.result][0], RETRY_TEXT[v.result][1])
+  if (hasOwn(NOTE_TEXT, v.result)) return msg(marked + NOTE_TEXT[v.result], "ok")
   switch (v.result) {
   case "done":
     return v.saved ? msg(marked + " · saved", "ok")
-      : msg(marked + " · not saved: " + (detail || "the file had unsaved edits in Emacs"), "warn")
-  case "note": return msg(marked + " · add your note in Emacs", "ok")
-  case "note-frame": return msg(marked + " · opening Emacs for your note", "ok")
+      : msg(marked + " · not saved: " + (detail || NOT_SAVED), "warn")
   case "blocked":
     return msg(detail ? "Org blocked this: “" + detail + "” isn't done yet"
                       : "Org blocked this: its checkboxes or dependencies aren't done yet", "warn")
-  case "changed": return msg("This entry changed in Emacs. The agenda is refreshing; try again.", "warn")
-  case "conflict":
-    return msg("The file changed on disk and has unsaved edits in Emacs. Resolve it there first.", "error")
-  case "busy": return msg("Emacs is waiting for another note. Finish it first.", "warn")
   case "invalid": return msg("Emacs refused " + kw + (detail ? ": " + detail : ""), "error")
   case "error": return msg("Couldn't change the state" + (detail ? ": " + detail : ""), "error")
   default: return msg("Couldn't change the state: unexpected answer from Emacs", "error")
@@ -1112,6 +1344,20 @@ function normalizeUi(ui) {
   }
 }
 
+// The clocked entry's rows and chips, as org-agenda-clocking tints them:
+// `clocked' on every row and chip; a list row's trail becomes the time,
+// an Org row gets `clock' ("◷ 0:23", else "").
+function tinted(block, timer) {
+  const hit = it => timer !== null && timer.clockKey !== "" && entryKey(it) === timer.clockKey
+  if (block.kind === "chips")
+    return Object.assign({}, block, { chips: block.chips.map(c => Object.assign({}, c, { clocked: hit(c.item) })) })
+  if (block.kind !== "row") return block
+  const on = hit(block.item)
+  const mark = on ? timer.glyph + " " + timer.barTime : ""
+  return Object.assign({}, block, { clocked: on },
+                       block.style === "org" ? { clock: mark } : on ? { trail: tone(mark, timer.tone) } : {})
+}
+
 // The popout's body for any layout, from view() and the popout's state
 // ui = {layout, tab, offset, week, weekError}. Blocks are display-ready;
 // `rows` lists what the keyboard reaches, in `sel` order.
@@ -1121,9 +1367,10 @@ function layoutModel(view, rawUi) {
   const today = payloadDay(view.payload)
   const nav = weekNav(view, ui.offset, ui.week)
   const entries = keyedEntries(view.items).filter(e => settings.showDone || !e.item.done)
+  const timer = isObj(view.timer) ? view.timer : null
   const model = (tabs, panes) => Object.assign(
     { layout: ui.layout, tab: ui.tab, tabs: tabs, nav: nav },
-    numbered(panes),
+    numbered(panes.map(p => Object.assign({}, p, { blocks: p.blocks.map(b => tinted(b, timer)) }))),
     { empty: ui.offset === 0 && entries.length === 0 && !view.next })
   if (!today) {
     const panes = ui.layout === "Columns"
@@ -1193,19 +1440,29 @@ function overdueUi(ui) {
 }
 
 // The popout's key map, as in Org's agenda: what a key press asks for, or
-// null. `ctx` = {layout, tab, pickerOpen}; `key` is a named key ("Up",
-// "Down", "Left", "Right", "Return", "Escape") or ""; `text` is the event's
-// text. Letters are case-sensitive, like Org's. The state picker, while it
-// is open, keeps every key for itself.
+// null. `ctx` = {layout, tab, pickerOpen, clocking, pomodoro,
+// pomodoroAvailable, confirming} (`pomodoro`: its state); `key` is a named
+// key ("Up", "Down", "Left", "Right", "Return", "Escape") or ""; `text` is
+// the event's text. Letters are case-sensitive, like Org's. The state
+// picker, while it is open, keeps every key for itself; the pomodoro's
+// stop question takes the next key: P stops, any other just dismisses it
+// (a key with no name or text, such as Shift, leaves it).
 //   {move: ±1} {open} {state} {refresh} {close} {layout: "next"}
 //   {week: +1 | -1 | 0} (Tabs: also {tab: "week"}) {tab: …} {pane: ±1}
+//   {clock: "in" | "out" | "cancel" | "goto"} {pomodoro: true | "stop"}
+//   {cancelConfirm}
 function keyAction(ctx, key, text) {
   const c = isObj(ctx) ? ctx : {}
   if (c.pickerOpen) return null
   const layout = normalizeSettings({ layout: c.layout }).layout
   const k = isStr(key) && key !== "" ? key : isStr(text) && text.length === 1 ? text : ""
+  if (c.confirming) return k === "" ? null : k === "P" ? { pomodoro: "stop" } : { cancelConfirm: true }
   const side = k === "Left" || k === "h" ? -1 : k === "Right" || k === "l" ? 1 : 0
   const step = { f: 1, b: -1, ".": 0 }
+  const onClock = { O: "out", X: "cancel", J: "goto" }
+  if (k === "I") return { clock: "in" }
+  if (hasOwn(onClock, k)) return c.clocking ? { clock: onClock[k] } : null
+  if (k === "P") return c.pomodoroAvailable ? { pomodoro: true } : null
   if (k === "Up" || k === "k" || k === "p") return { move: -1 }
   if (k === "Down" || k === "j" || k === "n") return { move: 1 }
   if (k === "Return") return { open: true }
@@ -1224,11 +1481,31 @@ function keyAction(ctx, key, text) {
   return null
 }
 
-// The footer's key hints.
-function layoutHints(layout) {
+// What P does now: "start" (on the selected row), "break" (end the
+// overtime), "ask" (org-pomodoro wants the stop confirmed), "stop", or
+// null without org-pomodoro.
+function pomodoroStep(view, confirming) {
+  const p = isObj(view) && isObj(view.payload) && isObj(view.payload.pomodoro) ? view.payload.pomodoro : null
+  if (p === null || p.available !== true) return null
+  if (p.state === "overtime") return "break"
+  if (hasOwn(PHASES, p.state)) return p.askKill !== false && !confirming ? "ask" : "stop"
+  return "start"
+}
+
+// The footer's key hints. With `timerCtx` = {clocking, pomodoroAvailable}
+// they add the clock's keys (and P); hints whose buttons name their key
+// in a tooltip make room, refresh first, so the line stays ≤ MAX_HINT.
+function layoutHints(layout, timerCtx) {
   const l = normalizeSettings({ layout: layout }).layout
-  const base = "↑↓ move · ↵ open · t state · f b week · v layout · r refresh · esc"
-  return (l === "Tabs" ? "1 2 3 tabs · " : l === "Columns" ? "← → column · " : "") + base
+  const prefix = l === "Tabs" ? "1 2 3 tabs · " : l === "Columns" ? "← → column · " : ""
+  const t = isObj(timerCtx) ? timerCtx : null
+  const timer = t === null ? []
+    : (t.clocking ? ["O out", "J jump"] : ["I clock"]).concat(t.pomodoroAvailable ? ["P pomodoro"] : [])
+  const hints = ["↑↓ move", "↵ open", "t state"].concat(timer, ["f b week", "v layout", "r refresh", "esc"])
+  const line = drop => prefix + hints.filter(h => drop.indexOf(h) < 0).join(" · ")
+  if (!timer.length) return line([])
+  const fits = range(1, HINT_DROPS.length).map(n => line(HINT_DROPS.slice(0, n))).filter(s => s.length <= MAX_HINT)
+  return fits.length ? fits[0] : line(HINT_DROPS)
 }
 
 // ---------------------------------------------------------------- view
@@ -1252,5 +1529,8 @@ function view(payload, status, detail, now, rawSettings) {
     overdue: overdueCount(items, settings),
     updated: updatedOf(p)
   }
+  // The bar and the rows count whole minutes; the popout's strip may ask
+  // timerState for seconds.
+  Object.assign(v, { timer: timerState(v, now, false) })
   return Object.assign(v, { label: barLabel(v), tooltip: tooltip(v) })
 }

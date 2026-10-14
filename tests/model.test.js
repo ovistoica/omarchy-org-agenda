@@ -18,7 +18,8 @@ const M = new Function(src + "; return { PROTOCOL, MAX_ITEMS, MAX_TITLE, ID_RE, 
   " weekForm, parseWeekResult, elispStringValue, LAYOUTS, MAX_WEEK_OFFSET, pullKey, nextLayout," +
   " orgCategory, orgLeader, orgWhen, orgDayTitle, isoWeek, compactDayTitle, browseOffset, weekNav," +
   " weekWanted, layoutModel, paneSel, tabStep, tabAt, overdueFocus, overdueUi, layoutHints, keyAction," +
-  " payloadFor }")()
+  " payloadFor, timerState, pomodoroStep, clockInForm, clockOutForm, clockCancelForm, clockGotoForm," +
+  " pomodoroForm, parseActionResult, actionMessage }")()
 
 let failed = 0
 let count = 0
@@ -198,7 +199,7 @@ eq(M.sections(all.concat([tomorrow, repeat]), {}).map(s => [s.key, s.items.map(i
 eq([M.nextUp([tomorrow], at(8, 0)), M.openToday([tomorrow, repeat]), M.overdueCount([repeat], { habitsInBadge: true })],
    [null, 0, 0], "later-day task: not next up, not open today, not overdue")
 eq(M.view(payloadOf([tomorrow, repeat]), "ok", "", at(8, 0), {}).label,
-   { mode: "clear", text: "", badge: 0, alert: false }, "later-day task: bar stays clear")
+   { mode: "clear", text: "", badge: 0, alert: false, timer: null }, "later-day task: bar stays clear")
 
 // Calendar-style entries on a later day: a timed timestamp, a date range.
 const event = item({ line: 92, type: "timestamp", title: "Design review", time: "10:00", durationMin: 30, inDays: 1 })
@@ -210,7 +211,7 @@ eq(M.sections(all.concat([event, trip]), {}).map(s => [s.key, s.items.map(i => i
 eq([M.nextUp([event], at(8, 0)), M.openToday([event, trip]), M.overdueCount([event, trip], { habitsInBadge: true })],
    [null, 0, 0], "later-day event: not next up, not open today, not overdue")
 eq(M.view(payloadOf([event, trip]), "ok", "", at(8, 0), {}).label,
-   { mode: "clear", text: "", badge: 0, alert: false }, "later-day event: bar stays clear")
+   { mode: "clear", text: "", badge: 0, alert: false, timer: null }, "later-day event: bar stays clear")
 eq([event, trip].map(i => M.rowLead(i, M.payloadDay(payloadOf([])))),
    [{ text: "Wed", urgent: false }, { text: "27 Oct", urgent: false }], "rowLead: later-day events")
 eq([event, trip].map(M.rowTrail), ["10:00 · cal", "cal"], "rowTrail: later-day events")
@@ -277,7 +278,7 @@ eq([M.normalizeSettings({ maxTitleChars: 3 }).maxTitleChars, M.normalizeSettings
 
 const P = items => payloadOf(items)
 const label = (items, status, settings, now) => M.view(P(items), status, "", now || at(11, 13), settings).label
-const L = (mode, text, badge, alert) => ({ mode, text, badge, alert })
+const L = (mode, text, badge, alert, timer) => ({ mode, text, badge, alert, timer: timer || null })
 
 eq(M.view(P(all), "offline", "x", at(11, 13), {}).label, L("offline", "", 0, false), "barLabel: offline")
 eq(M.view(P(all), "error", "x", at(11, 13), {}).label, L("error", "", 0, false), "barLabel: error status")
@@ -1142,6 +1143,374 @@ eq([1, 2, 3, 0, 4, "1", 1.5].map(M.tabAt), ["today", "week", "overdue", null, nu
       M.payloadFor(item({ path: "/x.org", line: 1 }), [main, week]), M.payloadFor(b, [main, null]),
       M.payloadFor(b, null), M.payloadFor(null, [main])],
      [true, true, null, null, null, null], "payloadFor: the bar's payload, then the week's")
+}
+
+// ---------------------------------------------------------------- timers: payload
+
+// The clock started at 10:00 on 14 Oct on the "Hiring plan" row (line 130).
+const S0 = on14(10, 0).getTime() / 1000
+const sec = (h, m, s, ms) => new Date(2026, 9, 14, h, m, s || 0, ms || 0)
+const clockAt = over => Object.assign({ title: "Hiring plan", category: "work", path: "/home/u/org/cal.org", line: 130,
+                                        startedAt: S0, baseMin: 0, effortMin: null }, over)
+const pomAt = over => Object.assign({ available: true, state: "none", endsAt: null, phaseMin: null, count: 0,
+                                      askKill: true }, over)
+const timerPayload = (clock, pom) => Object.assign(weekPayload(weekItems), { clock: clock, pomodoro: pom || pomAt({}) })
+const TV = (clock, pom, now, settings, status) =>
+  M.view(parsed(timerPayload(clock, pom)).value, status || "ok", "", now || on14(10, 40), settings || {})
+const NO_POMODORO = { available: false, state: "none", endsAt: null, phaseMin: null, count: 0, askKill: true }
+const clockOf = raw => parsed(timerPayload(raw)).value.clock
+const pomOf = raw => parsed(Object.assign(weekPayload([]), { pomodoro: raw })).value.pomodoro
+// A pomodoro started at 10:00: 25 min, the third since the long break.
+const POM = pomAt({ state: "pomodoro", endsAt: S0 + 1500, phaseMin: 25, count: 2 })
+const OVER = pomAt({ state: "overtime", endsAt: S0 + 1500, phaseMin: 25, count: 3 })
+const SHORT = pomAt({ state: "short-break", endsAt: S0 + 1800, phaseMin: 5, count: 3 })
+const LONG = pomAt({ state: "long-break", endsAt: S0 + 1800, phaseMin: 20, count: 0 })
+
+eq(clockOf(clockAt({ effortMin: 60, baseMin: 12 })),
+   { title: "Hiring plan", category: "work", path: "/home/u/org/cal.org", line: 130, startedAt: S0, baseMin: 12, effortMin: 60 },
+   "normalize clock: valid")
+eq([clockOf(clockAt({ startedAt: "x" })), clockOf(clockAt({ startedAt: -1 })), clockOf(clockAt({ startedAt: 0 })),
+    clockOf(clockAt({ startedAt: S0 + 0.5 })), clockOf(clockAt({ startedAt: S0 * 1000 })), clockOf(clockAt({ startedAt: null })),
+    clockOf("x"), clockOf([clockAt({})]), clockOf(undefined)],
+   [null, null, null, null, null, null, null, null, null], "normalize clock: bad startedAt or not an object -> null")
+eq([clockOf(clockAt({ path: "org/cal.org" })), clockOf(clockAt({ path: null, line: 5 })), clockOf(clockAt({ line: 0 })),
+    clockOf(clockAt({ line: "130" })), clockOf(clockAt({ path: "/a\u0001.org" }))].map(c => [c.path, c.line]),
+   [[null, null], [null, null], ["/home/u/org/cal.org", null], ["/home/u/org/cal.org", null], [null, null]],
+   "normalize clock: relative path, line without path, bad line")
+eq([-5, 2.5, "3", null, 7].map(b => clockOf(clockAt({ baseMin: b })).baseMin), [0, 0, 0, 0, 7],
+   "normalize clock: baseMin a non-negative int, else 0")
+eq([0, -3, "60", 1.5, null, 45].map(e => clockOf(clockAt({ effortMin: e })).effortMin), [null, null, null, null, null, 45],
+   "normalize clock: effort a positive int, else null")
+{
+  const c = clockOf(clockAt({ title: "a\tb\n" + "x".repeat(300), category: "w\u0001" }))
+  eq([c.title.slice(0, 4), Array.from(c.title).length, c.category, clockOf(clockAt({ title: 3 })).title],
+     ["a b ", 200, null, ""], "normalize clock: title cleaned and bounded, bad category null")
+}
+eq([pomOf(undefined), pomOf("x"), pomOf({})], [NO_POMODORO, NO_POMODORO, NO_POMODORO], "normalize pomodoro: defaults")
+eq(pomOf({ available: true, state: "pomodoro", endsAt: S0, phaseMin: 25.5, count: 4, askKill: false }),
+   { available: true, state: "pomodoro", endsAt: S0, phaseMin: 25.5, count: 4, askKill: false }, "normalize pomodoro: valid, float phase")
+eq([pomOf({ state: "paused", endsAt: S0 }), pomOf({ state: "none", endsAt: S0, phaseMin: 25 })].map(p => [p.state, p.endsAt]),
+   [["none", null], ["none", null]], "normalize pomodoro: unknown state -> none; endsAt null for none")
+eq([pomOf({ available: "yes", state: "overtime", endsAt: "S0", phaseMin: 0, count: -1, askKill: "no" }),
+    pomOf({ state: "long-break", endsAt: S0 * 1000, phaseMin: "25", count: 1.5, askKill: null })],
+   [{ available: false, state: "overtime", endsAt: null, phaseMin: null, count: 0, askKill: true },
+    { available: false, state: "long-break", endsAt: null, phaseMin: null, count: 0, askKill: true }],
+   "normalize pomodoro: bad fields -> defaults")
+{
+  // An elisp before 0.4 sends neither key.
+  const old = parsed(weekPayload(weekItems)).value
+  const v = M.view(old, "ok", "", on14(10, 40), {})
+  eq([old.clock, old.pomodoro, v.timer, M.pomodoroStep(v, false)], [null, NO_POMODORO, null, null],
+     "normalize: an old payload has no clock, pomodoro unavailable")
+  const raw = JSON.parse(M.elispStringValue(OUT_WEEK))
+  const w = M.parseWeekResult(JSON.stringify(Object.assign({}, raw, { clock: clockAt({}), pomodoro: POM })))
+  eq([w.ok, w.value.clock, w.value.pomodoro], [true, null, NO_POMODORO], "parseWeekResult: a week's timers are ignored")
+}
+
+// ---------------------------------------------------------------- timers: timerState
+
+eq([on14(10, 0), on14(10, 23), on14(11, 5), on14(22, 0), sec(10, 23, 59)].map(n => TV(clockAt({}), null, n).timer.time.text),
+   ["0:00", "0:23", "1:05", "12:00", "0:23"], "timerState clock: H:MM, whole minutes")
+eq([TV(clockAt({ baseMin: 75 }), null, sec(10, 0, 59)).timer.barTime, TV(clockAt({ baseMin: 600 }), null, on14(10, 5)).timer.barTime,
+    TV(clockAt({}), null, on14(9, 0)).timer.barTime],
+   ["1:15", "10:05", "0:00"], "timerState clock: earlier minutes added; a clock ahead of now shows 0:00")
+eq(TV(clockAt({ effortMin: 60 }), null, on14(10, 23)).timer,
+   { kind: "clock", caption: "CLOCKED IN", title: "Hiring plan", time: { text: "0:23", tone: "normal" },
+     extra: " / 1:00 effort", progress: 23 / 60, tone: "accent", glyph: "◷", clockKey: "/home/u/org/cal.org:130",
+     barTime: "0:23" }, "timerState clock: with effort")
+eq([on14(11, 0), on14(11, 1), on14(13, 0)].map(n => { const t = TV(clockAt({ effortMin: 60 }), null, n).timer; return [t.time, t.progress] }),
+   [[{ text: "1:00", tone: "normal" }, 1], [{ text: "1:01", tone: "urgent" }, 1], [{ text: "3:00", tone: "urgent" }, 1]],
+   "timerState clock: at the effort normal, past it urgent; progress capped")
+eq([TV(clockAt({}), null, on14(10, 23)).timer.extra, TV(clockAt({}), null, on14(10, 23)).timer.progress,
+    TV(clockAt({ effortMin: 150 }), null, on14(10, 23)).timer.extra],
+   ["", null, " / 2:30 effort"], "timerState clock: without effort; effort as H:MM")
+{
+  const v = TV(clockAt({}), POM, sec(10, 12, 19))
+  eq(v.timer, { kind: "pomodoro", caption: "POMODORO 3", title: "Hiring plan", time: { text: "13m", tone: "normal" },
+                extra: " left", progress: 739 / 1500, tone: "urgent", glyph: "●", clockKey: "/home/u/org/cal.org:130",
+                barTime: "13m" }, "timerState pomodoro: wins over the clock, minutes")
+  eq([M.timerState(v, sec(10, 12, 19), true).time.text, M.timerState(v, sec(10, 12, 19).getTime(), true).barTime],
+     ["12:41", "13m"], "timerState pomodoro: M:SS with seconds (Date or ms); barTime stays minutes")
+  eq([on14(10, 0), sec(10, 24, 30), on14(10, 25), on14(10, 30)].map(n => {
+    const t = M.timerState(v, n, true); return [t.time.text, M.timerState(v, n, false).time.text, t.progress] }),
+     [["25:00", "25m", 0], ["0:30", "1m", 1470 / 1500], ["0:00", "0m", 1], ["0:00", "0m", 1]],
+     "timerState pomodoro: 25:00 at start, never negative")
+  eq([M.timerState(v, sec(10, 12, 19, 500), true), M.timerState(v, sec(10, 12, 19, 500), false)].map(t => t.time.text),
+     ["12:41", "13m"], "timerState pomodoro: seconds rounded up")
+}
+{
+  const t = TV(null, POM, sec(10, 12, 19)).timer
+  eq([t.kind, t.title, t.clockKey, t.caption], ["pomodoro", "", "", "POMODORO 3"], "timerState pomodoro: after a manual clock-out")
+  eq([TV(null, pomAt({ state: "pomodoro", endsAt: S0 + 1500, count: 0 }), on14(10, 5)).timer.progress,
+      TV(null, pomAt({ state: "pomodoro", endsAt: S0 + 1500, count: 0 }), on14(10, 5)).timer.caption],
+     [null, "POMODORO 1"], "timerState pomodoro: no phase length -> no progress; count 0 -> POMODORO 1")
+}
+{
+  const v = TV(clockAt({}), OVER, sec(10, 28, 10))
+  eq(v.timer, { kind: "overtime", caption: "OVERTIME", title: "Hiring plan", time: { text: "+4m", tone: "urgent" },
+                extra: " over", progress: 1, tone: "urgent", glyph: "●", clockKey: "/home/u/org/cal.org:130", barTime: "+4m" },
+     "timerState overtime: counts up from endsAt")
+  eq([M.timerState(v, sec(10, 28, 10), true).time.text, M.timerState(v, on14(10, 25), true).time.text,
+      M.timerState(v, on14(10, 25), false).time.text], ["+3:10", "+0:00", "+0m"], "timerState overtime: +M:SS")
+}
+eq(TV(null, SHORT, on14(10, 26)).timer,
+   { kind: "short-break", caption: "SHORT BREAK", title: "", time: { text: "4m", tone: "normal" }, extra: " left",
+     progress: 0.2, tone: "accent", glyph: "◌", clockKey: "", barTime: "4m" }, "timerState: a short break")
+{
+  const t = TV(clockAt({}), LONG, on14(10, 26)).timer
+  eq([t.kind, t.caption, t.title, t.glyph, t.tone, t.clockKey, M.timerState(TV(clockAt({}), LONG), on14(10, 26), true).time.text],
+     ["long-break", "LONG BREAK", "Hiring plan", "◌", "accent", "/home/u/org/cal.org:130", "4:00"],
+     "timerState: a long break with the clock running (org-pomodoro-clock-break)")
+}
+eq([TV(clockAt({}), null, on14(10, 40), {}, "stale").timer, TV(clockAt({}), POM, on14(10, 40), {}, "offline").timer,
+    TV(clockAt({}), null, on14(10, 40), {}, "error").timer, TV(null, null).timer, TV(null, pomAt({ available: true })).timer,
+    M.timerState(TV(clockAt({})), new Date(NaN), false), M.timerState(null, on14(10, 40), false)],
+   [null, null, null, null, null, null, null], "timerState: null unless ok and something runs")
+eq([TV(clockAt({ path: "rel.org" })).timer.clockKey, TV(clockAt({ line: null })).timer.clockKey],
+   ["", ""], "timerState: no clockKey for a non-file buffer")
+eq(M.timerState(Object.assign({}, TV(clockAt({})), { payload: Object.assign({}, TV(clockAt({})).payload,
+     { pomodoro: pomAt({ state: "pomodoro", endsAt: null }) }) }), on14(10, 40), false).kind,
+   "clock", "timerState: a phase without its end shows the clock")
+
+// ---------------------------------------------------------------- timers: bar and tooltip
+
+{
+  const idle = V().label
+  const lab = (clock, pom, settings, now) => TV(clock, pom, now || on14(10, 23), settings).label
+  const CL = { glyph: "◷", time: "0:23", tone: "accent" }
+  eq(lab(clockAt({})), L("timer", "Hiring plan", idle.badge, idle.alert, CL), "barLabel timer: next item shows the clock")
+  eq(lab(clockAt({}), null, { maxTitleChars: 10 }).text, "Hiring pl…", "barLabel timer: title bounded")
+  eq([lab(clockAt({}), null, { label: "Count" }), lab(clockAt({}), null, { label: "Icon" })],
+     [L("count", "", idle.badge, idle.alert, CL), L("icon", "", 0, idle.alert, CL)],
+     "barLabel timer: Count shows the time instead of the count, Icon the time; no titles")
+  eq(lab(clockAt({}), null, { overdueBadge: false }).badge, 0, "barLabel timer: overdueBadge false")
+  eq(lab(clockAt({ effortMin: 10 })).timer, { glyph: "◷", time: "0:23", tone: "urgent" }, "barLabel timer: overrun is urgent")
+  eq([lab(clockAt({}), POM, {}, sec(10, 12, 19)), lab(null, POM, {}, sec(10, 12, 19)), lab(null, OVER, {}, sec(10, 28, 10))],
+     [L("timer", "Hiring plan", idle.badge, idle.alert, { glyph: "●", time: "13m", tone: "urgent" }),
+      L("timer", "", idle.badge, idle.alert, { glyph: "●", time: "13m", tone: "urgent" }),
+      L("timer", "", idle.badge, idle.alert, { glyph: "●", time: "+4m", tone: "urgent" })],
+     "barLabel timer: pomodoro and overtime")
+  eq([lab(null, SHORT, {}, on14(10, 26)), lab(clockAt({}), LONG, {}, on14(10, 26)).text,
+      lab(null, SHORT, { label: "Count" }, on14(10, 26)).text],
+     [L("timer", "break", idle.badge, idle.alert, { glyph: "◌", time: "4m", tone: "accent" }), "Hiring plan", ""],
+     "barLabel timer: a break, with and without the clock")
+  eq([lab(null, null), lab(null, null, { label: "Count" }).text], [idle, V(undefined, { label: "Count" }).label.text],
+     "barLabel timer: idle as before")
+  eq([TV(clockAt({}), null, on14(10, 23), {}, "offline").label, TV(clockAt({}), null, on14(10, 23), {}, "stale").label.timer],
+     [L("offline", "", 0, false), null], "barLabel timer: none while Emacs isn't reachable")
+}
+{
+  const first = (clock, pom, now, settings) => TV(clock, pom, now, settings).tooltip.split("\n")[0]
+  const idle = V().tooltip
+  eq([first(clockAt({ effortMin: 60 }), null, on14(10, 23)), first(clockAt({}), null, on14(10, 23)),
+      first(clockAt({}), POM, sec(10, 12, 19)), first(null, POM, sec(10, 12, 19)), first(clockAt({}), OVER, sec(10, 28, 10)),
+      first(null, SHORT, on14(10, 26)), first(clockAt({}), LONG, on14(10, 26))],
+     ["Clocked in: Hiring plan · 0:23 / 1:00", "Clocked in: Hiring plan · 0:23", "Pomodoro 3: Hiring plan · 13m left",
+      "Pomodoro 3 · 13m left", "Overtime: Hiring plan · +4m", "Short break · 4m left", "Long break: Hiring plan · 4m left"],
+     "tooltip timer: first line per kind")
+  eq(TV(clockAt({}), null, on14(10, 40)).tooltip.split("\n").slice(1).join("\n"), idle, "tooltip timer: then the existing lines")
+  eq([first(clockAt({ effortMin: 60 }), null, on14(10, 23), { label: "Icon" }),
+      first(clockAt({}), POM, sec(10, 12, 19), { label: "Icon" }),
+      first(clockAt({}), null, on14(10, 23), { label: "Count" })],
+     ["Clocked in · 0:23 / 1:00", "Pomodoro 3 · 13m left", "Clocked in: Hiring plan · 0:23"],
+     "tooltip timer: Icon hides the title as it hides the next item's; Count shows it")
+  eq(/[<>]/.test(TV(clockAt({ title: "<img src=x>" }), null, on14(10, 23)).tooltip), false, "tooltip timer: markup neutralised")
+}
+
+// ---------------------------------------------------------------- timers: row tint
+
+{
+  const clocked = m => {
+    const out = []
+    m.panes.forEach(p => p.blocks.forEach(b => {
+      if (b.kind === "row" && b.clocked) out.push("row " + b.item.line)
+      if (b.kind === "chips") b.chips.forEach(c => { if (c.clocked) out.push("chip " + c.item.line) })
+    }))
+    return out
+  }
+  const rowAt = (m, line) => concatRows(m).filter(b => b.item.line === line)[0]
+  const concatRows = m => m.panes.reduce((acc, p) => acc.concat(p.blocks.filter(b => b.kind === "row")), [])
+  const onLine = line => TV(clockAt({ line: line }), null, on14(10, 23))
+  const org = LM(onLine(130), { layout: "Org" })
+  eq([clocked(org), rowAt(org, 130).clock, rowAt(org, 130).trail, rowAt(org, 110).clock, rowAt(org, 110).clocked],
+     [["row 130"], "◷ 0:23", null, "", false], "row tint Org: the clocked row and its clock text")
+  eq(concatRows(LM(v14, { layout: "Org" })).every(b => b.clocked === false && b.clock === ""), true,
+     "row tint Org: nothing clocked without a timer")
+  const tabs = [["today", 130], ["week", 161], ["overdue", 140]].map(([tab, line]) => {
+    const m = LM(onLine(line), { layout: "Tabs", tab: tab })
+    return [clocked(m), rowAt(m, line).trail, rowAt(m, line).clock]
+  })
+  eq(tabs, [[["row 130"], { text: "◷ 0:23", tone: "accent" }, undefined],
+            [["row 161"], { text: "◷ 0:23", tone: "accent" }, undefined],
+            [["row 140"], { text: "◷ 0:23", tone: "accent" }, undefined]], "row tint Tabs: each tab, the trail is the time")
+  eq(rowAt(LM(v14, { layout: "Tabs", tab: "today" }), 130).trail, { text: "work", tone: "muted" }, "row tint Tabs: trail unchanged unclocked")
+  const cols = LM(onLine(100), { layout: "Columns" })
+  eq([clocked(cols), clocked(LM(onLine(120), { layout: "Columns" }))], [["chip 100"], ["row 120"]],
+     "row tint Columns: a habit chip, a right-pane row")
+  eq(LM(v14, { layout: "Columns" }).panes[0].blocks.filter(b => b.kind === "chips")[0].chips.map(c => c.clocked),
+     [false, false], "row tint Columns: chips unclocked without a timer")
+  // The clock on an entry of next week's payload.
+  const rep = TV(clockAt({ line: 200 }), POM, sec(10, 12, 19))
+  const wk = LM(rep, { layout: "Org", offset: 1, week: nextWeek })
+  eq([clocked(wk), rowAt(wk, 200).clock], [["row 200"], "● 13m"], "row tint: a week payload's row, pomodoro text")
+  eq(rowAt(LM(rep, { layout: "Tabs", tab: "week", offset: 1, week: nextWeek }), 200).trail, { text: "● 13m", tone: "urgent" },
+     "row tint: a week payload's list row in the pomodoro's tone")
+  const same = ui => [LM(v14, ui), LM(TV(clockAt({ line: 130 })), ui), LM(TV(clockAt({ line: 100 }), POM), ui)]
+    .map(m => JSON.stringify(m.rows.map(r => [r.key, r.sel, r.pane])))
+  eq([{ layout: "Org" }, { layout: "Tabs", tab: "today" }, { layout: "Tabs", tab: "week" }, { layout: "Tabs", tab: "overdue" },
+      { layout: "Columns" }, { layout: "Org", offset: 1, week: nextWeek }].map(ui => same(ui).every((s, i, a) => s === a[0])),
+     [true, true, true, true, true, true], "row tint: keys and sel unchanged")
+  eq(clocked(LM(TV(clockAt({ path: null })), { layout: "Org" })), [], "row tint: a clock outside a file tints nothing")
+}
+
+// ---------------------------------------------------------------- timers: keys
+
+{
+  const act = (over, key, text) => M.keyAction(Object.assign({ layout: "Org", tab: "today", pickerOpen: false }, over), key, text)
+  const caps = ["I", "O", "X", "J", "P"]
+  eq([{}, { clocking: true }, { pomodoroAvailable: true }, { clocking: true, pomodoroAvailable: true, pomodoro: "pomodoro" }]
+       .map(c => caps.map(k => act(c, "", k))),
+     [[{ clock: "in" }, null, null, null, null],
+      [{ clock: "in" }, { clock: "out" }, { clock: "cancel" }, { clock: "goto" }, null],
+      [{ clock: "in" }, null, null, null, { pomodoro: true }],
+      [{ clock: "in" }, { clock: "out" }, { clock: "cancel" }, { clock: "goto" }, { pomodoro: true }]],
+     "keyAction: I O X J P gated on the clock and org-pomodoro")
+  const all = { clocking: true, pomodoroAvailable: true }
+  eq(["j", "k", "p", "n", "i", "o", "x"].map(k => act(all, "", k)),
+     [{ move: 1 }, { move: -1 }, { move: -1 }, { move: 1 }, null, null, null], "keyAction: lowercase keep their meaning")
+  const conf = Object.assign({ confirming: true }, all)
+  eq([act(conf, "", "P"), act(conf, "", "p"), act(conf, "", "j"), act(conf, "Down", ""), act(conf, "Escape", ""),
+      act(conf, "Return", ""), act(conf, "", "I"), act(conf, "", ""), act(conf, "", "ab")],
+     [{ pomodoro: "stop" }, { cancelConfirm: true }, { cancelConfirm: true }, { cancelConfirm: true }, { cancelConfirm: true },
+      { cancelConfirm: true }, { cancelConfirm: true }, null, null],
+     "keyAction: the stop question takes the next key; a bare modifier leaves it")
+  eq([act(Object.assign({ pickerOpen: true }, conf), "", "P"), act(Object.assign({ pickerOpen: true }, all), "", "I"),
+      act(Object.assign({ pickerOpen: true }, all), "", "O")], [null, null, null], "keyAction: the picker still wins")
+}
+{
+  const states = ["none", "pomodoro", "overtime", "short-break", "long-break"]
+  const step = (state, askKill, confirming, available) =>
+    M.pomodoroStep(TV(null, pomAt({ state: state, endsAt: state === "none" ? null : S0 + 1500, askKill: askKill,
+                                    available: available !== false })), confirming)
+  eq(states.map(s => [step(s, true, false), step(s, true, true), step(s, false, false), step(s, false, true)]),
+     [["start", "start", "start", "start"], ["ask", "stop", "stop", "stop"], ["break", "break", "break", "break"],
+      ["ask", "stop", "stop", "stop"], ["ask", "stop", "stop", "stop"]], "pomodoroStep: every state, askKill, confirming")
+  eq([states.map(s => step(s, true, false, false)), M.pomodoroStep(null, false), M.pomodoroStep(V(), false)],
+     [[null, null, null, null, null], null, null], "pomodoroStep: null without org-pomodoro")
+}
+
+// ---------------------------------------------------------------- timers: forms
+
+{
+  const qp = payloadOf([item({ path: "/home/u/org/it's \"q\".org", line: 7, todo: "NEXT", id: "x\") (shell-command \"rm\")" })],
+                       { keywords: KW })
+  eq([M.clockInForm(task, sp, ELISP), M.clockInForm(sp.items[4], sp, ELISP).split(PRE)[1],
+      M.clockInForm(sync, sp, ELISP).split(PRE)[1], M.clockInForm(qp.items[0], qp, ELISP).split(PRE)[1]],
+     ["(progn " + PRE + " (omarchy-org-agenda-clock-in \"/home/u/org/cal.org\" 20 nil \"TODO\"))",
+      " (omarchy-org-agenda-clock-in \"/home/u/org/cal.org\" 80 \"e-1\" \"TODO\"))",
+      " (omarchy-org-agenda-clock-in \"/home/u/org/cal.org\" 63 nil nil))",
+      " (omarchy-org-agenda-clock-in \"/home/u/org/it's \\\"q\\\".org\" 7 nil \"NEXT\"))"],
+     "clockInForm: exact, id, FROM nil, hostile path and id")
+  eq([M.clockOutForm(ELISP), M.clockCancelForm(ELISP), M.clockGotoForm(ELISP)],
+     ["(progn " + PRE + " (omarchy-org-agenda-clock-out))", "(progn " + PRE + " (omarchy-org-agenda-clock-cancel))",
+      "(progn " + PRE + " (omarchy-org-agenda-clock-goto))"], "clock out/cancel/goto forms")
+  eq([M.pomodoroForm(task, sp, false, ELISP), M.pomodoroForm(sp.items[4], sp, true, ELISP).split(PRE)[1],
+      M.pomodoroForm(null, sp, true, ELISP).split(PRE)[1], M.pomodoroForm(undefined, null, false, ELISP).split(PRE)[1],
+      M.pomodoroForm(null, null, "yes", ELISP).split(PRE)[1]],
+     ["(progn " + PRE + " (omarchy-org-agenda-pomodoro \"/home/u/org/cal.org\" 20 nil \"TODO\" nil))",
+      " (omarchy-org-agenda-pomodoro \"/home/u/org/cal.org\" 80 \"e-1\" \"TODO\" t))",
+      " (omarchy-org-agenda-pomodoro nil nil nil nil t))", " (omarchy-org-agenda-pomodoro nil nil nil nil nil))",
+      " (omarchy-org-agenda-pomodoro nil nil nil nil nil))"], "pomodoroForm: start, confirm, break/stop")
+  const bad = [item({ line: 21 }), item({ path: "/etc/passwd", line: 20 }), sp.items[3],
+               Object.assign({}, task, { todo: "BOGUS" }), Object.assign({}, task, { todo: "TO DO" }), {}]
+  eq([bad.map(it => throws(() => M.clockInForm(it, sp, ELISP))), bad.map(it => throws(() => M.pomodoroForm(it, sp, false, ELISP))),
+      [throws(() => M.clockInForm(task, null, ELISP)), throws(() => M.clockInForm(task, sp, "rel.el")),
+       throws(() => M.clockOutForm("rel.el")), throws(() => M.pomodoroForm(null, null, true, "rel.el"))]],
+     [[true, true, true, true, true, true], [true, true, true, true, true, true], [true, true, true, true]],
+     "clock forms: unknown entries, sexps, bad keywords and relative files throw")
+  eq([M.clockInForm(nextWeek.items[1], nextWeek, ELISP).split(PRE)[1], throws(() => M.clockInForm(nextWeek.items[1], sp, ELISP))],
+     [" (omarchy-org-agenda-clock-in \"/home/u/org/cal.org\" 201 nil \"TODO\"))", true],
+     "clockInForm: checked against the payload the row came from")
+}
+
+// ---------------------------------------------------------------- timers: results
+
+{
+  const out = obj => JSON.stringify(JSON.stringify(Object.assign({ state: null, saved: false, detail: null }, obj))) + "\n"
+  const values = ["done", "note", "note-frame", "changed", "conflict", "busy", "invalid", "error", "not-clocking",
+                  "needs-emacs", "unavailable", "confirm"]
+  eq(values.map(r => M.parseActionResult(out({ result: r })).value.result), values, "parseActionResult: every result value")
+  eq(M.parseActionResult(out({ result: "done", state: "NEXT", saved: true, detail: null })),
+     { ok: true, value: { result: "done", state: "NEXT", saved: true, detail: null } }, "parseActionResult: done")
+  eq(M.parseActionResult(out({ result: "needs-emacs", detail: "Start the clock from then? " })).value.detail,
+     "Start the clock from then? ", "parseActionResult: needs-emacs detail")
+  eq([M.parseActionResult(out({ result: "blocked" })).ok, M.parseStateResult(out({ result: "blocked" })).ok,
+      M.parseStateResult(out({ result: "not-clocking" })).ok, M.parseStateResult(OUT_DONE).ok],
+     [false, true, false, true], "parseActionResult vs parseStateResult: each its own results")
+  eq(["", null, "t\n", "nil\n", "\"not json\"", "\"[1]\"", "*ERROR*: No running clock", "\"{\\\"result\\\":\\\"maybe\\\"}\""]
+       .map(s => M.parseActionResult(s).ok), [false, false, false, false, false, false, false, false],
+     "parseActionResult: garbage -> not ok")
+}
+{
+  const msg = (a, v) => M.actionMessage(a, Object.assign({ state: null, saved: false, detail: null }, v))
+  eq(["in", "out", "cancel", "start", "break", "stop"].map(a => msg(a, { result: "done", saved: true })),
+     ["Clocked in · saved", "Clocked out · saved", "Clock cancelled · saved", "Pomodoro started · saved",
+      "Break started · saved", "Pomodoro stopped · saved"].map(t => ({ text: t, tone: "ok" })), "actionMessage: done")
+  eq([msg("in", { result: "done", state: "NEXT", saved: true }), msg("out", { result: "done" }),
+      msg("out", { result: "done", detail: "Permission denied" }), msg("out", { result: "note" }),
+      msg("start", { result: "note-frame" }),
+      msg("in", { result: "needs-emacs", detail: "You stopped another clock 5 mins ago; start this one from then? " }),
+      msg("in", { result: "needs-emacs", detail: "Org wants to ask something; do it in Emacs" }),
+      msg("in", { result: "needs-emacs" }), msg("out", { result: "not-clocking" }),
+      msg("start", { result: "unavailable", detail: "org-pomodoro can't be loaded" }), msg("stop", { result: "confirm" }),
+      msg("in", { result: "changed" }), msg("in", { result: "conflict" }), msg("out", { result: "busy" }),
+      msg("in", { result: "invalid", detail: "no such entry" }),
+      msg("start", { result: "error", detail: "boom; no pomodoro started; the clock is still running" }),
+      msg("in", { result: "weird" }), M.actionMessage("bogus", { result: "done", saved: true })],
+     [{ text: "Clocked in · now NEXT · saved", tone: "ok" },
+      { text: "Clocked out · not saved: the file had unsaved edits in Emacs", tone: "warn" },
+      { text: "Clocked out · not saved: Permission denied", tone: "warn" },
+      { text: "Clocked out · add your note in Emacs", tone: "ok" },
+      { text: "Pomodoro started · opening Emacs for your note", tone: "ok" },
+      { text: "Org wants to ask: You stopped another clock 5 mins ago; start this one from then? — do it in Emacs", tone: "warn" },
+      { text: "Org wants to ask something — do it in Emacs", tone: "warn" },
+      { text: "Org wants to ask something — do it in Emacs", tone: "warn" },
+      { text: "No clock running", tone: "warn" },
+      { text: "org-pomodoro isn't available: org-pomodoro can't be loaded", tone: "error" },
+      { text: "Stop the pomodoro? P again", tone: "warn" },
+      { text: "This entry changed in Emacs. The agenda is refreshing; try again.", tone: "warn" },
+      { text: "The file changed on disk and has unsaved edits in Emacs. Resolve it there first.", tone: "error" },
+      { text: "Emacs is waiting for another note. Finish it first.", tone: "warn" },
+      { text: "Emacs refused this entry: no such entry", tone: "error" },
+      { text: "Couldn't start the pomodoro: boom; no pomodoro started; the clock is still running", tone: "error" },
+      { text: "Couldn't clock in: unexpected answer from Emacs", tone: "error" },
+      { text: "Done · saved", tone: "ok" }], "actionMessage: every result")
+  eq([M.actionMessage("in", null).tone, msg("in", { result: "needs-emacs", detail: "<b>?</b>" }).text.indexOf("<"),
+      Array.from(msg("in", { result: "error", detail: "y".repeat(400) }).text).length <= 300],
+     ["error", -1, true], "actionMessage: bad input, markup neutralised, bounded")
+}
+
+// ---------------------------------------------------------------- timers: hints
+
+{
+  const ctxs = [undefined, { clocking: false, pomodoroAvailable: false }, { clocking: false, pomodoroAvailable: true },
+                { clocking: true, pomodoroAvailable: false }, { clocking: true, pomodoroAvailable: true }]
+  const hints = ["Org", "Tabs", "Columns"].map(l => ctxs.map(c => M.layoutHints(l, c)))
+  eq(hints.map(h => h[0]), ["Org", "Tabs", "Columns"].map(l => M.layoutHints(l)), "layoutHints: no timer ctx as before")
+  eq(hints[0].slice(1), ["↑↓ move · ↵ open · t state · I clock · f b week · v layout · esc",
+                         "↑↓ move · ↵ open · t state · I clock · P pomodoro · f b week · v layout · esc",
+                         "↑↓ move · ↵ open · t state · O out · J jump · f b week · v layout · esc",
+                         "↑↓ move · ↵ open · t state · O out · J jump · P pomodoro · f b week · esc"],
+     "layoutHints Org: timer hints, refresh then layout make room")
+  eq(hints[2].slice(1), ["← → column · ↑↓ move · ↵ open · t state · I clock · f b week · v layout · esc",
+                         "← → column · ↑↓ move · ↵ open · t state · I clock · P pomodoro · f b week · esc",
+                         "← → column · ↑↓ move · ↵ open · t state · O out · J jump · f b week · esc",
+                         "← → column · ↑↓ move · ↵ open · t state · O out · J jump · P pomodoro · esc"],
+     "layoutHints Columns: timer hints fit the prefix")
+  eq(hints[1][4], "1 2 3 tabs · ↑↓ move · ↵ open · t state · O out · J jump · P pomodoro · esc", "layoutHints Tabs: the longest")
+  eq(hints.map(h => h.map(s => s.length <= 80)), [[true, true, true, true, true], [true, true, true, true, true],
+     [true, true, true, true, true]], "layoutHints: every combination ≤ 80 chars")
+  eq(hints.map(h => h.slice(1).every(s => s.indexOf("r refresh") < 0)), [true, true, true], "layoutHints: refresh leaves with a timer hint")
 }
 
 eq([M.PROTOCOL, M.MAX_ITEMS, M.MAX_TITLE, M.NOW_GRACE_MIN, M.STALE_AFTER_MS, M.ID_RE.test("a:b")],
