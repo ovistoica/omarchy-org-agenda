@@ -82,7 +82,7 @@ Item {
     }
     if (outputFile === "") {
       status = "error"
-      detail = "No private directory for the agenda file (XDG_RUNTIME_DIR and HOME are unset)"
+      detail = "No private directory for the agenda file (XDG_RUNTIME_DIR and HOME are unset or not absolute paths)"
       console.warn("org-agenda: cannot pull:", detail)
       return
     }
