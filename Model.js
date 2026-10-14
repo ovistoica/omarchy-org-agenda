@@ -37,6 +37,15 @@ const LABELS = ["Next item", "Count", "Icon"]
 const STATUSES = ["loading", "ok", "offline", "error", "stale"]
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+const WEEKDAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+const MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July", "August",
+                     "September", "October", "November", "December"]
+// The popout's layouts, in `v' order, and the Tabs layout's tabs.
+const LAYOUTS = ["Org", "Tabs", "Columns"]
+const TABS = ["today", "week", "overdue"]
+// Width of Org's %-12:c category and %?-12t time/leader columns.
+const ORG_CELL = 12
+const NOW_LINE = "now - - - - - - - - - - - - - - - - - - - - - - - - -"
 const SECTION_ORDER = [
   { key: "schedule", cls: "schedule", title: "Schedule" },
   { key: "today", cls: "today", title: "Today" },
@@ -264,8 +273,10 @@ function settingInt(v, dflt, lo, hi) {
 function normalizeSettings(raw) {
   const r = isObj(raw) ? raw : {}
   const label = settingStr(r.label, "Next item")
+  const layout = settingStr(r.layout, "Org")
   return {
     label: LABELS.indexOf(label) >= 0 ? label : "Next item",
+    layout: LAYOUTS.indexOf(layout) >= 0 ? layout : "Org",
     maxTitleChars: settingInt(r.maxTitleChars, 28, 10, 80),
     overdueBadge: r.overdueBadge !== false,
     habitsInBadge: r.habitsInBadge === true,
@@ -390,6 +401,13 @@ function agendaFilesList(settings) {
     .map(f => f.trim())
     .filter(f => cleanStr(f, 1024) !== null && f !== "")
     .slice(0, 50)
+}
+
+// Changes only with what a pull sends to Emacs, so a UI-only setting such
+// as the layout never costs one.
+function pullKey(settings) {
+  const s = normalizeSettings(settings)
+  return JSON.stringify([clientArgs(s), agendaFilesList(s), s.pushUpdates, socketKey(s)])
 }
 
 function filesForm(list) {
@@ -752,6 +770,442 @@ function refocus(before, after, index) {
     if (j >= 0) return j
   }
   return clamp(index, 0, after.length - 1)
+}
+
+// ---------------------------------------------------------------- org formatting
+
+function spaces(n) { return n > 0 ? new Array(n + 1).join(" ") : "" }
+function padRight(s, n) { return s + spaces(n - Array.from(s).length) }
+function padLeft(s, n) { return spaces(n - s.length) + s }
+function isDate(d) { return d instanceof Date && !isNaN(d.getTime()) }
+function addDays(date, n) { return new Date(date.getFullYear(), date.getMonth(), date.getDate() + n) }
+function range(from, to) {
+  const out = []
+  for (let i = from; i <= to; i++) out.push(i)
+  return out
+}
+
+// Org's %-12:c: "work:" padded to 12 columns, the category cut to 11.
+function orgCategory(cat) {
+  const chars = Array.from(isStr(cat) ? cat : "")
+  return chars.length ? padRight(chars.slice(0, ORG_CELL - 1).join("") + ":", ORG_CELL) : spaces(ORG_CELL)
+}
+
+function isScheduledType(item) { return item.type === "scheduled" || item.type === "past-scheduled" }
+
+// Org's default `org-agenda-scheduled-leaders' / `org-agenda-deadline-leaders'.
+function orgLeader(item) {
+  const n = item.overdueDays
+  if (isScheduledType(item)) return n > 0 ? "Sched." + padLeft(String(n), 2) + "x: " : "Scheduled: "
+  if (item.type === "deadline") return n > 0 ? padLeft(String(n), 2) + " d. ago: " : "Deadline:  "
+  if (item.type === "upcoming-deadline") return "In " + padLeft(String(item.inDays), 3) + " d.: "
+  return ""
+}
+
+// A leader that says more than the clock: overdue, a deadline, a warning.
+function leaderFirst(item) { return isDeadline(item) || (isScheduledType(item) && item.overdueDays > 0) }
+
+// The leader's Org face: org-scheduled-previously, org-scheduled,
+// org-warning, org-upcoming-deadline.
+function leaderTone(item, today) {
+  if (isScheduledType(item)) return item.overdueDays > 0 ? "late" : "muted"
+  if (item.type === "deadline") return item.overdueDays > 0 || today ? "urgent" : "soon"
+  if (item.type === "upcoming-deadline") return "soon"
+  return "normal"
+}
+
+// A clock row of today that is over; without a duration it lasts as long
+// as nextUp keeps it "now". Habits and leader rows never are.
+function isOver(item, nowMin) {
+  const start = minutesOf(item.time)
+  return !item.habit && !leaderFirst(item) && start >= 0
+    && start + (item.durationMin > 0 ? item.durationMin : NOW_GRACE_MIN) <= nowMin
+}
+
+// Org's 12-column time/leader cell: {text, tone}. `today`: the row is on
+// today's date.
+function orgWhen(item, nowMin, today) {
+  const start = minutesOf(item.time)
+  const cell = (t, tone) => ({ text: padRight(t, ORG_CELL), tone: tone })
+  if (leaderFirst(item) || start < 0) return cell(orgLeader(item), leaderTone(item, !!today))
+  const t = item.durationMin > 0 ? hhmm(start) + "-" + hhmm((start + item.durationMin) % 1440)
+    : hhmm(start) + "......"
+  return cell(t, today && isOver(item, nowMin) ? "muted" : "normal")
+}
+
+// ISO-8601 week number of a local date.
+function isoWeek(date) {
+  const dow = date.getDay() || 7
+  const thursday = Date.UTC(date.getFullYear(), date.getMonth(), date.getDate() + 4 - dow)
+  const yearStart = Date.UTC(new Date(thursday).getUTCFullYear(), 0, 1)
+  return Math.floor((thursday - yearStart) / 86400000 / 7) + 1
+}
+
+// `org-agenda-format-date-aligned': "Wednesday  14 October 2026", and
+// "W42" on a Monday or the first day shown.
+function orgDayTitle(date, firstShown) {
+  if (!isDate(date)) return { title: "", week: "" }
+  return {
+    title: padRight(WEEKDAY_NAMES[date.getDay()], 10) + " " + padLeft(String(date.getDate()), 2) + " "
+      + MONTH_NAMES[date.getMonth()] + " " + padLeft(String(date.getFullYear()), 4),
+    week: date.getDay() === 1 || firstShown ? "W" + pad2(isoWeek(date)) : ""
+  }
+}
+
+// "THU 15", for the Tabs and Columns day headers.
+function compactDayTitle(date) {
+  return isDate(date) ? WEEKDAYS[date.getDay()].toUpperCase() + " " + date.getDate() : ""
+}
+
+// ---------------------------------------------------------------- layouts
+
+function nextLayout(layout) {
+  return LAYOUTS[(LAYOUTS.indexOf(normalizeSettings({ layout: layout }).layout) + 1) % LAYOUTS.length]
+}
+
+function weekOffsetOf(v) { return intIn(v, -MAX_WEEK_OFFSET, MAX_WEEK_OFFSET) ? v : 0 }
+
+// f (+1), b (-1) and . (0, back to this week).
+function browseOffset(offset, step) {
+  if (step === 0) return 0
+  const dir = step > 0 ? 1 : step < 0 ? -1 : 0
+  return clamp(weekOffsetOf(offset) + dir, -MAX_WEEK_OFFSET, MAX_WEEK_OFFSET)
+}
+
+// The week payload when it is the one for `offset`, else null.
+function weekFor(offset, week) {
+  return isObj(week) && week.weekOffset === offset && payloadDay({ date: week.weekStart }) !== null
+    && Array.isArray(week.items) ? week : null
+}
+
+// The week to fetch for `offset`, or null when none is needed.
+function weekWanted(offset, week) {
+  const o = weekOffsetOf(offset)
+  return o === 0 || (isObj(week) && week.weekOffset === o) ? null : o
+}
+
+// First day of the Org week `offset` weeks away. The bar's week ends
+// `daysAhead` days after its day and lasts 7 days, whatever
+// `org-agenda-start-on-weekday' is, so no Emacs setting is needed.
+function weekStartDay(view, offset, week) {
+  const w = weekFor(offset, week)
+  if (w) return payloadDay({ date: w.weekStart })
+  const today = payloadDay(view.payload)
+  return today ? addDays(today, 7 * offset + view.payload.daysAhead - 6) : null
+}
+
+// "14–18 Oct", "29 Sep – 5 Oct", "14 Oct".
+function dayRange(a, b) {
+  if (a.getTime() === b.getTime()) return a.getDate() + " " + MONTHS[a.getMonth()]
+  return a.getMonth() === b.getMonth() && a.getFullYear() === b.getFullYear()
+    ? a.getDate() + "–" + b.getDate() + " " + MONTHS[b.getMonth()]
+    : a.getDate() + " " + MONTHS[a.getMonth()] + " – " + b.getDate() + " " + MONTHS[b.getMonth()]
+}
+
+// The header's week navigator: {offset, label, range}.
+function weekNav(view, offset, week) {
+  const o = weekOffsetOf(offset)
+  const today = payloadDay(view.payload)
+  const first = weekStartDay(view, o, week)
+  const label = o === 0 ? "This week" : o === 1 ? "Next week" : o === -1 ? "Last week"
+    : first ? "W" + pad2(isoWeek(first))
+    : (o > 0 ? "+" : "") + o + " weeks"
+  const span = o === 0 ? (today ? dayRange(today, addDays(today, view.payload.daysAhead)) : "")
+    : first ? dayRange(first, addDays(first, 6)) : ""
+  return { offset: o, label: label, range: span }
+}
+
+// Keys for a payload's items, the same in every layout and refresh:
+// type, path, line and day, with "#2"… for repeats. Computed before
+// showDone filters, so hiding done rows doesn't move them either.
+function keyedEntries(items) {
+  const seen = {}
+  return (items || []).map(item => {
+    const base = item.type + ":" + item.path + ":" + item.line + ":" + item.inDays
+    const n = hasOwn(seen, base) ? seen[base] + 1 : 1
+    seen[base] = n
+    return { key: n > 1 ? base + "#" + n : base, item: item }
+  })
+}
+
+// Soonest first, ties in Org's order (V4's sort may not be stable).
+function entriesByInDays(entries) {
+  return entries
+    .map((e, i) => ({ e: e, i: i }))
+    .sort((a, b) => (a.e.item.inDays - b.e.item.inDays) || (a.i - b.i))
+    .map(x => x.e)
+}
+
+function isLaterDay(item) { return item.inDays > 0 && item.type !== "upcoming-deadline" }
+
+// Where Org draws its now line in today's rows: before the first timed
+// non-habit row starting after now, else after the last one; -1 for none.
+function nowLineAt(items, nowMin) {
+  if (!isFinite(nowMin)) return -1
+  const timed = items
+    .map((item, i) => ({ i: i, start: item.habit ? -1 : minutesOf(item.time) }))
+    .filter(c => c.start >= 0)
+  if (!timed.length) return -1
+  const after = timed.filter(c => c.start > nowMin)
+  return after.length ? after[0].i : timed[timed.length - 1].i + 1
+}
+
+const tone = (t, tn) => ({ text: t, tone: tn })
+
+function orgRow(e, nowMin, today) {
+  return { kind: "row", key: e.key, sel: -1, item: e.item, style: "org", lead: null, trail: null,
+           cat: orgCategory(e.item.category), when: orgWhen(e.item, nowMin, today),
+           past: !!today && isOver(e.item, nowMin), flag: isDeadline(e.item), dense: false }
+}
+
+function listRow(e, lead, trail, past, dense) {
+  return { kind: "row", key: e.key, sel: -1, item: e.item, style: "list", lead: lead, trail: trail,
+           cat: "", when: null, past: past, flag: isDeadline(e.item), dense: dense }
+}
+
+// Today's and Overdue's rows, with the v0.2 lead and trail.
+function classicRow(e, today, nowMin, dense) {
+  const lead = rowLead(e.item, today)
+  return listRow(e, tone(lead.text, lead.urgent ? "urgent" : "muted"),
+                 tone(rowTrail(e.item), e.item.habit && e.item.overdueDays > 0 ? "late" : "muted"),
+                 isOver(e.item, nowMin), dense)
+}
+
+// A week row: the time, then the category.
+function weekRow(e, dense) {
+  return listRow(e, tone(e.item.time || "", "muted"), tone(e.item.category || "", "muted"), false, dense)
+}
+
+function sectionBlock(key, title, count, hint, urgent) {
+  return { kind: "section", key: "sec:" + key, title: title, count: count, hint: hint, urgent: urgent }
+}
+
+function dayBlock(date, style, today, empty, firstShown) {
+  const org = orgDayTitle(date, firstShown)
+  return { kind: "day", key: "day:" + dateKey(date), style: style, today: today, empty: empty,
+           title: style === "org" ? org.title : compactDayTitle(date),
+           week: style === "org" ? org.week : "",
+           hint: style === "compact" && empty ? "nothing scheduled" : "" }
+}
+
+function nextBlock(view) {
+  return view.next
+    ? [{ kind: "next", key: "next", sel: -1, item: view.next.item,
+         caption: view.next.state === "now" ? "NOW" : "NEXT UP", meta: nextMeta(view.next, view.nowMin) }]
+    : []
+}
+
+function chipsBlock(entries) {
+  return { kind: "chips", key: "chips:habits", chips: entries.map(e => ({
+    key: e.key, sel: -1, item: e.item, text: e.item.title,
+    missed: e.item.overdueDays > 0 ? e.item.overdueDays + "d" : "", done: e.item.done })) }
+}
+
+function concatAll(lists) { return lists.reduce((acc, l) => acc.concat(l), []) }
+
+function countRows(blocks) {
+  return blocks.reduce((n, b) => n + (b.kind === "row" ? 1 : b.kind === "chips" ? b.chips.length : 0), 0)
+}
+
+// A week payload's 7 days: [{date, today, entries}].
+function payloadWeekDays(week, showDone) {
+  const start = payloadDay({ date: week.weekStart })
+  const entries = keyedEntries(week.items).filter(e => showDone || !e.item.done)
+  return range(0, 6).map(i => ({
+    date: addDays(start, i), today: week.startInDays + i === 0,
+    entries: entries.filter(e => e.item.inDays - week.startInDays === i)
+  }))
+}
+
+// Another week's area: its days, or a loading / error message.
+function otherWeek(ui, nav, showDone) {
+  const w = weekFor(ui.offset, ui.week)
+  if (w && !w.error) return { days: payloadWeekDays(w, showDone), message: null }
+  const err = ui.weekError || (w && w.error) || ""
+  const what = / week$/.test(nav.label) ? nav.label.toLowerCase() : nav.label
+  return { days: null, message: err
+    ? { kind: "message", key: "msg:week", text: text(err, 300), tone: "error" }
+    : { kind: "message", key: "msg:week", text: "Loading " + what + "…", tone: "muted" } }
+}
+
+function compactDays(days, dense) {
+  return concatAll(days.map(d => [dayBlock(d.date, "compact", d.today, d.entries.length === 0, false)]
+    .concat(d.entries.map(e => weekRow(e, dense)))))
+}
+
+// Tabs' Week tab and Columns' week section. This week: its later days,
+// with each deadline warning on its day, and further ones after.
+function weekBlocks(ctx, dense) {
+  if (ctx.ui.offset !== 0) {
+    const other = otherWeek(ctx.ui, ctx.nav, ctx.settings.showDone)
+    return other.days ? compactDays(other.days, dense) : [other.message]
+  }
+  const ahead = ctx.daysAhead
+  const warns = ctx.entries.filter(e => e.item.type === "upcoming-deadline")
+  const inWeek = e => e.item.inDays >= 1 && e.item.inDays <= ahead
+  const days = range(1, ahead).map(d => ({
+    date: addDays(ctx.today, d), today: false,
+    entries: warns.filter(e => e.item.inDays === d)
+      .concat(ctx.entries.filter(e => isLaterDay(e.item) && e.item.inDays === d))
+  }))
+  const later = entriesByInDays(warns.filter(e => !inWeek(e)))
+  return compactDays(days, dense).concat(later.length
+    ? [sectionBlock("ahead", "Deadlines ahead", later.length, "", false)].concat(later.map(e =>
+        listRow(e, tone(dayLabel(e.item.inDays, ctx.today), "muted"), tone(e.item.category || "", "muted"),
+                false, dense)))
+    : [])
+}
+
+// The next card, then Schedule, Today and Habits as sections() has them;
+// Habits as chips in Columns.
+function todayBlocks(ctx, chips) {
+  const secs = SECTION_ORDER
+    .filter(sec => ["schedule", "today", "habit"].indexOf(sec.cls) >= 0)
+    .map(sec => ({ sec: sec, entries: ctx.entries.filter(e => classify(e.item) === sec.cls) }))
+    .filter(x => x.entries.length > 0)
+  return nextBlock(ctx.view).concat(concatAll(secs.map(x =>
+    [sectionBlock(x.sec.key, x.sec.title, x.entries.length, sectionHint(x.sec.key), false)]
+      .concat(chips && x.sec.key === "habits" ? [chipsBlock(x.entries)]
+              : x.entries.map(e => classicRow(e, ctx.today, ctx.nowMin, false))))))
+}
+
+function overdueEntries(ctx) { return ctx.entries.filter(e => classify(e.item) === "overdue") }
+
+// Org: today in Org's order with the now line, then the week's later
+// days; another week is its 7 days.
+function orgBlocks(ctx) {
+  if (ctx.ui.offset !== 0) {
+    const other = otherWeek(ctx.ui, ctx.nav, ctx.settings.showDone)
+    return other.days
+      ? concatAll(other.days.map((d, i) => [dayBlock(d.date, "org", d.today, d.entries.length === 0, i === 0)]
+          .concat(d.entries.map(e => orgRow(e, ctx.nowMin, d.today)))))
+      : [other.message]
+  }
+  const todays = ctx.entries.filter(e => !isLaterDay(e.item))
+  const rows = todays.map(e => orgRow(e, ctx.nowMin, true))
+  const at = nowLineAt(todays.map(e => e.item), ctx.nowMin)
+  const withNow = at < 0 ? rows
+    : rows.slice(0, at).concat([{ kind: "now", key: "now", text: NOW_LINE }], rows.slice(at))
+  return [dayBlock(ctx.today, "org", true, todays.length === 0, true)].concat(withNow,
+    concatAll(range(1, ctx.daysAhead).map(d => {
+      const day = ctx.entries.filter(e => isLaterDay(e.item) && e.item.inDays === d)
+      return [dayBlock(addDays(ctx.today, d), "org", false, day.length === 0, false)]
+        .concat(day.map(e => orgRow(e, ctx.nowMin, false)))
+    })))
+}
+
+// Numbers what the keyboard reaches, pane by pane in display order.
+function numbered(panes) {
+  let sel = 0
+  const rows = []
+  const take = (key, item, pane) => {
+    rows.push({ key: key, sel: sel, pane: pane, item: item })
+    return sel++
+  }
+  const out = panes.map((p, pi) => ({ key: p.key, title: p.title, blocks: p.blocks.map(b =>
+    b.kind === "row" || b.kind === "next" ? Object.assign({}, b, { sel: take(b.key, b.item, pi) })
+    : b.kind === "chips" ? Object.assign({}, b, { chips: b.chips.map(c =>
+        Object.assign({}, c, { sel: take(c.key, c.item, pi) })) })
+    : b) }))
+  return { panes: out, rows: rows }
+}
+
+function normalizeUi(ui) {
+  const u = isObj(ui) ? ui : {}
+  return {
+    layout: normalizeSettings({ layout: u.layout }).layout,
+    tab: TABS.indexOf(u.tab) >= 0 ? u.tab : "today",
+    offset: weekOffsetOf(u.offset),
+    week: isObj(u.week) ? u.week : null,
+    weekError: isStr(u.weekError) ? u.weekError : ""
+  }
+}
+
+// The popout's body for any layout, from view() and the popout's state
+// ui = {layout, tab, offset, week, weekError}. Blocks are display-ready;
+// `rows` lists what the keyboard reaches, in `sel` order.
+function layoutModel(view, rawUi) {
+  const ui = normalizeUi(rawUi)
+  const settings = normalizeSettings(view.settings)
+  const today = payloadDay(view.payload)
+  const nav = weekNav(view, ui.offset, ui.week)
+  const entries = keyedEntries(view.items).filter(e => settings.showDone || !e.item.done)
+  const model = (tabs, panes) => Object.assign(
+    { layout: ui.layout, tab: ui.tab, tabs: tabs, nav: nav },
+    numbered(panes),
+    { empty: ui.offset === 0 && entries.length === 0 && !view.next })
+  if (!today) {
+    const panes = ui.layout === "Columns"
+      ? [{ key: "today", title: "Today", blocks: [] }, { key: "side", title: "", blocks: [] }]
+      : [{ key: ui.layout === "Tabs" ? ui.tab : "main", title: "", blocks: [] }]
+    return model([], panes)
+  }
+  const ctx = { view: view, ui: ui, settings: settings, today: today, nav: nav, entries: entries,
+                nowMin: view.nowMin, daysAhead: view.payload.daysAhead || 0 }
+  const overdue = overdueEntries(ctx)
+  if (ui.layout === "Org") return model([], [{ key: "main", title: "", blocks: orgBlocks(ctx) }])
+  if (ui.layout === "Tabs") {
+    const byTab = {
+      today: todayBlocks(ctx, false),
+      week: weekBlocks(ctx, false),
+      overdue: overdue.map(e => classicRow(e, today, ctx.nowMin, false))
+    }
+    const todayCount = countRows(byTab.today.filter(b => b.kind !== "next"))
+    const overdueCount = countRows(byTab.overdue)
+    return model([{ key: "today", title: "Today", count: todayCount, urgent: false },
+                  { key: "week", title: nav.label, count: countRows(byTab.week), urgent: false },
+                  { key: "overdue", title: "Overdue", count: overdueCount, urgent: overdueCount > 0 }],
+                 [{ key: ui.tab, title: "", blocks: byTab[ui.tab] }])
+  }
+  const week = weekBlocks(ctx, true)
+  const side = (overdue.length
+    ? [sectionBlock("overdue", "Overdue", overdue.length, "", true)]
+        .concat(overdue.map(e => classicRow(e, today, ctx.nowMin, true)))
+    : []).concat([sectionBlock("week", nav.label, countRows(week), "", false)], week)
+  return model([], [{ key: "today", title: "Today", blocks: todayBlocks(ctx, true) },
+                    { key: "side", title: "", blocks: side }])
+}
+
+// ←/→ in Columns: the other pane, same index within the pane, clamped.
+function paneSel(model, sel, dir) {
+  const rows = isObj(model) && Array.isArray(model.rows) ? model.rows : []
+  const cur = rows.filter(r => r.sel === sel)[0]
+  if (!cur || !Array.isArray(model.panes) || model.panes.length < 2) return sel
+  const target = clamp(cur.pane + (dir > 0 ? 1 : dir < 0 ? -1 : 0), 0, model.panes.length - 1)
+  const there = rows.filter(r => r.pane === target)
+  if (target === cur.pane || !there.length) return sel
+  const index = rows.filter(r => r.pane === cur.pane).indexOf(cur)
+  return there[Math.min(index, there.length - 1)].sel
+}
+
+// ←/→ in Tabs, stopping at the ends.
+function tabStep(tab, dir) {
+  const i = Math.max(0, TABS.indexOf(tab))
+  return TABS[clamp(i + (dir > 0 ? 1 : dir < 0 ? -1 : 0), 0, TABS.length - 1)]
+}
+
+// Keys 1 2 3; null for anything else.
+function tabAt(n) { return intIn(n, 1, TABS.length) ? TABS[n - 1] : null }
+
+// The first overdue row's key, for the badge click; "" when none shows.
+function overdueFocus(model) {
+  const rows = isObj(model) && Array.isArray(model.rows) ? model.rows : []
+  const hit = rows.filter(r => r.key !== "next" && isObj(r.item) && classify(r.item) === "overdue")[0]
+  return hit ? hit.key : ""
+}
+
+// The popout state that shows overdue: this week, and Tabs on Overdue.
+function overdueUi(ui) {
+  const u = normalizeUi(ui)
+  return Object.assign({}, isObj(ui) ? ui : {}, { offset: 0 },
+                       u.layout === "Tabs" ? { tab: "overdue" } : {})
+}
+
+// The footer's key hints.
+function layoutHints(layout) {
+  const l = normalizeSettings({ layout: layout }).layout
+  const base = "↑↓ move · ↵ open · t state · f b week · v layout · r refresh · esc"
+  return (l === "Tabs" ? "1 2 3 tabs · " : l === "Columns" ? "←→ column · " : "") + base
 }
 
 // ---------------------------------------------------------------- view

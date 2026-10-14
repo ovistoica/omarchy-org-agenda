@@ -15,7 +15,9 @@ const M = new Function(src + "; return { PROTOCOL, MAX_ITEMS, MAX_TITLE, ID_RE, 
   " basename, isDeadline, rowLead, rowTrail, rowLocation, sectionHint, nextMeta, footerLine," +
   " panelMode, errorMessage, panelModel, refocus, stateChoices, canChangeState, stateForm," +
   " takeNoteForm, parseStateResult, stateMessage, entryKey, pickerHint, ITEM_TYPES, payloadDay," +
-  " weekForm, parseWeekResult, elispStringValue }")()
+  " weekForm, parseWeekResult, elispStringValue, LAYOUTS, MAX_WEEK_OFFSET, pullKey, nextLayout," +
+  " orgCategory, orgLeader, orgWhen, orgDayTitle, isoWeek, compactDayTitle, browseOffset, weekNav," +
+  " weekWanted, layoutModel, paneSel, tabStep, tabAt, overdueFocus, overdueUi, layoutHints }")()
 
 let failed = 0
 let count = 0
@@ -253,7 +255,7 @@ eq(M.nextUp([sync], new Date(NaN)), null, "nextUp: invalid now -> null")
 
 // ---------------------------------------------------------------- settings
 
-eq(M.normalizeSettings(null), { label: "Next item", maxTitleChars: 28, overdueBadge: true, habitsInBadge: false,
+eq(M.normalizeSettings(null), { label: "Next item", layout: "Org", maxTitleChars: 28, overdueBadge: true, habitsInBadge: false,
   showDone: true, pushUpdates: true, socketName: "", serverFile: "", emacsclient: "", agendaFiles: "",
   agendaKey: "a", emacsApp: "emacs", timeoutSeconds: 5 }, "normalizeSettings: defaults")
 eq(M.normalizeSettings({ upcomingDays: 3 }), M.normalizeSettings({}),
@@ -712,6 +714,398 @@ eq([M.errorMessage(M.view(payloadOf([], { error: "bad" }), "ok", "x", at(11, 13)
       M.refocus(keys(after), keys(before), 6), M.refocus(keys(after), keys(before), 3),
       M.refocus([], keys(before), 0), M.refocus(keys(before), [], 3), M.refocus(["gone"], ["a", "b"], 5)],
      [4, 5, 6, 7, 3, 0, 0, 1], "refocus: keeps the entry or the one above")
+}
+
+// ---------------------------------------------------------------- layouts: settings
+
+{
+  const base = { socketName: "work", agendaFiles: "/a.org", label: "Count" }
+  const key = over => M.pullKey(Object.assign({}, base, over))
+  eq([{ layout: "Tabs" }, { layout: "Columns" }, { label: "Icon" }, { showDone: false }, { maxTitleChars: 40 },
+      { overdueBadge: false }, { habitsInBadge: true }, { agendaKey: "t" }, { emacsApp: "x" }]
+       .map(o => key(o) === key({})), [true, true, true, true, true, true, true, true, true],
+     "pullKey: UI-only settings keep it")
+  eq([{ socketName: "home" }, { serverFile: "/tmp/srv" }, { emacsclient: "/opt/ec" }, { agendaFiles: "/b.org" },
+      { pushUpdates: false }, { timeoutSeconds: 9 }].map(o => key(o) === key({})),
+     [false, false, false, false, false, false], "pullKey: pull settings change it")
+  eq([M.pullKey(null) === M.pullKey({}), typeof M.pullKey({})], [true, "string"], "pullKey: defaults")
+}
+eq([M.LAYOUTS, ["Org", "Tabs", "Columns", "bogus", null].map(M.nextLayout)],
+   [["Org", "Tabs", "Columns"], ["Tabs", "Columns", "Org", "Tabs", "Tabs"]], "nextLayout: cycles, invalid as Org")
+eq(["Org", "Tabs", "Columns", " Tabs ", "tabs", "", 3, undefined].map(l => M.normalizeSettings({ layout: l }).layout),
+   ["Org", "Tabs", "Columns", "Tabs", "Org", "Org", "Org", "Org"], "normalizeSettings: layout")
+
+// ---------------------------------------------------------------- layouts: Org formatting
+
+eq([M.orgCategory("work"), M.orgCategory("work-cal"), M.orgCategory("abcdefghijk"), M.orgCategory("abcdefghijkl"),
+    M.orgCategory(""), M.orgCategory(null), M.orgCategory("ăîșțâ")],
+   ["work:       ", "work-cal:   ", "abcdefghijk:", "abcdefghijk:", "            ", "            ", "ăîșțâ:      "],
+   "orgCategory: padded to 12, cut to 11")
+{
+  const L = over => M.orgLeader(item(over))
+  eq([L({ overdueDays: 5 }), L({ type: "past-scheduled", overdueDays: 13 }), L({ overdueDays: 120 }), L({}),
+      L({ type: "past-scheduled" }), L({ type: "deadline", overdueDays: 3 }), L({ type: "deadline", overdueDays: 100 }),
+      L({ type: "deadline" }), L({ type: "upcoming-deadline", inDays: 5 }), L({ type: "upcoming-deadline", inDays: 120 }),
+      L({ type: "timestamp" }), L({ type: "sexp" }), L({ type: "block" }), L({ habit: true, overdueDays: 2 }),
+      L({ habit: true })],
+     ["Sched. 5x: ", "Sched.13x: ", "Sched.120x: ", "Scheduled: ", "Scheduled: ", " 3 d. ago: ", "100 d. ago: ",
+      "Deadline:  ", "In   5 d.: ", "In 120 d.: ", "", "", "", "Sched. 2x: ", "Scheduled: "], "orgLeader: Org's formats")
+}
+{
+  const W = (over, nowMin, today) => M.orgWhen(item(over), nowMin, today === undefined ? true : today)
+  eq([W({ time: "09:30", durationMin: 30, type: "timestamp" }, 600),
+      W({ time: "09:30", durationMin: 30, type: "timestamp" }, 599),
+      W({ time: "09:30", durationMin: 30, type: "timestamp" }, 600, false),
+      W({ time: "13:00", type: "timestamp" }, 640),
+      W({ time: "13:00", type: "timestamp" }, 810),
+      W({ time: "23:30", durationMin: 60, type: "timestamp" }, 640),
+      W({ time: "22:00", durationMin: 180 }, NaN),
+      W({}, 640), W({ type: "timestamp" }, 640),
+      W({ overdueDays: 13, time: "09:00" }, 640),
+      W({ type: "deadline", overdueDays: 3 }, 640),
+      W({ type: "deadline", time: "17:00" }, 640),
+      W({ type: "deadline" }, 640, false),
+      W({ type: "upcoming-deadline", inDays: 5 }, 640),
+      W({ habit: true, time: "07:30" }, 640),
+      W({ habit: true, time: "07:30", overdueDays: 2 }, 640)],
+     [{ text: "09:30-10:00 ", tone: "muted" }, { text: "09:30-10:00 ", tone: "normal" },
+      { text: "09:30-10:00 ", tone: "normal" },
+      { text: "13:00...... ", tone: "normal" }, { text: "13:00...... ", tone: "muted" },
+      { text: "23:30-00:30 ", tone: "normal" }, { text: "22:00-01:00 ", tone: "normal" },
+      { text: "Scheduled:  ", tone: "muted" }, { text: "            ", tone: "normal" },
+      { text: "Sched.13x:  ", tone: "late" }, { text: " 3 d. ago:  ", tone: "urgent" },
+      { text: "Deadline:   ", tone: "urgent" }, { text: "Deadline:   ", tone: "soon" },
+      { text: "In   5 d.:  ", tone: "soon" },
+      { text: "07:30...... ", tone: "normal" }, { text: "Sched. 2x:  ", tone: "late" }],
+     "orgWhen: times, leaders, padding, tones, past, past midnight")
+}
+{
+  const d = (y, m, day) => new Date(y, m - 1, day)
+  eq([M.orgDayTitle(d(2026, 10, 14), true), M.orgDayTitle(d(2026, 10, 15), false), M.orgDayTitle(d(2026, 10, 19), false),
+      M.orgDayTitle(d(2026, 5, 3), false), M.orgDayTitle(new Date(NaN), true)],
+     [{ title: "Wednesday  14 October 2026", week: "W42" }, { title: "Thursday   15 October 2026", week: "" },
+      { title: "Monday     19 October 2026", week: "W43" }, { title: "Sunday      3 May 2026", week: "" },
+      { title: "", week: "" }], "orgDayTitle: aligned, week on Monday or first shown")
+  eq([d(2026, 1, 1), d(2027, 1, 1), d(2024, 12, 30), d(2021, 1, 3), d(2020, 12, 31), d(2026, 12, 28), d(2026, 10, 14),
+      d(2026, 3, 29)].map(M.isoWeek), [1, 53, 1, 53, 53, 53, 42, 13], "isoWeek: edges")
+  eq([M.compactDayTitle(d(2026, 10, 15)), M.compactDayTitle(d(2026, 11, 1)), M.compactDayTitle(null)],
+     ["THU 15", "SUN 1", ""], "compactDayTitle")
+}
+
+// ---------------------------------------------------------------- layouts: fixture
+
+// Wednesday 14 Oct 2026, 10:40. The Org week runs Mon–Sun: 4 later days.
+// Today's list is in Org's order (habit-down time-up urgency-down).
+const on14 = (h, m) => new Date(2026, 9, 14, h, m)
+const runH = item({ line: 100, todo: "TODO", title: "Morning run", category: "habits", habit: true, time: "07:30", overdueDays: 2 })
+const readH = item({ line: 101, todo: "TODO", title: "Read", category: "habits", habit: true, time: "08:00" })
+const standup14 = item({ line: 110, type: "timestamp", title: "Standup", category: "work-cal", time: "09:30", durationMin: 30 })
+const sync14 = item({ line: 111, type: "timestamp", title: "Engineering sync", category: "work-cal", time: "13:00" })
+const late14 = item({ line: 112, type: "timestamp", title: "Release", category: "work-cal", time: "23:30", durationMin: 60 })
+const expenses = item({ line: 120, type: "deadline", todo: "TODO", title: "Expenses", category: "work", overdueDays: 3 })
+const taxes = item({ line: 121, type: "deadline", todo: "TODO", title: "Taxes", category: "home" })
+const talk = item({ line: 122, type: "upcoming-deadline", todo: "TODO", title: "Talk proposal", category: "work", inDays: 2 })
+const visa = item({ line: 123, type: "upcoming-deadline", todo: "TODO", title: "Visa", category: "home", inDays: 12 })
+const hiring = item({ line: 130, todo: "NEXT", priority: "A", title: "Hiring plan", category: "work" })
+const insurance = item({ line: 140, type: "past-scheduled", todo: "TODO", title: "Insurance", category: "home", overdueDays: 13 })
+const done14 = item({ line: 150, todo: "DONE", done: true, title: "Done thing", category: "home" })
+const thuStandup = item({ line: 160, type: "timestamp", title: "Standup", category: "work-cal", time: "09:30", durationMin: 30, inDays: 1 })
+const slides = item({ line: 161, todo: "TODO", title: "Board slides", category: "work", inDays: 1 })
+const groceries = item({ line: 170, todo: "TODO", title: "Groceries", category: "home", inDays: 3 })
+const weekItems = [runH, readH, standup14, sync14, late14, expenses, taxes, talk, visa, hiring, insurance, done14,
+                   thuStandup, slides, groceries]
+const weekPayload = items => payloadOf(items, { date: "2026-10-14", generatedAt: "2026-10-14T10:38:00+0300", daysAhead: 4 })
+const V = (now, settings, items) => M.view(parsed(weekPayload(items || weekItems)).value, "ok", "", now || on14(10, 40), settings || {})
+const v14 = V()
+// Next week (Mon 19 – Sun 25) and last week (Mon 5 – Sun 11), as parseWeekResult gives them.
+const nextWeek = parsed(payloadOf([
+  item({ line: 200, type: "deadline", todo: "TODO", title: "Visa", category: "home", inDays: 5 }),
+  item({ line: 201, todo: "TODO", title: "Dentist", category: "home", time: "10:00", inDays: 7 }),
+  item({ line: 202, todo: "DONE", done: true, title: "Done next week", category: "home", inDays: 7 })],
+  { date: "2026-10-14", reason: "week", weekOffset: 1, weekStart: "2026-10-19", startInDays: 5 })).value
+const lastWeek = parsed(payloadOf([
+  item({ line: 210, type: "past-scheduled", todo: "TODO", title: "Old repeat", category: "home", inDays: -8 }),
+  item({ line: 211, type: "deadline", todo: "TODO", title: "Old deadline", category: "work", inDays: -5 })],
+  { date: "2026-10-14", reason: "week", weekOffset: -1, weekStart: "2026-10-05", startInDays: -9 })).value
+
+const lineOf = k => Number(/:(\d+):-?\d+(#\d+)?$/.exec(k)[1])
+// One short string per block, to compare kinds and order at a glance.
+const shape = b => b.kind === "row" ? "row " + b.item.line
+  : b.kind === "next" ? "next " + b.item.line
+  : b.kind === "day" ? "day " + b.title.trim() + (b.empty ? " (empty)" : "")
+  : b.kind === "section" ? "sec " + b.title + " " + b.count
+  : b.kind === "chips" ? "chips " + b.chips.map(c => c.item.line).join(",")
+  : b.kind === "message" ? "msg " + b.text
+  : b.kind
+const shapes = (m, pane) => m.panes[pane || 0].blocks.map(shape)
+const LM = (v, ui) => M.layoutModel(v, ui)
+
+// The keyboard's order is the display order, pane by pane.
+function selsInOrder(m) {
+  const seen = []
+  m.panes.forEach((p, pi) => p.blocks.forEach(b => {
+    if (b.kind === "row" || b.kind === "next") seen.push([b.sel, b.key, pi])
+    if (b.kind === "chips") b.chips.forEach(c => seen.push([c.sel, c.key, pi]))
+  }))
+  return seen.every((s, i) => s[0] === i) && JSON.stringify(seen) === JSON.stringify(m.rows.map(r => [r.sel, r.key, r.pane]))
+}
+
+// ---------------------------------------------------------------- layouts: week navigation
+
+eq([[0, 1], [0, -1], [5, 0], [-3, 0], [52, 1], [-52, -1], [51, 7], [1.5, 1], [undefined, -1], [2, "x"]]
+     .map(a => M.browseOffset(a[0], a[1])),
+   [1, -1, 0, 0, 52, -52, 52, 1, -1, 2], "browseOffset: f b . clamped to ±52")
+eq(M.MAX_WEEK_OFFSET, 52, "MAX_WEEK_OFFSET")
+eq([M.weekNav(v14, 0, null), M.weekNav(v14, 1, null), M.weekNav(v14, 1, nextWeek), M.weekNav(v14, -1, lastWeek),
+    M.weekNav(v14, -2, null), M.weekNav(v14, 3, null), M.weekNav(v14, 99, null)],
+   [{ offset: 0, label: "This week", range: "14–18 Oct" }, { offset: 1, label: "Next week", range: "19–25 Oct" },
+    { offset: 1, label: "Next week", range: "19–25 Oct" }, { offset: -1, label: "Last week", range: "5–11 Oct" },
+    { offset: -2, label: "W40", range: "28 Sep – 4 Oct" }, { offset: 3, label: "W45", range: "2–8 Nov" },
+    { offset: 0, label: "This week", range: "14–18 Oct" }],
+   "weekNav: labels and ranges, across a month, without a week payload")
+eq(M.weekNav(V(), 2, Object.assign({}, nextWeek, { weekOffset: 2, weekStart: "2026-10-26" })),
+   { offset: 2, label: "W44", range: "26 Oct – 1 Nov" }, "weekNav: from the week payload")
+{
+  // On Sunday the week ends today; with Org's week starting today, 6 days on.
+  const sun = M.view(parsed(payloadOf([], { date: "2026-10-18", daysAhead: 0 })).value, "ok", "", new Date(2026, 9, 18, 9, 0), {})
+  const fromToday = M.view(parsed(payloadOf([], { date: "2026-10-14", daysAhead: 6 })).value, "ok", "", on14(9, 0), {})
+  eq([M.weekNav(sun, 0, null).range, M.weekNav(sun, 1, null).range, M.weekNav(fromToday, 0, null).range,
+      M.weekNav(fromToday, 1, null).range],
+     ["18 Oct", "19–25 Oct", "14–20 Oct", "21–27 Oct"], "weekNav: Sunday, and a week starting today")
+  eq(M.weekNav(M.view(null, "loading", "", on14(9, 0), {}), 3, null), { offset: 3, label: "+3 weeks", range: "" },
+     "weekNav: no payload yet")
+}
+eq([M.weekWanted(0, null), M.weekWanted(1, null), M.weekWanted(1, nextWeek), M.weekWanted(-1, nextWeek),
+    M.weekWanted(-1, lastWeek), M.weekWanted(0, nextWeek)],
+   [null, 1, null, -1, null, null], "weekWanted")
+
+// ---------------------------------------------------------------- layouts: Org
+
+{
+  const m = LM(v14, { layout: "Org" })
+  eq([m.layout, m.tab, m.tabs, m.nav, m.panes.length, m.empty],
+     ["Org", "today", [], { offset: 0, label: "This week", range: "14–18 Oct" }, 1, false], "layoutModel Org: frame")
+  eq(shapes(m), ["day Wednesday  14 October 2026", "row 100", "row 101", "row 110", "now", "row 111", "row 112",
+                 "row 120", "row 121", "row 122", "row 123", "row 130", "row 140", "row 150",
+                 "day Thursday   15 October 2026", "row 160", "row 161", "day Friday     16 October 2026 (empty)",
+                 "day Saturday   17 October 2026", "row 170", "day Sunday     18 October 2026 (empty)"],
+     "layoutModel Org: today in Org's order with the now line, then each later day, empty days kept")
+  const b = m.panes[0].blocks
+  eq([b[0], b[4]],
+     [{ kind: "day", key: "day:2026-10-14", style: "org", today: true, empty: false,
+        title: "Wednesday  14 October 2026", week: "W42", hint: "" },
+      { kind: "now", key: "now", text: "now - - - - - - - - - - - - - - - - - - - - - - - - -" }],
+     "layoutModel Org: today's header and the now line")
+  eq(b.filter(x => x.kind === "row").map(x => [x.item.line, x.cat, x.when.text, x.when.tone, x.past, x.flag]),
+     [[100, "habits:     ", "Sched. 2x:  ", "late", false, false], [101, "habits:     ", "08:00...... ", "normal", false, false],
+      [110, "work-cal:   ", "09:30-10:00 ", "muted", true, false], [111, "work-cal:   ", "13:00...... ", "normal", false, false],
+      [112, "work-cal:   ", "23:30-00:30 ", "normal", false, false], [120, "work:       ", " 3 d. ago:  ", "urgent", false, true],
+      [121, "home:       ", "Deadline:   ", "urgent", false, true], [122, "work:       ", "In   2 d.:  ", "soon", false, true],
+      [123, "home:       ", "In  12 d.:  ", "soon", false, true], [130, "work:       ", "Scheduled:  ", "muted", false, false],
+      [140, "home:       ", "Sched.13x:  ", "late", false, false], [150, "home:       ", "Scheduled:  ", "muted", false, false],
+      [160, "work-cal:   ", "09:30-10:00 ", "normal", false, false], [161, "work:       ", "Scheduled:  ", "muted", false, false],
+      [170, "home:       ", "Scheduled:  ", "muted", false, false]],
+     "layoutModel Org: categories, leaders, tones; past only today")
+  const r = b[1]
+  eq([r.style, r.lead, r.trail, r.dense, r.sel], ["org", null, null, false, 0], "layoutModel Org: row shape")
+  eq([b[14].week, b[17].week, selsInOrder(m), m.rows.length, m.rows.map(x => x.pane).indexOf(1)],
+     ["", "", true, 15, -1], "layoutModel Org: no week mark mid-week; sel in display order")
+  eq(m.rows.map(x => x.key).indexOf("next"), -1, "layoutModel Org: no next card")
+}
+{
+  const nowAt = (h, mi) => shapes(LM(V(on14(h, mi)), { layout: "Org" })).slice(0, 8).join(" | ")
+  eq([nowAt(8, 0), nowAt(13, 0), nowAt(23, 50)],
+     ["day Wednesday  14 October 2026 | row 100 | row 101 | now | row 110 | row 111 | row 112 | row 120",
+      "day Wednesday  14 October 2026 | row 100 | row 101 | row 110 | row 111 | now | row 112 | row 120",
+      "day Wednesday  14 October 2026 | row 100 | row 101 | row 110 | row 111 | row 112 | now | row 120"],
+     "layoutModel Org: now line before the first later start, else after the last timed row")
+  eq(shapes(LM(V(on14(10, 40), {}, [runH, hiring, slides]), { layout: "Org" })).indexOf("now"), -1,
+     "layoutModel Org: no now line without a timed non-habit row today")
+  eq(shapes(LM(V(new Date(NaN)), { layout: "Org" })).indexOf("now"), -1, "layoutModel Org: no now line without a clock")
+}
+{
+  const m = LM(V(on14(10, 40), { showDone: false }), { layout: "Org" })
+  eq([shapes(m).indexOf("row 150"), m.rows.length, selsInOrder(m)], [-1, 14, true], "layoutModel Org: showDone false")
+}
+{
+  const wk = LM(v14, { layout: "Org", offset: 1, week: nextWeek })
+  eq(shapes(wk), ["day Monday     19 October 2026", "row 200", "day Tuesday    20 October 2026 (empty)",
+                  "day Wednesday  21 October 2026", "row 201", "row 202", "day Thursday   22 October 2026 (empty)",
+                  "day Friday     23 October 2026 (empty)", "day Saturday   24 October 2026 (empty)",
+                  "day Sunday     25 October 2026 (empty)"], "layoutModel Org: next week's 7 days")
+  const b = wk.panes[0].blocks
+  eq([b[0].week, b[0].today, b[1].when, b[4].when, b[4].past, wk.empty, wk.nav.label],
+     ["W43", false, { text: "Deadline:   ", tone: "soon" }, { text: "10:00...... ", tone: "normal" }, false, false, "Next week"],
+     "layoutModel Org: next week, week mark on the first day, no today")
+  eq(shapes(LM(V(on14(10, 40), { showDone: false }), { layout: "Org", offset: 1, week: nextWeek })).indexOf("row 202"), -1,
+     "layoutModel Org: next week, showDone false")
+  const lw = LM(v14, { layout: "Org", offset: -1, week: lastWeek })
+  eq([shapes(lw).filter(s => s.indexOf("row") === 0), lw.panes[0].blocks[2].when, lw.nav.label],
+     [["row 210", "row 211"], { text: "Scheduled:  ", tone: "muted" }, "Last week"],
+     "layoutModel Org: last week, its past-scheduled rows aren't overdue")
+  eq([LM(v14, { layout: "Org", offset: 1 }).panes[0].blocks, LM(v14, { layout: "Org", offset: 2, week: nextWeek }).panes[0].blocks,
+      LM(v14, { layout: "Org", offset: -1, weekError: "Emacs not reachable" }).panes[0].blocks,
+      LM(v14, { layout: "Org", offset: 1, week: Object.assign({}, nextWeek, { error: "boom" }) }).panes[0].blocks],
+     [[{ kind: "message", key: "msg:week", text: "Loading next week…", tone: "muted" }],
+      [{ kind: "message", key: "msg:week", text: "Loading W44…", tone: "muted" }],
+      [{ kind: "message", key: "msg:week", text: "Emacs not reachable", tone: "error" }],
+      [{ kind: "message", key: "msg:week", text: "boom", tone: "error" }]],
+     "layoutModel Org: loading, another offset's payload, error, an error payload")
+  eq(LM(v14, { layout: "Org", offset: 1 }).rows, [], "layoutModel Org: loading has no rows")
+}
+
+// ---------------------------------------------------------------- layouts: Tabs
+
+{
+  const tab = t => LM(v14, { layout: "Tabs", tab: t })
+  const today = tab("today")
+  eq(today.tabs, [{ key: "today", title: "Today", count: 8, urgent: false },
+                  { key: "week", title: "This week", count: 5, urgent: false },
+                  { key: "overdue", title: "Overdue", count: 2, urgent: true }], "layoutModel Tabs: tabs and counts")
+  eq([today.tab, today.panes.length, today.panes[0].key, shapes(today)],
+     ["today", 1, "today", ["next 111", "sec Schedule 3", "row 110", "row 111", "row 112", "sec Today 3", "row 121", "row 130",
+                           "row 150", "sec Habits 2", "row 100", "row 101"]], "layoutModel Tabs: Today tab")
+  const b = today.panes[0].blocks
+  eq(b[0], { kind: "next", key: "next", sel: 0, item: sync14, caption: "NEXT UP", meta: "13:00 · in 2 h 20 min · work-cal" },
+     "layoutModel Tabs: next card")
+  eq([b[1], b[9].hint], [{ kind: "section", key: "sec:schedule", title: "Schedule", count: 3, hint: "", urgent: false },
+                         "missed days"], "layoutModel Tabs: section blocks")
+  eq([b[2].style, b[2].lead, b[2].trail, b[2].past, b[3].past, b[2].cat, b[2].when, b[10].trail, b[6].flag],
+     ["list", { text: "09:30", tone: "muted" }, { text: "work-cal", tone: "muted" }, true, false, "", null,
+      { text: "2d", tone: "late" }, true], "layoutModel Tabs: list rows, past, habit trail, flag")
+  eq([selsInOrder(today), today.rows.length], [true, 9], "layoutModel Tabs: Today sel")
+  eq(LM(V(on14(13, 10)), { layout: "Tabs" }).panes[0].blocks[0].caption, "NOW", "layoutModel Tabs: NOW card")
+
+  const week = tab("week")
+  eq(shapes(week), ["day THU 15", "row 160", "row 161", "day FRI 16", "row 122", "day SAT 17", "row 170",
+                    "day SUN 18 (empty)", "sec Deadlines ahead 1", "row 123"],
+     "layoutModel Tabs: Week tab, warnings on their day, later ones after")
+  const wb = week.panes[0].blocks
+  eq([wb[0], wb[7].hint], [{ kind: "day", key: "day:2026-10-15", style: "compact", today: false, empty: false,
+                             title: "THU 15", week: "", hint: "" }, "nothing scheduled"], "layoutModel Tabs: compact days")
+  eq([wb[1].lead, wb[1].trail, wb[2].lead, wb[4].flag, wb[4].lead, wb[9].lead, wb[9].flag, wb[1].dense],
+     [{ text: "09:30", tone: "muted" }, { text: "work-cal", tone: "muted" }, { text: "", tone: "muted" }, true,
+      { text: "", tone: "muted" }, { text: "26 Oct", tone: "muted" }, true, false],
+     "layoutModel Tabs: week rows: time, category, deadline flags and day")
+  eq([selsInOrder(week), week.rows.length, week.tabs[1].count], [true, 5, 5], "layoutModel Tabs: Week sel")
+
+  const od = tab("overdue")
+  eq([shapes(od), od.panes[0].blocks.map(x => [x.lead, x.flag])],
+     [["row 120", "row 140"], [[{ text: "3d", tone: "urgent" }, true], [{ text: "13d", tone: "urgent" }, false]]],
+     "layoutModel Tabs: Overdue tab")
+  eq(M.layoutModel(v14, { layout: "Tabs", tab: "bogus" }).tab, "today", "layoutModel Tabs: bad tab -> today")
+
+  // Browsing weeks moves only the Week tab.
+  const wk1 = LM(v14, { layout: "Tabs", tab: "week", offset: 1, week: nextWeek })
+  eq([shapes(wk1), wk1.tabs.map(t => [t.title, t.count])],
+     [["day MON 19", "row 200", "day TUE 20 (empty)", "day WED 21", "row 201", "row 202", "day THU 22 (empty)",
+       "day FRI 23 (empty)", "day SAT 24 (empty)", "day SUN 25 (empty)"],
+      [["Today", 8], ["Next week", 3], ["Overdue", 2]]], "layoutModel Tabs: next week")
+  eq([shapes(LM(v14, { layout: "Tabs", tab: "today", offset: 1, week: nextWeek })), shapes(LM(v14, { layout: "Tabs", tab: "overdue", offset: -1 }))],
+     [shapes(today), shapes(od)], "layoutModel Tabs: Today and Overdue ignore the week offset")
+  eq([shapes(LM(v14, { layout: "Tabs", tab: "week", offset: 1 })), LM(v14, { layout: "Tabs", tab: "week", offset: 1 }).tabs[1].count],
+     [["msg Loading next week…"], 0], "layoutModel Tabs: week loading")
+
+  const hidden = LM(V(on14(10, 40), { showDone: false }), { layout: "Tabs" })
+  eq([hidden.tabs.map(t => t.count), shapes(hidden).indexOf("row 150")], [[7, 5, 2], -1], "layoutModel Tabs: showDone false")
+}
+
+// ---------------------------------------------------------------- layouts: Columns
+
+{
+  const m = LM(v14, { layout: "Columns" })
+  eq([m.panes.map(p => [p.key, p.title]), m.tabs], [[["today", "Today"], ["side", ""]], []], "layoutModel Columns: panes")
+  eq(shapes(m, 0), ["next 111", "sec Schedule 3", "row 110", "row 111", "row 112", "sec Today 3", "row 121", "row 130",
+                    "row 150", "sec Habits 2", "chips 100,101"], "layoutModel Columns: left, habits as chips")
+  eq(shapes(m, 1), ["sec Overdue 2", "row 120", "row 140", "sec This week 5", "day THU 15", "row 160", "row 161",
+                    "day FRI 16", "row 122", "day SAT 17", "row 170", "day SUN 18 (empty)", "sec Deadlines ahead 1",
+                    "row 123"], "layoutModel Columns: right, overdue then the week")
+  const chips = m.panes[0].blocks[10]
+  eq([chips.key, chips.chips.map(c => [c.sel, c.text, c.missed, c.done])],
+     ["chips:habits", [[7, "Morning run", "2d", false], [8, "Read", "", false]]], "layoutModel Columns: chips")
+  const right = m.panes[1].blocks
+  eq([right[0].urgent, right[1].dense, right[1].lead, right[5].dense, m.panes[0].blocks[2].dense],
+     [true, true, { text: "3d", tone: "urgent" }, true, false], "layoutModel Columns: dense right pane")
+  eq([selsInOrder(m), m.rows.map(r => r.pane).join(""), m.rows.length], [true, "0000000001111111", 16],
+     "layoutModel Columns: sel across panes")
+  const wk = LM(v14, { layout: "Columns", offset: -1, week: lastWeek })
+  eq([shapes(wk, 0), shapes(wk, 1).slice(0, 5)],
+     [shapes(m, 0), ["sec Overdue 2", "row 120", "row 140", "sec Last week 2", "day MON 5 (empty)"]],
+     "layoutModel Columns: last week changes only the week part")
+  eq(shapes(LM(v14, { layout: "Columns", offset: 1, weekError: "timeout" }), 1),
+     ["sec Overdue 2", "row 120", "row 140", "sec Next week 0", "msg timeout"], "layoutModel Columns: week error")
+  eq(shapes(LM(V(on14(10, 40), {}, [hiring, slides]), { layout: "Columns" }), 1),
+     ["sec This week 1", "day THU 15", "row 161", "day FRI 16 (empty)", "day SAT 17 (empty)", "day SUN 18 (empty)"],
+     "layoutModel Columns: no overdue section without overdue rows")
+  eq(LM(V(on14(10, 40), { showDone: false }), { layout: "Columns" }).rows.map(r => r.item.line).indexOf(150), -1,
+     "layoutModel Columns: showDone false")
+
+  // ←/→ keeps the position within the pane, clamped.
+  eq([M.paneSel(m, 2, 1), M.paneSel(m, 8, 1), M.paneSel(m, 9, -1), M.paneSel(m, 15, -1), M.paneSel(m, 0, -1),
+      M.paneSel(m, 12, 1), M.paneSel(m, 99, 1)], [11, 15, 0, 6, 0, 12, 99], "paneSel")
+  const noRight = LM(V(on14(10, 40), {}, [hiring]), { layout: "Columns" })
+  eq([M.paneSel(noRight, 0, 1), M.paneSel(LM(v14, { layout: "Org" }), 3, 1), M.paneSel(null, 2, 1)], [0, 3, 2],
+     "paneSel: empty target or one pane stays")
+}
+
+// ---------------------------------------------------------------- layouts: keys, empty, helpers
+
+{
+  const models = [LM(v14, { layout: "Org" }), LM(v14, { layout: "Tabs", tab: "today" }), LM(v14, { layout: "Tabs", tab: "week" }),
+                  LM(v14, { layout: "Tabs", tab: "overdue" }), LM(v14, { layout: "Columns" })]
+  const keyOf = (m, line) => m.rows.filter(r => r.key !== "next" && r.item.line === line).map(r => r.key)
+  eq([111, 100, 120, 122, 160, 123].map(line => models.map(m => keyOf(m, line)).filter(k => k.length)
+       .every((k, i, all) => k.length === 1 && k[0] === all[0][0])), [true, true, true, true, true, true],
+     "keys: the same entry has the same key in every layout and tab")
+  eq([keyOf(models[0], 111)[0], keyOf(models[0], 122)[0]],
+     ["timestamp:/home/u/org/cal.org:111:0", "upcoming-deadline:/home/u/org/cal.org:122:2"], "keys: type, path, line, day")
+  eq(models.map(m => new Set(m.rows.map(r => r.key)).size === m.rows.length), [true, true, true, true, true], "keys: unique")
+  eq(keyOf(LM(V(), { layout: "Org" }), 111), keyOf(models[0], 111), "keys: stable across refreshes")
+  eq(keyOf(LM(V(on14(10, 40), { showDone: false }), { layout: "Org" }), 160), keyOf(models[0], 160), "keys: showDone doesn't move them")
+  // The same heading twice on a day: a deterministic suffix.
+  const twice = LM(V(on14(10, 40), {}, [hiring, Object.assign({}, hiring, { title: "again" }), hiring]), { layout: "Org" })
+  const k130 = "scheduled:/home/u/org/cal.org:130:0"
+  eq(twice.rows.map(r => r.key), [k130, k130 + "#2", k130 + "#3"], "keys: repeats suffixed #2, #3")
+  eq(lineOf(twice.rows[1].key), 130, "keys: suffix keeps the line readable")
+  const wkKeys = LM(v14, { layout: "Org", offset: 1, week: nextWeek }).rows.map(r => r.key)
+  eq([wkKeys, LM(v14, { layout: "Tabs", tab: "week", offset: 1, week: nextWeek }).rows.map(r => r.key)],
+     [wkKeys, wkKeys], "keys: a week's rows keyed alike in Org and Tabs")
+}
+{
+  const empty = M.view(parsed(weekPayload([])).value, "ok", "", on14(10, 40), {})
+  eq(["Org", "Tabs", "Columns"].map(l => LM(empty, { layout: l }).empty), [true, true, true], "layoutModel: empty")
+  eq([LM(empty, { layout: "Org", offset: 1 }).empty, LM(V(on14(10, 40), {}, [done14]), { layout: "Org" }).empty,
+      LM(V(on14(10, 40), { showDone: false }, [done14]), { layout: "Org" }).empty], [false, false, true],
+     "layoutModel: empty only this week, after showDone")
+  eq(shapes(LM(empty, { layout: "Org" })), ["day Wednesday  14 October 2026 (empty)", "day Thursday   15 October 2026 (empty)",
+     "day Friday     16 October 2026 (empty)", "day Saturday   17 October 2026 (empty)", "day Sunday     18 October 2026 (empty)"],
+     "layoutModel Org: an empty week keeps its days")
+  const loading = M.view(null, "loading", "", on14(10, 40), {})
+  eq(["Org", "Tabs", "Columns"].map(l => { const m = LM(loading, { layout: l }); return [m.panes.length, m.rows.length, m.empty] }),
+     [[1, 0, true], [1, 0, true], [2, 0, true]], "layoutModel: no payload yet")
+  eq(LM(v14, null).layout, "Org", "layoutModel: no ui -> Org")
+}
+eq([M.tabStep("today", 1), M.tabStep("week", 1), M.tabStep("overdue", 1), M.tabStep("overdue", -1), M.tabStep("today", -1),
+    M.tabStep("bogus", 1)], ["week", "overdue", "overdue", "week", "today", "week"], "tabStep: stops at the ends")
+eq([1, 2, 3, 0, 4, "1", 1.5].map(M.tabAt), ["today", "week", "overdue", null, null, null, null], "tabAt")
+{
+  eq(["Org", "Tabs", "Columns"].map(l => M.overdueFocus(LM(v14, M.overdueUi({ layout: l, tab: "week", offset: 2 })))),
+     ["deadline:/home/u/org/cal.org:120:0", "deadline:/home/u/org/cal.org:120:0", "deadline:/home/u/org/cal.org:120:0"],
+     "overdueFocus: the first overdue row in every layout")
+  eq([M.overdueUi({ layout: "Tabs", tab: "week", offset: 2, week: null }), M.overdueUi({ layout: "Org", tab: "week", offset: -3 }),
+      M.overdueUi({ layout: "Columns", offset: 1 })],
+     [{ layout: "Tabs", tab: "overdue", offset: 0, week: null }, { layout: "Org", tab: "week", offset: 0 },
+      { layout: "Columns", offset: 0 }], "overdueUi: this week, Tabs on Overdue")
+  eq([M.overdueFocus(LM(V(on14(10, 40), {}, [hiring, runH]), { layout: "Org" })),
+      M.overdueFocus(LM(v14, { layout: "Org", offset: -1, week: lastWeek })), M.overdueFocus(null)],
+     ["", "", ""], "overdueFocus: none")
+}
+{
+  const hints = ["Org", "Tabs", "Columns"].map(l => M.layoutHints(l))
+  eq(hints, ["↑↓ move · ↵ open · t state · f b week · v layout · r refresh · esc",
+             "1 2 3 tabs · ↑↓ move · ↵ open · t state · f b week · v layout · r refresh · esc",
+             "←→ column · ↑↓ move · ↵ open · t state · f b week · v layout · r refresh · esc"], "layoutHints")
+  eq(hints.map(h => h.length <= 80), [true, true, true], "layoutHints: under 80 chars")
 }
 
 eq([M.PROTOCOL, M.MAX_ITEMS, M.MAX_TITLE, M.NOW_GRACE_MIN, M.STALE_AFTER_MS, M.ID_RE.test("a:b")],
