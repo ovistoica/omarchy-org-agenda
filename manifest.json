@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "ovistoica.org-agenda",
   "name": "Org Agenda",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "author": "Ovi Stoica",
   "license": "MIT",
   "description": "Today's Org agenda from your running Emacs, in the bar. Click an entry to open it in Emacs at its line. Needs Emacs running as a server.",
